@@ -66,6 +66,31 @@ QWEN35_PATTERN = (
 )
 
 
+# The `minimax-m2` pre-tokenizer, transcribed from MiniMax-M2's tokenizer.json (the "Split" pretokenizer, whose
+# `invert: true` keeps the text the pattern MATCHES - the same job Strata's `finditer` does) followed by the
+# ByteLevel pretokenizer.  Three details separate it from Qwen's:
+#
+#   * the letters are split in two classes - an upper-case run and a lower-case run - so "HTTPServer" is cut after the
+#     capitals, while Qwen's single `[\p{L}\p{M}]+` keeps it whole;
+#   * the digits come in groups of three (`\p{N}{1,3}`), so "2026" is two pieces and not four;
+#   * the punctuation run keeps a trailing "/" (`[\r\n/]*`), which Qwen's does not.
+MINIMAX2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# The pre-tokenizer each family's GGUF names (`tokenizer.ggml.pre`).
+PRE_PATTERNS = {
+    "qwen35": QWEN35_PATTERN,
+    "minimax-m2": MINIMAX2_PATTERN,
+}
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -88,7 +113,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        # the pattern the file names: an unknown `pre` keeps Qwen's (the families that do not say otherwise)
+        self._re = regex.compile(PRE_PATTERNS.get(pre, QWEN35_PATTERN))
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
