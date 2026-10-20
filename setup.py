@@ -621,6 +621,16 @@ QWEN36_FILES = {
     "Qwen3.6-35B-A3B-Q8_0.gguf": (37801097504, "c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131"),
     "mmproj-F16.gguf": (899283584, "71f3cbc1f7cc0f30d09d41cfa924c0060827ebc33bf15ace7e86661e856f0160"),
 }
+# MiniMax-M2 (GGUF architecture minimax-m2): 230B with 10B active, 256 experts top-8, FULL attention on every
+# layer (no GDN, no sparse attention), no shared expert and no MTP block in the released weights.  A family with an
+# engine path of its own (src/minimaxm2; `strata` switches to it from the file's architecture).  The engine path
+# reads the experts where they lie in the file (the low-RAM mode, --low-ram): a copy of the 49 GB of experts does
+# not fit beside the file they are read from, and the copy's presence empties the page cache, so the reads fall to
+# the drive's page-fault rate (measured: 39-52 MB/s instead of 4.3 GB/s).
+MINIMAX2_FILES = {
+    "MiniMaxAI_MiniMax-M2-IQ2_XXS-00001-of-00002.gguf": (39922661440, "84294b035551643111f15403c77d68a29e1b900fac9bf028d871c48851e9a178"),
+    "MiniMaxAI_MiniMax-M2-IQ2_XXS-00002-of-00002.gguf": (14803701088, "4da31c4005c1e1f83ed403e4013cb2bb9bc1395b26b65c2fa962a8cdb645f091"),
+}
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -642,7 +652,25 @@ OWN_PATH_FAMILIES = {
                # pictures: Unsloth's mmproj (the same projector family as Flash-Next's: qwen3vl_merger) through
                # strata-vision; a parallel slot's session: its KV cache (kv_bytes_per_token) and the recurrent state of
                # the 30 GDN layers (state_gb)
-               "vision": True, "state_gb": 0.07}
+               "vision": True, "state_gb": 0.07},
+    "minimax2": {"title": "MiniMax-M2", "by": "MiniMax; GGUFs by bartowski", "arch": "minimax-m2",
+                 "about": "230B mixture of experts with 10B active (256 experts, top-8), full attention on every "
+                          "layer; the experts are read where they lie in the file, so the download is the disk's "
+                          "business and the page cache does the rest",
+                 "hf": hf("bartowski/MiniMaxAI_MiniMax-M2-GGUF"),
+                 "file": "MiniMaxAI_MiniMax-M2-{q}.gguf", "tag": "minimax2-",
+                 "name": "minimax-m2",
+                 "license": "MiniMax Community License: https://huggingface.co/MiniMaxAI/MiniMax-M2",
+                 # RAM: the low-RAM mode keeps NO copy of the experts, so the engine's own memory is the KV cache
+                 # and its buffers; the file's pages are the OS's page cache's business (it reads them as the
+                 # routing asks for them).
+                 "models": {"IQ2_XXS": {"about": "2-bit i-quant (the smallest M2 file), 54.7 GB", "ram_gb": 24}},
+                 "sha256": MINIMAX2_FILES,
+                 # the engine's KV cache per context token: 62 layers, 4 KV heads x 128, K and V in fp32 (strata-m2)
+                 "kv_bytes_per_token": 62 * 4 * 128 * 2 * 4,
+                 "mtp": 0,                      # the released weights carry no MTP block
+                 "low_ram": True,               # no host copy of the experts: they stay in the file
+                 "vision": False, "state_gb": 0.0}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
@@ -6786,6 +6814,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if fam.get("low_ram"):
+        # the experts stay in the file (a copy of them does not fit beside it, and it empties the page cache)
+        args += ["--low-ram"]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
         vram = gpu.get("vram_gb", 0.0)
         if vram > 0:
