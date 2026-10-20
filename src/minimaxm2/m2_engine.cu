@@ -495,20 +495,7 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
 /// The peer's rows into the host rows: the entries it computed.  `peer_row[e]` is the entry's row in the peer's
 /// OWN output (-1: the peer did not compute it).  The rows go where the CPU pool's rows go, so the merge that
 /// follows takes them like the CPU's.  grid (n_ent), block 256.
-__global__ void k_peer_rows(const float* src, float* dst, const int32_t* peer_row, int n_ent, int n) {
-    const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= n_ent) return;
-    const int row = peer_row[e];
-    if (row < 0) return;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[(size_t) e * n + i] = src[(size_t) row * n + i];
-}
 /// The inverse of the grouping's table: the entry whose row is p.  grid (n_rows), block 256.
-__global__ void k_peer_rowmap(const int32_t* ent_dst, int32_t* peer_row, int n_rows) {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= n_rows) return;
-    const int e = ent_dst[p];
-    if (e >= 0) peer_row[e] = p;
-}
 /// The CPU pool's expert rows into the entries' rows: parts[e] = cpu[e] where miss[e].  grid (n_ent), block 256.
 __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
     const int e = blockIdx.x;
@@ -1385,6 +1372,8 @@ struct Engine {
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
+    // the activations are ready: recorded after the quantization, so the peer copies them whole
+    cudaEvent_t ev_xq = nullptr;
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -2384,6 +2373,7 @@ struct Engine {
         CK(cudaEventRecord(ev_route, st));
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
+        CK(cudaEventRecord(ev_xq, st));     // the activations are whole: the peer copies them after this
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
     }
@@ -2400,7 +2390,7 @@ struct Engine {
         // The peer's stream waits for the routing (the ids) and for the activations.  EVERY call on the peer's
         // stream needs the PEER's device current: HIP refuses a launch on a stream that belongs to another device.
         CK(cudaSetDevice(peer_device));
-        CK(cudaStreamWaitEvent(peer_st, ev_route, 0));
+        CK(cudaStreamWaitEvent(peer_st, ev_xq, 0));
         // the ids and the activations, copied to the peer's card (a device-to-device copy does not cross cards)
         CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, peer_st));
         CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, peer_st));
@@ -2412,11 +2402,6 @@ struct Engine {
                                              peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok);
         K::native_expert_grouped(L.L, peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, peer_xq, peer_escr, peer_eparts, peer_st);
-        // the rows into the host rows (where the CPU pool's rows go): the scatter runs ON THE PEER, for it reads
-        // the peer's own output and writes the portable host rows over PCIe
-        CK(cudaMemsetAsync(peer_row, 0xff, (size_t) n_ent * 4, peer_st));
-        k_peer_rowmap<<<grid1((int) peer_rows_max), kThreads, 0, peer_st>>>(peer_ent_dst, peer_row, (int) peer_rows_max);
-        k_peer_rows<<<grid1(n_ent), kThreads, 0, peer_st>>>(peer_eparts, cpu_out, peer_row, n_ent, N);
         CK(cudaEventRecord(peer_done, peer_st));
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
@@ -2457,6 +2442,7 @@ struct Engine {
             if (!defer) H.score[(size_t) x] += 1.0;
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
+            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
             // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
             if (peer_slots && (*peer_slots)[(size_t) x] >= 0) continue;
             ++n_miss;
@@ -3304,9 +3290,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaMalloc(&E.peer_grp_ptr, (nmax + 1) * sizeof(unsigned long long)));
         CK(cudaMalloc(&E.peer_grp_start, (nmax + 1) * 4));
         CK(cudaMalloc(&E.peer_n_groups, 4));
-        CK(cudaMalloc(&E.peer_ent_dst, nmax * 4));
-        E.peer_rows_max = nmax;
-        CK(cudaMalloc(&E.peer_ent_tok, nmax * 4));
+        // The ENTRIES' tables (ent_dst, ent_tok): the expert kernels index them by ENTRY, not by the dense rows,
+        // so they hold T * Kp entries, as the primary's do.  The GROUPS' tables (grp_ptr, grp_start) hold one
+        // entry per expert.
+        CK(cudaMalloc(&E.peer_ent_dst, T * Kp * 4));
+        CK(cudaMalloc(&E.peer_ent_tok, T * Kp * 4));
+        E.peer_rows_max = T * Kp;
         CK(cudaMalloc(&E.peer_ids, T * Kp * 4));
         CK(cudaMalloc(&E.peer_xq, K::native_q8_1_bytes((int) N, 1) * T));
         // The scratch is sized the way native_expert_grouped sizes it: FOUR buffers of cap_entries x n_ff floats
@@ -3314,7 +3303,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         int64_t ff_max = 0;
         for (const Layer* L2 : all) ff_max = std::max<int64_t>(ff_max, L2->L.n_ff);
         E.peer_escr = dalloc(K::native_expert_scratch_bytes((int64_t) (T * Kp), ff_max));
-        CK(cudaMalloc(&E.peer_eparts, (size_t) T * Kp * N * 4));
+        // The peer's rows go STRAIGHT into the host rows (the portable pinned buffer): the expert kernels write
+        // them at the entries' positions, which is where the CPU pool's rows and the merge expect them.
+        E.peer_eparts = E.cpu_out;
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
     }
@@ -3326,6 +3317,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
 
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&E.ev_xq, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
