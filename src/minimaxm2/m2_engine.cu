@@ -2996,7 +2996,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+            // ONE EXPERT AT A TIME.  A copy of a whole layer's slots (48 experts, ~200 MB) out of the 49 GB
+            // pinned arena is staged through the driver's bounce buffer instead of being a DMA, and it ran at
+            // 5 MB/s on this box (a 256 MB copy from a 256 MB pinned buffer: 10 GB/s).  One expert is 4 MB, and
+            // that is a DMA.
+            for (int s = 0; s < S; ++s)
+                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) s * L.stride, L.L.bytes,
+                               cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
