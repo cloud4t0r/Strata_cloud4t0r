@@ -445,6 +445,18 @@ model is in the right range.
 
 ### What it says
 
+The engine, on one RX 9070 (gfx1201) with 64 GB of RAM, the IQ2_XXS file in the low-RAM mode:
+
+| | measured | the study's estimate |
+| --- | ---: | ---: |
+| the placement (every expert read where it lies) | 1.8 s | - |
+| the prompt read (512-token chunks) | 87.3 tok/s | - |
+| the decode (64 tokens) | 14.9-16.1 tok/s | 10-14 tok/s |
+
+The decode lands in the band the study predicted for this machine (10-14 tok/s at IQ2_XXS), a little above it.
+The study's estimate was made from the bytes each token reads and from the machine's PCIe link; the measurement
+is the engine's own counter.
+
 - **No MiniMax-M3 file fits in this box's RAM.** The smallest needs 102 GB (90.5 GB of file plus the OS,
   the engine and the cache); the box has 64 GB. Everything runs in the low-RAM mode, with the disk in the
   path. The disk has 246 GB free, so every candidate up to UD-Q3_K_M (195.5 GB) fits on it; UD-Q4_K_XL
