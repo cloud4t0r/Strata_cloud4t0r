@@ -321,6 +321,54 @@ def toy() -> ST.Tokenizer:
     return ST.Tokenizer(tokens, merges)
 
 
+class MiniMaxPreTokenizer(unittest.TestCase):
+    """The `minimax-m2` pre-tokenizer: the pieces it cuts a string into.
+
+    Three details separate it from Qwen's, and each one changes the ids the model gets:
+    the letters are split in an upper-case run and a lower-case run, the digits come in groups of
+    three, and a punctuation run keeps a trailing "/".
+    """
+
+    @staticmethod
+    def pieces(tk, text):
+        return [m.group(0) for m in tk._re.finditer(text)]
+
+    def test_an_upper_case_run_stands_alone(self):
+        tk = toy()
+        tk._re = ST.regex.compile(ST.MINIMAX2_PATTERN)
+        # the upper-case run is its own piece after a lower-case one
+        self.assertEqual(self.pieces(tk, "aHTTP"), ["a", "HTTP"])
+        # Qwen's single letter class keeps the two together
+        self.assertEqual(self.pieces(toy(), "aHTTP"), ["aHTTP"])
+
+    def test_the_digits_come_in_groups_of_three(self):
+        tk = toy()
+        tk._re = ST.regex.compile(ST.MINIMAX2_PATTERN)
+        self.assertEqual(self.pieces(tk, "2026"), ["202", "6"])
+        self.assertEqual(self.pieces(tk, "1234567890"), ["123", "456", "789", "0"])
+        # Qwen takes one digit at a time
+        self.assertEqual(self.pieces(toy(), "2026"), ["2", "0", "2", "6"])
+
+    def test_a_contraction_stays_with_its_letters(self):
+        tk = toy()
+        tk._re = ST.regex.compile(ST.MINIMAX2_PATTERN)
+        self.assertEqual(self.pieces(tk, "IT'S"), ["IT'S"])
+        # Qwen cuts the apostrophe off
+        self.assertEqual(self.pieces(toy(), "IT'S"), ["IT", "'S"])
+
+    def test_a_punctuation_run_keeps_its_slash(self):
+        tk = toy()
+        tk._re = ST.regex.compile(ST.MINIMAX2_PATTERN)
+        self.assertEqual(self.pieces(tk, "a/b"), ["a", "/b"])
+        self.assertEqual(self.pieces(tk, "/api/v2"), ["/api", "/v", "2"])
+
+    def test_the_round_trip(self):
+        tk = toy()
+        tk._re = ST.regex.compile(ST.MINIMAX2_PATTERN)
+        text = "HTTPServer 2026 /api/v2 don\'t\n\ttabs  你好 🌍"
+        self.assertEqual(tk.decode(tk.encode(text)), text)
+
+
 class PieceCache(unittest.TestCase):
     def test_same_ids_cold_warm_and_off(self):
         rng = random.Random(7)
