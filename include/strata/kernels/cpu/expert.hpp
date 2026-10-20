@@ -54,6 +54,15 @@ inline constexpr size_t O_D_CODES = 2ull * FF * ROW_GU;
 inline constexpr size_t O_GU_SCALES = O_D_CODES + 1ull * H * ROW_D;
 inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 
+// ---- the NATIVE (GGUF i-quant) expert path's maxima ----
+// The constants above are the Q2_0 PACK's layout (Flash-Next's own pack format, on disk: its blob offsets are
+// fixed by them), so they stay on Flash-Next's geometry.  The native path reads the GGUF's own experts, whose
+// geometry is the file's, and a second family now uses it: MiniMax-M2 (3072 x 1536, 256 experts).  Its
+// activation buffers are therefore sized for the widest of the two.
+inline constexpr int kNativeH = 3072;      // the widest n_embd of the native families (MiniMax-M2)
+inline constexpr int kNativeFF = 1536;     // the widest n_ff of the native families (MiniMax-M2)
+inline constexpr int kNativeMAXC = kNativeH / QKA;   // 96 activation chunks across the widest reduction
+
 /// One activation in Strata's planar storage: `QKA` elements per chunk.
 /// The default legacy quantizer uses FP32 scales and half-away rounding. It is
 /// not the pinned ggml CPU Q8_0 contract; expert_set_oracle_q8_0 selects that
@@ -66,18 +75,18 @@ inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 /// (`sum (c-1) d_w xhat d_x = d_w (d_x*sum(c*xhat) - d_x*sum(xhat))`), precomputed once per layer rather than
 /// once per row: 640 rows would otherwise recompute it 640 times.
 struct ActQ {
-    alignas(64) int8_t q[H];
-    float scale[MAXC];
-    int32_t sum[MAXC];
-    float hx[MAXC];
+    alignas(64) int8_t q[kNativeH];
+    float scale[kNativeMAXC];
+    int32_t sum[kNativeMAXC];
+    float hx[kNativeMAXC];
     int nchunks;
     /// The AVX-2 "bit-plane" image of `q` (src/kernels/cpu/q2_avx2.cpp explains it), filled only by
     /// `act_quant_q8_1_avx2` with STRATA_Q2_BITPLANE=1 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
     /// `qp[128p + 32k + 16h + i] = q[128p + 64h + 4i + k]`, `psum[8p + 4h + m]` = the sum of q[128p + 64h + 16m ..
     /// + 16), `pscale[8p + 2c + e] = scale[4p + c]`.  `bp_pairs` is 0 when the image is absent (n % 128 != 0).
-    alignas(32) int8_t qp[H];
-    alignas(32) int32_t psum[H / 16];
-    alignas(32) float pscale[H / 16];
+    alignas(32) int8_t qp[kNativeH];
+    alignas(32) int32_t psum[kNativeH / 16];
+    alignas(32) float pscale[kNativeH / 16];
     int bp_pairs = 0;
 };
 
