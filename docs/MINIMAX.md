@@ -863,14 +863,47 @@ large registered allocation, not the link and not the code's copy shape.  The ne
 bisecting the arena size (a 4 GB arena with the same code), and then the low-RAM mode above, which does
 not need the arena at all.
 
-### The other finding: the two cards
+### The two cards
 
-The layer split across GPUs lives in the **Flash-Next** path (`src/program/generate.cpp`, the stage search,
-the prompt buffers' loans, the per-stage expert caches).  The Qwen3.6 path does not have it, and it
-**refuses** the option: `strata-q36` exits with its usage on `--layer-split`, so a two-GPU config cannot
-run Qwen3.6 either.  MiniMax-M2 inherits that gap: its path is built on the Qwen3.6 template, so it is
-single-GPU today.  Porting the split to the "own path" families is a separate piece of work from the
-model itself.
+The layer split across GPUs lives in the **Flash-Next** path (`src/program/generate.cpp`: the stage search,
+the prompt buffers' loans, the per-stage expert caches, the hand-off of the hidden state).  The Qwen3.6 path
+does not have it, and it **refuses** the option: `strata-q36` exits with its usage on `--layer-split`, so a
+two-GPU config cannot run Qwen3.6 either.  MiniMax-M2 inherits that gap: its path is built on the Qwen3.6
+template, so it is single-GPU today.
+
+**What MiniMax-M2 would gain, and what it would cost.**  Measured on one RX 9070 (gfx1201), 64 GB of RAM, the
+IQ2_XXS file, the low-RAM mode:
+
+| | measured |
+| --- | ---: |
+| the placement (every expert read where it lies) | 1.8 s |
+| the prompt read (512-token chunks) | 87.3 tok/s |
+| the decode (64 tokens) | 14.9-16.1 tok/s |
+
+The decode's cost is the **CPU pool**: 77,422 of the 96,720 batch entries go to the CPU (the GPU holds 48 of
+the 256 experts per layer), and they take 8.9 s of the window.  So the second card is worth roughly what its
+expert slots are worth: holding the other 48 experts per layer would move about a quarter of the pool's work
+to the GPU, and the decode should land near 19-20 tok/s.
+
+**The port is the peer tier, not the layer split.**  Strata already has one
+(`include/strata/core/peer_experts.hpp`: a second expert tier on another card - the pool publishes the
+primary's plan, the peer computes the rows it holds into the same mapped host rows while the CPU computes the
+rest, and the rows are bit-identical whichever card computes them).  But it is written against the
+Flash-Next path's `expert_source` / `expert_cache`, which the M2 path does not use: M2 has its own placement
+(`place_experts`), its own CPU pool and its own combine.  Porting it means, in `src/minimaxm2/m2_engine.cu`:
+
+  * a second device with its own expert slots, and the placement filling both cards' slots (the two cards'
+    slot tables have to stay consistent with the routing: which expert is on which card);
+  * the pool's plan published to the peer, which computes its rows into the SAME mapped rows the CPU writes
+    (so the buffers must be allocated portable, as `set_peer_portable` already does);
+  * the pool waiting for both before the combine.
+
+The layer split (the hidden state crossing the cards per window) is a bigger and separate piece: it is what
+makes the Flash-Next path scale, and it would need the per-stage expert caches and the prompt buffers' loans
+that the M2 path does not have.
+
+**The order to do it in**: the peer tier first (it is the same card twice, the same kernels, the same rows, and
+it takes the CPU pool's biggest share), then the layer split if the numbers still call for it.
 
 ## The sources
 
