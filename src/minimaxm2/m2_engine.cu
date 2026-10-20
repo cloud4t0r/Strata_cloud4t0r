@@ -4441,7 +4441,10 @@ int strata::minimaxm2::run(int argc, char** argv) {
         return 1;
     }
     Engine E;
-    E.use_graph = graph;
+    // The decode's graph is captured on the first card and replays ITS pointers: with the layer split the
+    // decode's layers run on the second card, so the graph would read the first card's memory.  The split
+    // runs the layers without the graph.
+    E.use_graph = graph && layer_split <= 0;
     // the low-RAM mode: no host copy of the experts (they stay in the GGUF mapping and the CPU pool reads
     // them where they lie).  On a 64 GB box the copy of a 49 GB model does not fit beside the file: the
     // placement ran at 39-52 MB/s and the machine thrashed (3.5 GB of swap in and out).
