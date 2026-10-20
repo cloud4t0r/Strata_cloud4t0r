@@ -1800,6 +1800,23 @@ struct Engine {
             if (S[l]) CK(cudaMemsetAsync(S[l], 0, (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4, st));
         }
         if (hlast) CK(cudaMemsetAsync(hlast, 0, (size_t) g.n_embd * 4, st));
+        // The attention's K / V too: the warm-up pass (the engine's first, padded forward) leaves its rows in the
+        // cache, and the real prompt would read them.
+        for (size_t l = 0; l < kc.size(); ++l) {
+            if (!kc[l] && !vc[l]) continue;
+            const bool on2 = split_dev >= 0 && (int) l >= split_layer;
+            if (on2) {
+                CK(cudaSetDevice(split_dev));
+                CK(cudaGetLastError());
+            }
+            cudaStream_t ks = on2 ? set[1].st : st;
+            if (kc[l]) CK(cudaMemsetAsync(kc[l], 0, (size_t) g.n_head_kv * ctx * g.head_dim * 4, ks));
+            if (vc[l]) CK(cudaMemsetAsync(vc[l], 0, (size_t) g.n_head_kv * ctx * g.head_dim * 4, ks));
+            if (on2) {
+                CK(cudaSetDevice(0));
+                CK(cudaGetLastError());
+            }
+        }
         CK(cudaStreamSynchronize(st));
         if (split_dev >= 0 && cd != 0) {   // back to the card we came from
             use_set(cd);
@@ -2437,6 +2454,21 @@ struct Engine {
                 CK(cudaMemcpyPeerAsync(set[1].tok, split_dev, tok, 0, (size_t) T * 4, st));
                 CK(cudaMemcpyPeerAsync(set[1].pos0, split_dev, pos0, 0, 4, st));
                 CK(cudaEventRecord(ev_cross, st));
+                if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: what arrives on the second card
+                    std::vector<uint8_t> a((size_t) T * N * 4), b(a.size());
+                    std::vector<int32_t> pa(4), pb(4);
+                    CK(cudaMemcpyAsync(a.data(), x, a.size(), cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(b.data(), set[1].x, b.size(), cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(pa.data(), tok, 16, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(pb.data(), set[1].tok, 16, cudaMemcpyDeviceToHost, st));
+                    CK(cudaStreamSynchronize(st));
+                    long nd = 0, fi = -1;
+                    for (size_t z = 0; z < a.size(); ++z)
+                        if (a[z] != b[z]) { if (fi < 0) fi = (long) z; ++nd; }
+                    std::fprintf(stderr, "CROSS layer %d T=%d : x %ld differing bytes (first %ld of %zu) | tok %d,%d vs %d,%d\n",
+                                 (int) l, T, nd, fi, a.size(), pa[0], pa[1], pb[0], pb[1]);
+                    std::fflush(stderr);
+                }
                 use_set(1);
                 CK(cudaSetDevice(split_dev));
                 CK(cudaGetLastError());
@@ -3511,6 +3543,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.hy.resize(all.size());
     if (E.peer_device >= 0) E.peer_hy.resize(all.size());
     int place_dev = 0;   // the card the layer's resources are on (the layer split)
+    int slot_off = 0;    // the first expert this card holds: the primary takes [0, S), the second card the rest
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
         // the layer split: the layer's resources (its expert slots) live on its card, with ITS free VRAM
@@ -3526,6 +3559,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 size_t sb = vram_gib >= 0 ? budget : (f > reserve ? f - reserve : 0);
                 if (sb + staging + ((size_t) 256 << 20) > f)
                     sb = f > staging + ((size_t) 512 << 20) ? f - staging - ((size_t) 512 << 20) : 0;
+                slot_off = S;   // the second card takes the experts the primary does not hold
                 S = slots < 0 ? 0 : (slots > 0 ? (int) std::min<int64_t>(ne, slots)
                                               : (int) std::min<size_t>((size_t) ne, sb / per_slot));
                 std::fprintf(stderr, "strata-m2: the second card takes %d of %d experts per layer (%.2f GiB free)\n",
@@ -3563,12 +3597,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             // 5 MB/s on this box (a 256 MB copy from a 256 MB pinned buffer: 10 GB/s).  One expert is 4 MB, and
             // that is a DMA.
             for (int s = 0; s < S; ++s) {
-                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) s * L.stride : nullptr;
+                const int e = slot_off + s;   // the expert this slot holds (the second card's are the ones the first does not)
+                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) e * L.stride : nullptr;
                 if (src) {
                     CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
                 } else {
                     // read in place: repack the expert out of the mapping into the host buffer, then copy it
-                    expert_blob(L, s, E.repack.data());
+                    expert_blob(L, e, E.repack.data());
                     CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
                 }
             }
@@ -3577,8 +3612,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         H.slot_of.assign((size_t) ne, -1);
         H.exp_in_slot.assign((size_t) S, 0);
         for (int s = 0; s < S; ++s) {
-            H.slot_of[(size_t) s] = s;
-            H.exp_in_slot[(size_t) s] = s;
+            H.slot_of[(size_t) (slot_off + s)] = s;
+            H.exp_in_slot[(size_t) s] = slot_off + s;
         }
         // The peer's slots: the experts the primary does not hold, on the peer's card.
         if (S_peer > 0) {
@@ -4665,7 +4700,11 @@ int strata::minimaxm2::run(int argc, char** argv) {
     E.draft_n = std::max(0, draft_vocab);
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-m2: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
-    if (warm) E.warmup();
+    if (warm) {
+        E.warmup();
+        // The warm-up's rows are in the K / V cache: the real prompt must not read them.
+        E.reset();
+    }
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
         // llama-bench's shapes: a prompt of bench_pp tokens from a fresh state, then bench_tg tokens one at a time
