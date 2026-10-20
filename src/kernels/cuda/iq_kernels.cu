@@ -769,10 +769,18 @@ template<> struct Fmt<146> { static constexpr int qk = 128, ipb = 8, step = 4;
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
+// The down matrix of an expert: the formats whose row is decoded by the same kernel as the gate/up rows,
+// and the ones with a down-only kernel.  The i-quants (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ1_M) were
+// gate/up only until MiniMax-M2 needed them the other way round: its files store the down matrix in the same
+// i-quant as the gate/up (bartowski's IQ2_XXS: IQ1_M or IQ2_XS on both sides), and the down row is the same
+// 256-value blocks read the same way - only the row length differs (n_ff, not n_embd).  The Fmt<T> templates
+// and the row-byte geometry were already there for the gate/up side.
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) \
+                        X(16) X(17) X(18) X(21) X(22) X(29)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) \
+                        X(16) X(17) X(18) X(21) X(22) X(29)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
@@ -2932,6 +2940,36 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
+// Q2_K (MiniMax-M2's IQ2_XXS file carries its token_embd at Q2_K): llama.cpp's dequantize_row_q2_K, its 256
+// values over 32 threads (4 values each).  The block holds 16 scales and 16 mins packed 6 bits each (one byte
+// per sub-block), 64 bytes of 2-bit quants, and the super-block scales d and dmin.  ggml walks the block as
+// two halves of 128 values, four groups of 32 inside each, and each group of 32 takes TWO scales: the first
+// 16 values use one, the next 16 the other, with the same 2-bit shift for the whole group.
+template<typename dst_t>
+__device__ void dq_q2_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q2_K* x = (const block_q2_K*) vx + ibs;
+    // the super-block scales live in the union's `data` member in every device build (ggml-common.h names it
+    // `data` for C++, CUDA, HIP and SYCL; the C build leaves the struct anonymous)
+    const float d = (float) x->data.d;
+    const float dmin = (float) x->data.dmin;
+    // 16 threads per half of 128 values, 8 values each: the half holds 4 groups of 32 values, and a group
+    // holds two sub-groups of 16 with their own scale, so a thread takes half of a sub-group.
+    const int half = tid / 16;              // 0 or 1: the two halves of 128 values
+    const int r = tid % 16;
+    const int sub = r / 2;                  // the sub-group of 16 values (8 of them in a half)
+    const int j = sub / 2;                  // the group of 32 values
+    const int grp = sub % 2;                // the first or the second 16 of the group
+    const int hs = r % 2;                   // which half of the 16 this thread takes
+    const int is = 8 * half + 2 * j + grp;
+    const uint8_t sc = x->scales[is];
+    const float dl = d * (float) (sc & 0xF);
+    const float ml = dmin * (float) (sc >> 4);
+    const int shift = 2 * j;
+    const uint8_t* q = x->qs + 32 * half + 16 * grp + 8 * hs;
+    dst_t* y = yy + 128 * half + 32 * j + 16 * grp + 8 * hs;
+    for (int l = 0; l < 8; ++l)
+        y[l] = cvt<dst_t>(dl * (float) ((int8_t) ((q[l] >> shift) & 3)) - ml);
+}
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3183,6 +3221,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;   // MiniMax-M2's IQ2_XXS token_embd
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
@@ -4174,8 +4213,9 @@ void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
-// BF16 and Q6_K: embedding only (dq_dispatch has them; no expert or prompt-path kernels take them)
-bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30 || t == 14; }
+// BF16, Q6_K and Q2_K: embedding only (dq_dispatch has them; no expert or prompt-path kernels take them).
+// Q2_K is MiniMax-M2's token_embd (its IQ2_XXS file) - the experts there are i-quants, never Q2_K.
+bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30 || t == 14 || t == 10; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
@@ -4187,7 +4227,8 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
-        case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
+    case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
@@ -4228,7 +4269,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    // embed_type_supported, not is_iq: the embedding-only types (Q2_K, Q6_K, BF16) are dequantized here too
+    if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
     check("iq_dequant_f16");
 }

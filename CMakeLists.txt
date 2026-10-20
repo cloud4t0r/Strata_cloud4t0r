@@ -2086,6 +2086,11 @@ if(STRATA_BUILD_TESTS)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)   # #93: it needs the device dequantizers and a GPU runtime
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+
+    # the Q2_K dequantizer (MiniMax-M2's IQ2_XXS token_embd) against the artifact's CPU reference
+    add_executable(q2_k_dequant_parity src/kernels/q2_k_dequant_parity.cpp)
+    target_link_libraries(q2_k_dequant_parity PRIVATE strata_engine strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+    add_test(NAME q2_k_dequant_parity COMMAND q2_k_dequant_parity)
   endif()
 
   add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)

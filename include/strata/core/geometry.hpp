@@ -54,7 +54,8 @@ struct ModelGeometry {
     int64_t n_expert_used = 10;     ///< expert_used_count
     int64_t n_ff = 640;             ///< expert_feed_forward_length (= expert_shared_feed_forward_length)
 
-    // appended for the model families (Qwen3.6 = qwen35moe); the defaults keep Flash-Next's values
+    // appended for the model families (Qwen3.6 = qwen35moe, MiniMax-M2 = minimax-m2); the defaults keep
+    // Flash-Next's values
     int64_t n_ff_shexp = 640;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
@@ -65,6 +66,11 @@ struct ModelGeometry {
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
     constexpr int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
     constexpr int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
+    /// A linear-attention (Gated-DeltaNet) layer exists.  MiniMax-M2 has none: its full-attention interval is 1,
+    /// so every layer is a full-attention layer and the GDN keys are absent from its file.
+    constexpr bool has_ssm() const { return n_gdn_layers() > 0; }
+    /// A shared expert beside the routed ones.  MiniMax-M2 has none (shared_intermediate_size 0).
+    constexpr bool has_shared_expert() const { return n_ff_shexp > 0; }
 };
 
 /// The shape the kernels are compiled for.  A kernel that fixes a dimension at compile time asserts it here.

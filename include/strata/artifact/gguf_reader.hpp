@@ -645,6 +645,29 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// MiniMax-M2's guard: every key the geometry is read from must be present (core::geometry_from_gguf), and the
+/// ones that describe one thing twice must agree.  The key list is the one the published GGUFs carry
+/// (bartowski/MiniMaxAI_MiniMax-M2-GGUF, unsloth/MiniMax-M2-GGUF): there is no ssm.* key, no
+/// full_attention_interval, no expert_shared_feed_forward_length and no nextn_predict_layers, because the
+/// model has no GDN layer, no shared expert and no MTP block in its released weights.
+inline std::string check_architecture_minimax_m2(const GgufFile& g) {
+    static const char* const keys[] = {
+        "minimax-m2.block_count", "minimax-m2.embedding_length", "minimax-m2.attention.head_count",
+        "minimax-m2.attention.head_count_kv", "minimax-m2.attention.key_length", "minimax-m2.attention.value_length",
+        "minimax-m2.attention.layer_norm_rms_epsilon", "minimax-m2.expert_count", "minimax-m2.expert_used_count",
+        "minimax-m2.expert_feed_forward_length", "minimax-m2.expert_gating_func", "minimax-m2.rope.dimension_count",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const MetaValue* used = g.get("minimax-m2.expert_used_count");
+    const MetaValue* cnt = g.get("minimax-m2.expert_count");
+    if (used->u > cnt->u) return "minimax-m2.expert_used_count is bigger than minimax-m2.expert_count";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -832,6 +855,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::MiniMaxM2) return check_architecture_minimax_m2(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
