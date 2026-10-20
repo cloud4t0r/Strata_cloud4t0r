@@ -79,7 +79,11 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 constexpr int kThreads = 256;
-constexpr int kChunkCells = 256;   // attention split-K chunk
+// The attention's split-K chunk, in cells.  It is also the block size of the chunk kernel: each thread
+// owns one cell of the chunk and writes its softmax weight into sc[].  With MiniMax-M2's head dim of 128
+// the chunk is 128 cells (the Qwen3.6 path's 256 cells with 256 threads each wrote every weight; a
+// 256-cell chunk with a 128-thread block would leave half the chunk's weights unwritten).
+constexpr int kChunkCells = 128;
 constexpr int kHD = 128;           // MiniMax-M2's head dim (load() refuses any other)
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
 
@@ -1282,6 +1286,18 @@ struct Engine {
     int64_t rows_pmax = 0;                                                  // (eager) the highest cell of the rows
     // pictures (--vision): the request's rows replace the embeddings of its <|image_pad|> cells; M-RoPE
     bool vision = false;
+    // The low-RAM mode: no host copy of the experts at all.  The experts stay in the GGUF mapping and the
+    // CPU pool reads them where they lie (the job's blob is the gate rows, the job's NativeFmt carries the
+    // byte distances to the up and down tensors).  On a 64 GB box the copy of a 49 GB model does not fit
+    // beside the file: the placement then ran at 39-52 MB/s and the box thrashed (3.5 GB of swap).
+    bool low_ram = false;
+    // The repack buffers: one expert's blob, for the GPU's copy out of the mapping.  ONE PER STREAM: the copy
+    // out of the host buffer is ASYNC, so the host buffer stays in use until the stream has taken it - one
+    // buffer shared by the prompt path and the slot replacement has them corrupt each other's expert (the
+    // two copies overlap, and the answer changes with the speed of the machine).
+    std::vector<uint8_t> repack;         // the decode path's (the slot replacement)
+    std::vector<uint8_t> repack_pf;      // the prompt path's (the staged copy)
+    std::vector<strata::kernels::cpu::NativeFmt> zc_fmt;   // the per-job layouts of the experts read in place
     int32_t* d_mtab = nullptr;          // [ctx][3] t, h, w of the current request's prompt cells (vision)
     const int32_t* mtab_now = nullptr;  // set for a forward over prompt cells that need it, else null
     int32_t* d_delta = nullptr;         // device scalar: the current session's rotary offset (decode graphs read it)
@@ -1855,18 +1871,33 @@ struct Engine {
     bool route_group(const Layer& L, const int32_t* slot_of, int T, int ld) {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
-        if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 4) return false;
+        // MiniMax-M2 picks 8 experts of 256 (expert_used_count 8); the kernel is instantiated for the two
+        // counts the family can carry.  It matters: falling back to native_router_topk would be the SOFTMAX
+        // router, and MiniMax-M2's is a sigmoid with a per-expert selection bias - a different choice of
+        // experts, and a different answer.
+        if (!fast_k || T > 8 || m->g.n_expert != 256 || (Kp != 4 && Kp != 8)) return false;
         // MiniMax-M2's router: the sigmoid gate and the per-expert selection bias (the file's
         // expert_weights_scale, 2.0, rides in the weights).
         const float scale = m->expert_weights_scale;
-        if (slot_of)
-            m2k::k_route_group_m2<true, 4><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
+        if (Kp == 8) {
+            if (slot_of)
+                m2k::k_route_group_m2<true, 8><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
+                                                                               slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
+                                                                               ent_dst, ent_tok);
+            else
+                m2k::k_route_group_m2<false, 8><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
+                                                                                nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
+                                                                                ent_dst, ent_tok);
+        } else {
+            if (slot_of)
+                m2k::k_route_group_m2<true, 4><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
                                                                            slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
                                                                            ent_dst, ent_tok);
-        else
-            m2k::k_route_group_m2<false, 4><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
+            else
+                m2k::k_route_group_m2<false, 4><<<1, dim3(32, 8), 0, st>>>(logits_r, L.router_bias, ids, ewts, T, ld, scale,
                                                                             nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
                                                                             ent_dst, ent_tok);
+        }
         grouped_by_route = true;
         // the verify arm compares against native_router_topk, which is the SOFTMAX router: MiniMax-M2's is a
         // sigmoid with a selection bias, so the two are not comparable and the arm stays off here.
@@ -2047,7 +2078,7 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<kHD><<<dim3(nc, nt * H), HD, 0, st>>>(q, rows_mode ? nullptr : kc[li],
+                    k_attn_part<kHD><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                     rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                                                                     1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
                     k_attn_merge<kHD><<<nt * H, HD, 0, st>>>(pacc, pm, pl, dpos, t0, H, n_chunk, att, rs);
@@ -2224,7 +2255,25 @@ struct Engine {
         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
-        if (all || 2 * L.n_slots < ne) {
+        if (!L.hblobs) {
+            // the low-RAM mode: the experts are read where they lie, so each one is repacked out of the
+            // mapping into the host buffer and copied on its own (the staging buffer wants the native
+            // [gate | up | down] layout, which the mapping does not have).
+            for (int x = 0; x < ne; ++x) {
+                const bool dev = H.slot_of[(size_t) x] >= 0;
+                if (dev) {
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
+                                       L.L.bytes, cudaMemcpyDeviceToDevice, cst));
+                } else {
+                    // the host buffer stays in use until the copy has taken it: wait for the stream before
+                    // filling it again
+                    CK(cudaStreamSynchronize(cst));
+                    expert_blob(L, x, repack_pf.data());
+                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, repack_pf.data(), L.L.bytes, cudaMemcpyHostToDevice,
+                                       cst));
+                }
+            }
+        } else if (all || 2 * L.n_slots < ne) {
             CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
         } else {
             for (int x = 0; x < ne;) {
@@ -2290,6 +2339,9 @@ struct Engine {
         const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
+        // The per-job layouts of the experts read in place.  Sized ONCE here: a resize inside the loop
+        // would move the vector and leave the jobs already created pointing at freed memory.
+        if (zc_fmt.size() < (size_t) n_ent) zc_fmt.resize((size_t) n_ent);
         std::vector<char> quantized((size_t) T, 0);
         int n_miss = 0;
         std::map<int, size_t> open;   // expert -> its job with room
@@ -2312,7 +2364,24 @@ struct Engine {
             auto it = open.find(x);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
-                j.blob = L.hblobs + (size_t) x * L.stride;
+                if (L.hblobs) {
+                    j.blob = L.hblobs + (size_t) x * L.stride;
+                    j.fmt = nullptr;
+                } else {
+                    // the GGUF read in place: the blob is the expert's gate rows, and its up and down rows
+                    // are at their distance in the mapping (the job's own NativeFmt carries them)
+                    j.blob = L.src_g + (size_t) x * L.src_gsz;
+                    C::NativeFmt& f = zc_fmt[jobs.size()];
+                    f = H.fmt;
+                    // The distance from THIS expert's gate rows to its up and down rows, in the mapping.  The
+                    // job's blob is at src_g + x * src_gsz, so the x terms only cancel for the up matrix
+                    // (same size per expert); the down matrix is n_embd rows of d_row, a different size, and
+                    // its x term stays.
+                    f.up_off = (size_t) ((uintptr_t) L.src_u - (uintptr_t) L.src_g);
+                    f.down_off = (size_t) ((uintptr_t) L.src_d - (uintptr_t) L.src_g) +
+                                 (size_t) x * (L.src_dsz - L.src_gsz);
+                    j.fmt = &f;
+                }
                 jobs.push_back(j);
                 it = open.insert_or_assign(x, jobs.size() - 1).first;
             }
@@ -2370,8 +2439,16 @@ struct Engine {
                     H.slot_of[(size_t) y] = -1;
                     H.slot_of[(size_t) x] = s;
                     H.exp_in_slot[(size_t) s] = x;
-                    CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
-                                       cudaMemcpyHostToDevice, st));
+                    if (L.hblobs) {
+                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
+                                           cudaMemcpyHostToDevice, st));
+                    } else {
+                        // the low-RAM mode: the expert is repacked out of the mapping first
+                        CK(cudaStreamSynchronize(st));
+                        expert_blob(L, x, repack.data());
+                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, repack.data(), L.L.bytes,
+                                           cudaMemcpyHostToDevice, st));
+                    }
                     --left;
                     ++hy_swaps;
                     changed = true;
@@ -2959,19 +3036,30 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies).
+    // The low-RAM mode keeps NO copy: the experts stay in the mapping and are read where they lie.
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
-        (void) cudaGetLastError();
-        arena = (uint8_t*) std::malloc(host);
-        if (!arena) {
-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-            return false;
+    bool pinned = false;
+    if (!E.low_ram) {
+        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+        if (!pinned) {
+            (void) cudaGetLastError();
+            arena = (uint8_t*) std::malloc(host);
+            if (!arena) {
+                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+                return false;
+            }
         }
+    }
+    {   // the low-RAM mode's repack buffers: one expert's blob, out of the mapping (before the slots' copy,
+        // which uses it)
+        size_t max_bytes = 0;
+        for (Layer* L : all) max_bytes = std::max(max_bytes, L->L.bytes);
+        E.repack.assign(max_bytes, 0);
+        E.repack_pf.assign(max_bytes, 0);
     }
     size_t off = 0;
     E.hy.resize(all.size());
@@ -2988,10 +3076,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        if (E.low_ram) {
+            // no host copy: the expert e of this layer is the gate rows at src_g + e * src_gsz, and its up
+            // and down rows are at their distance in the mapping (the GGUF stores the expert as the SLOWEST
+            // dimension, so each expert is contiguous).
+            L.hblobs = nullptr;
+        } else {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        }
         L.n_slots = S;
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
@@ -3000,9 +3095,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             // pinned arena is staged through the driver's bounce buffer instead of being a DMA, and it ran at
             // 5 MB/s on this box (a 256 MB copy from a 256 MB pinned buffer: 10 GB/s).  One expert is 4 MB, and
             // that is a DMA.
-            for (int s = 0; s < S; ++s)
-                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) s * L.stride, L.L.bytes,
-                               cudaMemcpyHostToDevice));
+            for (int s = 0; s < S; ++s) {
+                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) s * L.stride : nullptr;
+                if (src) {
+                    CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
+                } else {
+                    // read in place: repack the expert out of the mapping into the host buffer, then copy it
+                    expert_blob(L, s, E.repack.data());
+                    CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
+            }
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
@@ -3029,6 +3131,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
+
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
@@ -3782,6 +3885,7 @@ int serve(Engine& E) {
 
 int strata::minimaxm2::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
+    bool low_ram = false;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
@@ -3824,6 +3928,7 @@ int strata::minimaxm2::run(int argc, char** argv) {
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--low-ram") low_ram = true;   // no host copy of the experts: they stay in the mapping
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -3864,6 +3969,11 @@ int strata::minimaxm2::run(int argc, char** argv) {
     }
     Engine E;
     E.use_graph = graph;
+    // the low-RAM mode: no host copy of the experts (they stay in the GGUF mapping and the CPU pool reads
+    // them where they lie).  On a 64 GB box the copy of a 49 GB model does not fit beside the file: the
+    // placement ran at 39-52 MB/s and the machine thrashed (3.5 GB of swap in and out).
+    E.low_ram = low_ram || std::getenv("STRATA_M2_LOW_RAM") != nullptr;
+    if (E.low_ram) std::fprintf(stderr, "strata-m2: low-RAM mode: the experts stay in the file, no host copy\n");
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
