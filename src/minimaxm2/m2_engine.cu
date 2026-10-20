@@ -2630,11 +2630,19 @@ struct Engine {
         PeerHy& P = peer_hy[li];
         // The peer's stream waits for the routing (the ids) and for the activations.  EVERY call on the peer's
         // stream needs the PEER's device current: HIP refuses a launch on a stream that belongs to another device.
+        // The ids and the activations, copied to the peer's card.  The copy is issued with the SOURCE's device
+        // current and on the source's stream: a peer copy reads the source in the SOURCE's address space, and
+        // with the peer's device current it would read the peer's memory at that address (garbage).
+        CK(cudaSetDevice(0));
+        CK(cudaGetLastError());
+        CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, st));
+        CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, st));
+        CK(cudaEventRecord(ev_xq, st));   // the copies are done (and the quantization was before them)
+        // From here on, every call on the peer's stream needs the PEER's device current: HIP refuses a launch
+        // on a stream that belongs to another device.
         CK(cudaSetDevice(peer_device));
+        CK(cudaGetLastError());
         CK(cudaStreamWaitEvent(peer_st, ev_xq, 0));
-        // the ids and the activations, copied to the peer's card (a device-to-device copy does not cross cards)
-        CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, peer_st));
-        CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, peer_st));
         // the grouping on the peer: only the entries whose expert it holds
         // the DENSE rows (one per expert the peer holds), not the entries: the table is the grouping's, and it
         // has one row per expert
@@ -2726,6 +2734,33 @@ struct Engine {
         if (n_miss == 0) return;
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
+        {   // DIAG: the host rows (the CPU pool's and the peer's), before they are merged
+            const char* lay = std::getenv("STRATA_M2_DUMP_ROWS");
+            if (lay && (int) li == std::atoi(lay)) {
+                std::fprintf(stderr, "ROWS layer %d T=%d :", (int) li, T);
+                for (int e = 0; e < 3; ++e)
+                    for (int j = 0; j < 3; ++j) std::fprintf(stderr, " %.9g", cpu_out[(size_t) e * N + j]);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
+        {   // DIAG: the host rows (the CPU pool's and the peer's), and which entries the peer took
+            const char* lay = std::getenv("STRATA_M2_DUMP_ROWS");
+            if (lay && (int) li == std::atoi(lay)) {
+                std::fprintf(stderr, "ROWS layer %d T=%d :", (int) li, T);
+                for (int e = 0; e < 8 && e < n_ent; ++e)
+                    for (int j = 0; j < 2; ++j) std::fprintf(stderr, " %.9g", cpu_out[(size_t) e * N + j]);
+                std::fprintf(stderr, "\n");
+                std::fprintf(stderr, "IDS  layer %d T=%d :", (int) li, T);
+                for (int e = 0; e < 8 && e < n_ent; ++e) {
+                    const int32_t x = h_ids[e];
+                    const int slot = (peer_device >= 0 && li < peer_hy.size()) ? peer_hy[(size_t) li].slot_of[(size_t) x] : -1;
+                    std::fprintf(stderr, " %d%s", x, slot >= 0 ? "*" : "");
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
         k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
