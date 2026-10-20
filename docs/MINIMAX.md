@@ -731,6 +731,31 @@ So the MiniMax-M2 engine path needs the same treatment in three places:
 Until then MiniMax-M2 loads and runs a step on this box, but the placement takes half an hour and the
 machine thrashes while it does.
 
+### It answers correctly (2026-10-20, after the low-RAM mode)
+
+`strata-m2 --low-ram` on "The capital of France is" gives **8261 (" Paris")** - the token llama.cpp gives on
+the same file and the same ids.  The logits are within **1.09** of the reference's (5.7% of the max logit),
+with 4 of the top-5 shared.  The gap is the expert rows' quantization (Q8_K) and the accumulation order,
+not a wrong expert.
+
+The low-RAM mode is what made it usable: the placement went from **857 s to 1.8 s**, and the machine
+stopped thrashing.  The copy of a 49 GB model does not fit beside the file it is read from; with no copy,
+the experts stay in the GGUF mapping, the CPU pool reads them where they lie (the job's blob is the gate
+rows, the job's `NativeFmt` the byte distances to the up and down rows), and the GPU's copies repack one
+expert at a time.
+
+Three bugs were found on the way, all of them mine:
+
+  * the router picked **4 experts instead of 8** (the file's `expert_used_count` is 8, the kernel had 4
+    hard-wired), so `route_group()` refused and the engine fell back to `native_router_topk` - the
+    **softmax** router.  A different choice of experts, and a different answer.
+  * the repack buffer was **shared** between the prompt path and the slot replacement, and the copy out of
+    a host buffer is asynchronous: the two paths corrupted each other's experts, and the answer changed
+    with the speed of the machine.  One buffer per stream now.
+  * the attention's split-K chunk is also the chunk kernel's block size (each thread writes one cell's
+    softmax weight into `sc[]`): with a 256-cell chunk and a 128-thread block - MiniMax-M2's head dim is 128
+    - half the chunk's weights were never written.  The chunk is 128 cells now.
+
 ### The copy into VRAM, and the driver
 
 The second half of the placement - the slots' copy from the pinned host arena into VRAM - runs at **10 MB/s**
