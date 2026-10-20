@@ -731,6 +731,20 @@ So the MiniMax-M2 engine path needs the same treatment in three places:
 Until then MiniMax-M2 loads and runs a step on this box, but the placement takes half an hour and the
 machine thrashes while it does.
 
+### The copy into VRAM, and the driver
+
+The second half of the placement - the slots' copy from the pinned host arena into VRAM - runs at **10 MB/s**
+on this box, while the same operation from a 256 MiB pinned buffer runs at **10.15 GB/s** (sync) and
+**11.79 GB/s** (async) (`hipMemcpy` on the RX 9070, ROCm 10.1).  The arena is resident and pinned
+(`RssShmem` 49.26 GB), the PCIe link is up (32 GT/s), and the stack shows the thread waiting inside
+`hipMemcpy`.  Copying one expert at a time instead of a whole layer's slots changed nothing (10 MB/s
+either way), so it is not the size of the copy.
+
+A thousand times between a 256 MiB and a 49 GB registered host region is the driver's handling of a very
+large registered allocation, not the link and not the code's copy shape.  The next thing to try is
+bisecting the arena size (a 4 GB arena with the same code), and then the low-RAM mode above, which does
+not need the arena at all.
+
 ### The other finding: the two cards
 
 The layer split across GPUs lives in the **Flash-Next** path (`src/program/generate.cpp`, the stage search,
