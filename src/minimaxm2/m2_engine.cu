@@ -1296,7 +1296,9 @@ struct Engine {
     X(__half*, att_p16) X(__half*, k16) X(__half*, v16) X(__half*, q16) X(float*, mq_gu)          \
     X(float*, mq_h) X(int32_t*, d_delta)                                                         \
     X(cudaEvent_t, ev_route) X(cudaEvent_t, ev_xq) X(cublasHandle_t, blas)                    \
-    X(float*, vbuf) X(void*, vq) X(void*, vgrp) X(float*, vx_) X(float*, vh_)
+    X(float*, vbuf) X(void*, vq) X(void*, vgrp) X(float*, vx_) X(float*, vh_)                \
+    X(int32_t*, d_rcell) X(int32_t*, d_rslot) X(int32_t*, d_rdelta)                           \
+    X(int32_t*, d_gslot) X(int32_t*, d_grow0) X(int32_t*, d_gcnt)
     struct Buf {
 #define STRATA_M2_BUF_DECL(T, N) T N = nullptr;
         STRATA_M2_BUF_LIST(STRATA_M2_BUF_DECL)
@@ -1589,6 +1591,13 @@ struct Engine {
         // The cards' buffers: the same set, once per card (the layer split).  The stream and the events go
         // with it: a stream belongs to its card.
         auto alloc_core = [&](int card) {
+            // the decode / verify's rows: per card (the verify's path runs on the card that decodes)
+            d_rcell = dalloc_t<int32_t>(kVerify);
+            d_rslot = dalloc_t<int32_t>(kVerify);
+            d_rdelta = dalloc_t<int32_t>(kVerify);
+            d_gslot = dalloc_t<int32_t>(kVerify);
+            d_grow0 = dalloc_t<int32_t>(kVerify);
+            d_gcnt = dalloc_t<int32_t>(kVerify);
             d_delta = dalloc_t<int32_t>(1);   // the rotary offset: per card (it belongs to its card)
             // the stream, the events and the pool's buffers: per card (a stream and an event belong to their card)
             CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -1742,12 +1751,6 @@ struct Engine {
                     CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
                                   cudaMemcpyHostToDevice));
                 }
-                d_rcell = dalloc_t<int32_t>(kVerify);
-                d_rslot = dalloc_t<int32_t>(kVerify);
-                d_rdelta = dalloc_t<int32_t>(kVerify);
-                d_gslot = dalloc_t<int32_t>(kVerify);
-                d_grow0 = dalloc_t<int32_t>(kVerify);
-                d_gcnt = dalloc_t<int32_t>(kVerify);
                 CK(cudaHostAlloc((void**) &hrow, 128 * sizeof(int32_t), cudaHostAllocDefault));
             }
             if (vision) {
@@ -4389,7 +4392,7 @@ int strata::minimaxm2::run(int argc, char** argv) {
     Model m;
     // The layer split: the second card gets its own copy of the weights of the layers it runs (the cards do
     // not share their memory), so the loader must know about it BEFORE it uploads the weights.
-    if (layer_split > 0 && layer_split < (int) m.g.n_layers) {
+    if (layer_split > 0 && layer_split <= (int) m.g.n_layers) {
         int n_dev = 1;
         CK(cudaGetDeviceCount(&n_dev));
         CK(cudaGetLastError());
