@@ -24,6 +24,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/minimaxm2/engine.hpp"
@@ -1139,6 +1140,13 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         y.src_g = gm.shard(sg).tensor_data(*tg);
         y.src_u = gm.shard(su).tensor_data(*tu);
         y.src_d = gm.shard(sd).tensor_data(*td);
+        // The experts are read from the mapping, one expert at a time, when they are placed in VRAM.  Without a
+        // read-ahead the kernel serves those pages one by one: the placement of a 48 GB model then runs at the
+        // mmap's page-fault rate (measured: 52 MB/s) instead of the drive's (4.3 GB/s).  Asking for the whole
+        // region up front puts the drive in sequential mode.
+        strata::platform::advise_willneed(y.src_g, strata::tensor_payload_bytes(*tg));
+        strata::platform::advise_willneed(y.src_u, strata::tensor_payload_bytes(*tu));
+        strata::platform::advise_willneed(y.src_d, strata::tensor_payload_bytes(*td));
         y.src_gsz = gsz;
         y.src_dsz = dsz;
     }
