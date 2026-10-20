@@ -20,6 +20,13 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
 bool native_router_topk_supported(int n_expert, int k);
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream);
+/// The same for a router that gates with a SIGMOID and carries a per-expert selection bias (MiniMax-M2):
+/// the BIASED values (the sigmoid plus `bias`) decide which experts are picked, and the weight of a pick is the
+/// UNBIASED sigmoid of its logit; the picks' weights are normalised to sum to one and scaled by `scale`.
+/// logits and bias [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
+bool native_router_topk_sigmoid_supported(int n_expert, int k);
+void native_router_topk_sigmoid(const float* logits, const float* bias, int32_t* ids, float* weights,
+                                int n_expert, int k, int n_tok, float scale, void* stream);
 /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
 /// `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident before, non-resident after.
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,

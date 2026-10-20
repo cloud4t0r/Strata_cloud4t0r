@@ -205,6 +205,57 @@ __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < K) weights[lane] = selected * inverse_selected_sum;
 }
+// The same, for a router that GATES WITH A SIGMOID and carries a per-expert selection bias (MiniMax-M2):
+// the BIASED values decide which experts are picked, and the weight of a pick is the UNBIASED sigmoid of its
+// logit, the picks' weights normalised to sum to one and then scaled.  One warp per token, n_tok tokens
+// (8 per block), so it covers a prompt of any length - the Qwen3.6 path's own kernel only covers the decode's
+// eight tokens at a time, and a prompt that fell back on it was routed by the SOFTMAX.
+template <int NE, int K>
+__launch_bounds__(256, 1)
+__global__ void route_topk_sigmoid(const float* __restrict__ logits, const float* __restrict__ bias,
+                                   int32_t* __restrict__ ids, float* __restrict__ weights, int n_tok, float scale) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
+    if (tk >= n_tok) return;
+    logits += (size_t) tk * NE; ids += (size_t) tk * K; weights += (size_t) tk * K;
+    // the bias is PER LAYER: the same NE values for every token (not offset by the token)
+    const int lane = threadIdx.x;
+    float values[V];   // the unbiased sigmoid: the weight of a pick
+    float sel[V];      // the biased values: the choice
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        const float v = logits[lane + i * 32];
+        values[i] = 1.0f / (1.0f + expf(-v));
+        sel[i] = values[i] + bias[lane + i * 32];
+    }
+    float selected = 0.f, selected_sum = 0.f;
+    for (int rank = 0; rank < K; ++rank) {
+        float best = sel[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < V; ++i)
+            if (sel[i] > best) { best = sel[i]; expert = lane + i * 32; }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        // the winner's UNBIASED sigmoid, from the lane that owns it (the shfl is a warp collective: every lane
+        // runs it)
+        const float unbiased = __shfl_sync(0xffffffffu, (expert & 31) == lane ? values[expert / 32] : 0.0f, expert & 31, 32);
+        if ((expert & 31) == lane) {
+            sel[expert / 32] = -INFINITY;
+            ids[rank] = expert;
+            selected_sum += values[expert / 32];
+        }
+        if (rank == lane) selected = unbiased;
+    }
+    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum * scale;
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -246,6 +297,24 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
         throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
     route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
         logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+bool native_router_topk_sigmoid_supported(int n_expert, int k) { return n_expert == 256 && (k == 4 || k == 8); }
+void native_router_topk_sigmoid(const float* logits, const float* bias, int32_t* ids, float* weights,
+                                int n_expert, int k, int n_tok, float scale, void* stream) {
+    if (!stream || n_tok < 1 || !native_router_topk_sigmoid_supported(n_expert, k) ||
+        !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(bias, (size_t) n_tok * n_expert * 4) ||
+        !valid(ids, (size_t) n_tok * k * 4) || !valid(weights, (size_t) n_tok * k * 4))
+        throw std::invalid_argument("native_router_topk_sigmoid: a stream, a supported (experts, k) and aligned buffers");
+    const auto grid = (unsigned) ((n_tok + 7) / 8);
+    if (k == 8)
+        route_topk_sigmoid<256, 8><<<grid, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, bias, ids, weights, n_tok, scale);
+    else
+        route_topk_sigmoid<256, 4><<<grid, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, bias, ids, weights, n_tok, scale);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
