@@ -2100,8 +2100,12 @@ struct Engine {
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
+        // The routing: MiniMax-M2's SIGMOID gate with its per-expert selection bias.  The fast path (the
+        // decode's eight tokens at a time) groups the picks as it goes; a prompt of any length goes through
+        // the generic kernel, which does the same arithmetic.  The softmax router would pick OTHER experts.
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
-            K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
+            K::native_router_topk_sigmoid(logits_r, L.router_bias, ids, ewts, (int) g.n_expert, Kp, T,
+                                         m->expert_weights_scale, st);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         if (hy_rows) {
@@ -3025,8 +3029,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
-    // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
-    int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    // --expert-slots: that many per layer (tests: the same split with and without the MTP block).
+    // A NEGATIVE count means NO slot at all: every expert goes to the CPU pool.  It is what takes the slots
+    // out of the picture when the answer has to be compared with a reference (the placement reads 0 as "the
+    // VRAM budget", so 0 could not do it).
+    int S = slots < 0 ? 0 : (slots > 0 ? (int) std::min<int64_t>(ne, slots)
+                                          : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot));
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
