@@ -917,44 +917,37 @@ that the M2 path does not have.
 **The order to do it in**: the peer tier first (it is the same card twice, the same kernels, the same rows, and
 it takes the CPU pool's biggest share), then the layer split if the numbers still call for it.
 
-### The peer tier in the M2 path: written, not validated yet
+### The peer tier in the M2 path: it runs, on both cards at the same time
 
-The peer tier is now written in `src/minimaxm2/m2_engine.cu`, behind `--peer-device N`.  **It is not validated:
-the peer's expert kernel faults on the peer card.**  The path is behind `STRATA_M2_PEER_EXPERIMENTAL=1`, so
-`--peer-device` alone refuses and says why.
+The peer tier is written in `src/minimaxm2/m2_engine.cu`, behind `--peer-device N` and
+`STRATA_M2_PEER_EXPERIMENTAL=1`.  **The model runs on the two cards at once** (the primary holds 48 of the 256
+experts per layer, the second card 74 of them, the rest goes to the CPU pool), and the first generated token
+matches the reference (8261).
 
-What is in place:
+Five bugs had to be found and fixed, each of them a crash or a wrong answer first:
 
-  * the peer device and its stream, and its slots per layer, filled with the experts the primary does not hold
-    (the primary keeps the first 48 of the 256, the peer the next ones), read out of the mapping one expert at
-    a time, so the low-RAM mode still needs no host copy;
-  * the slots' allocation asks the card for its real free VRAM layer by layer, and a card that is short of room
-    takes fewer slots (on this box, the RX 6800 took **74 of the 256 experts per layer, 14.19 GiB**, with the
-    RX 9070 keeping 48 of them, 9.21 GiB);
-  * the peer's own grouping and expert buffers, on its card, and the copies of the ids and of the activations
-    (`hipMemcpyPeerAsync`: a device-to-device copy does not cross cards);
-  * the scatter of the peer's rows into the same pinned host rows the CPU pool writes (the buffer is allocated
-    portable, so both cards see the same addresses), the event the primary waits on before the merge, and the
-    CPU pool skipping the entries the peer holds.
+  * the peer's expert kernel faulted on the peer card: its entries' tables (`ent_dst`, `ent_tok`) were sized on
+    the dense rows (256) instead of on the entries (T * Kp), so the kernel read 400 KB past the end;
+  * the peer copied the activations while the primary was still quantizing them: it now waits on an event
+    recorded after the quantization;
+  * the peer's rows were scattered a second time: the expert kernels already write them at the entries'
+    positions, so the peer writes straight into the host rows (the portable pinned buffer) and the merge takes
+    them there;
+  * the peer's scratch is sized with the layer's FF, like the primary's;
+  * the peer's slots check the card's real free VRAM layer by layer (the RX 6800 takes 74 experts per layer,
+    14.19 GiB, not the 79 the budget said).
 
-Three HIP facts the port had to learn, each of them a crash first:
+**Two things are not settled yet.**  The 64-token run on the two cards diverges from the one-card run at the
+sixth token, so the peer's rows are not bit-identical to the CPU pool's (the first token, the argmax, matches;
+the logits do not).  And the decode is **slower** with the second card: 16.0 tok/s on one RX 9070, 10.5 tok/s
+with the RX 6800 as the peer (64 tokens, 4096 of context, the IQ2_XXS file, the low-RAM mode, measured on this
+box).  The second card takes a quarter of the pool's work off the CPU, but an RX 6800 is much slower than a
+RX 9070 and the rows travel over PCIe, so it costs more than it saves.  With a second RX 9070 the balance would
+be different - that is not measured here.
 
-  * **every call on a stream that belongs to another device needs that device current** (`hipSetDevice` before
-    the launch, and back to the primary after): HIP refuses the launch otherwise;
-  * `hipMemcpyPeerAsync(dst, dstDevice, src, srcDevice, size, stream)`: the device ids come before the size;
-  * the grouping's table has one row **per expert**, not per entry: the memset over the entries (16,384 of
-    them in a prompt chunk) ran past the buffer (256 rows) and HIP called it "invalid argument".
-
-**What is not finished**: the peer's expert kernel (`native_gu_multi_kernel`, the IQ2_XS gate/up kernel) reads
-an address that is not there on the peer card, and the run ends with a memory access fault.  The grouping is
-right (the probe counted the groups), the ids and the slot table arrive, the activations are copied: the fault
-is inside the peer's own expert run.  The next thing to try is the peer's expert layout (`L.L` is the layer's,
-and the peer's slots have the primary's `stride`), and then the scratch buffer's size, which the primary
-sizes from the layer and the peer sizes from the geometry.
-
-Until that is fixed, the two-card numbers above are **estimates from the pool's split**, not measurements: the
-19-20 tok/s figure says what the second card would buy if it held the other experts of the layer, and nothing
-has measured it yet.
+Until the rows are bit-identical, the path stays behind `STRATA_M2_PEER_EXPERIMENTAL=1`: `--peer-device` alone
+refuses, and the message says why.  The numbers above are what this box measured; the 19-20 tok/s of the first
+estimate is still an estimate.
 
 One build note, for the two cards: the engine has to be compiled for **both** cards' architectures
 (`-DCMAKE_HIP_ARCHITECTURES="gfx1201;gfx1030"` here).  The peer runs its own copy of the expert kernels, so a
