@@ -2328,6 +2328,36 @@ struct Engine {
             K::native_router_topk_sigmoid(logits_r, L.router_bias, ids, ewts, (int) g.n_expert, Kp, T,
                                          m->expert_weights_scale, st);
         const int64_t n_ent = (int64_t) T * Kp;
+        {   // DIAG: the layer's state (the env var names the layer)
+            const char* lay = std::getenv("STRATA_M2_DUMP_STATE");
+            if (lay && (int) li == std::atoi(lay)) {
+                static std::vector<float> v;
+                v.resize((size_t) N);
+                const char* names[3] = {"h", "moe_out", "x"};
+                const float* srcs[3] = {h, moe_out, x};
+                for (int k = 0; k < 3; ++k) {
+                    CK(cudaMemcpyAsync(v.data(), srcs[k], (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaStreamSynchronize(st));
+                    std::fprintf(stderr, "STATE layer %d T=%d %s :", (int) li, T, names[k]);
+                    for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", v[(size_t) i]);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
+        }
+        {   // DIAG: the routed ids of a layer (the env var names it)
+            const char* lay = std::getenv("STRATA_M2_DUMP_ROUTE");
+            if (lay && (int) li == std::atoi(lay)) {
+                static std::vector<int32_t> h;
+                h.resize((size_t) n_ent);
+                CK(cudaMemcpyAsync(h.data(), ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                std::fprintf(stderr, "ROUTE layer %d T=%d :", (int) li, T);
+                for (int i = 0; i < n_ent && i < 16; ++i) std::fprintf(stderr, " %d", h[(size_t) i]);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
