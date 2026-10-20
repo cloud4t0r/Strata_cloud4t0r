@@ -96,6 +96,12 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_MINIMAXM2)
+#include "strata/minimaxm2/engine.hpp"
+#endif
+#if defined(STRATA_HAVE_QWEN35)
+#include "strata/qwen35/engine.hpp"
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -2278,20 +2284,26 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HAVE_QWEN35)
-    // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
-    // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
-    // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
+#if defined(STRATA_HAVE_QWEN35) || defined(STRATA_HAVE_MINIMAXM2)
+    // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) and a MiniMax-M2 file (GGUF
+    // architecture minimax-m2) run on their own engine paths (src/qwen35, src/minimaxm2), decided here from the
+    // file's header before any of this engine's state exists; every other file goes on below exactly as before.
+    // Only the architecture string is read (the header of --native's shard).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
-        bool qwen35 = false;
+        strata::ModelFamily family = strata::ModelFamily::Unknown;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
-            qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            family = strata::model_family(meta);
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
-        if (qwen35) return strata::qwen35::run(argc, argv);
+#if defined(STRATA_HAVE_QWEN35)
+        if (family == strata::ModelFamily::Qwen35Moe) return strata::qwen35::run(argc, argv);
+#endif
+#if defined(STRATA_HAVE_MINIMAXM2)
+        if (family == strata::ModelFamily::MiniMaxM2) return strata::minimaxm2::run(argc, argv);
+#endif
         break;
     }
 #endif
