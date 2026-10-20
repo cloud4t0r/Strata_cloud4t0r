@@ -413,7 +413,8 @@ __global__ void __launch_bounds__(256) k_route_group_m2(const float* __restrict_
                                                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                                                         int32_t* ent_dst, int32_t* ent_tok) {
     constexpr int NE = 256, V = NE / 32;
-    __shared__ int sids[64], sid[64];
+    // the picked experts of the 8 tokens of a warp: K per token
+    __shared__ int sids[K * 8], sid[K * 8];
     const int tk = threadIdx.y;
     const int lane = threadIdx.x;
     if (tk < n_tok) {
