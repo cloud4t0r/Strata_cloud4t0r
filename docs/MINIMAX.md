@@ -779,9 +779,33 @@ Two things this says, both measured:
     that reaches the head is too small, so the error is accumulated, not random.  A missing or mis-scaled
     contribution that grows with the number of attended cells.
 
-The next step is to compare the layer outputs (`l_out-N`) between the two engines on a 100-token prompt,
-which says which layer starts to drift.  The reference tool already dumps them (`tools/qwen35/q36_llama_dump.cpp
---dump-layers`); the engine path needs the same dump.
+**The layer outputs say where.**  The engine path now dumps them (`strata-m2 --dump-layers`, the same
+`[pos][layer][n_embd]` f32 format as the reference's `l_out-N`), and on a 100-token prompt:
+
+| layer | max difference | mean | the reference's norm |
+| ---: | ---: | ---: | ---: |
+| 0 | **0.0265** | 0.0033 | 25.9 |
+| 1 | **3.56** | 0.0105 | 29.2 |
+| 3 | 1.02 | 0.0281 | 31.5 |
+| 10 | 0.95 | 0.0822 | 51.5 |
+| 30 | 6.87 | 0.6394 | 71.1 |
+| 50 | 69.1 | 3.245 | 137.4 |
+| 61 | 174.5 | 7.035 | 189.7 |
+
+**Layer 0 is exact** (a rounding-level difference) and **layer 1 is already wrong**.  So the error is not an
+accumulation: layer 1 computes something wrong from an input that is right.  What layer 1 has that layer 0 does
+not is a predecessor's output, the expert slots it may share with the rest of the model, and the router.
+
+Two more facts from the same work:
+
+  * **the answer depends on the warmup.**  With the warmup (the default) the engine answers 4729 on that
+    prompt, without it 6787 - the same prompt, the same reference.  The warmup is what fills the expert
+    slots, so the slots' state changes the answer: something in the hybrid mode's slot handling is not
+    deterministic, and that is the same place the layer-1 divergence must come from.
+  * the experts of a layer are read by the CPU pool **in place**, in the mapping, with the job's `NativeFmt`
+    carrying the byte distances to the up and down matrices.  The distances were wrong once (the `x` terms do
+    not cancel for the down matrix, whose expert is a different size) and are fixed; the layer-1 divergence
+    says that something in that path is still wrong.
 
 ### The copy into VRAM, and the driver
 
