@@ -1291,6 +1291,8 @@ struct Engine {
     // byte distances to the up and down tensors).  On a 64 GB box the copy of a 49 GB model does not fit
     // beside the file: the placement then ran at 39-52 MB/s and the box thrashed (3.5 GB of swap).
     bool low_ram = false;
+    FILE* dump_layers = nullptr;      // the layer outputs, like q36ref's: [pos][layer][n_embd] f32
+    std::vector<float> dump_row;
     // The repack buffers: one expert's blob, for the GPU's copy out of the mapping.  ONE PER STREAM: the copy
     // out of the host buffer is ASYNC, so the host buffer stays in use until the stream has taken it - one
     // buffer shared by the prompt path and the slot replacement has them corrupt each other's expert (the
@@ -2166,6 +2168,15 @@ struct Engine {
             const bool last = l + 1 == m->layers.size();
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
                   last ? hmain : h);
+            if (dump_layers && T > 0) {
+                // the layer's output (the residual stream), like q36ref's and llama.cpp's l_out-N
+                if (!dump_row.size()) dump_row.resize((size_t) T * N);
+                CK(cudaMemcpyAsync(dump_row.data(), x, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                for (int t = 0; t < T; ++t)
+                    std::fwrite(dump_row.data() + (size_t) t * N, 4, (size_t) N, dump_layers);
+                std::fflush(dump_layers);   // the engine does not close the file: flush it as it goes
+            }
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
     }
@@ -3884,7 +3895,7 @@ int serve(Engine& E) {
 }  // namespace
 
 int strata::minimaxm2::run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file;
+    std::string model, tokens, force, dump_full, emb_file, dump_layers_path;
     bool low_ram = false;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
@@ -3929,6 +3940,7 @@ int strata::minimaxm2::run(int argc, char** argv) {
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--low-ram") low_ram = true;   // no host copy of the experts: they stay in the mapping
+        else if (a == "--dump-layers") dump_layers_path = next();
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -3973,6 +3985,10 @@ int strata::minimaxm2::run(int argc, char** argv) {
     // them where they lie).  On a 64 GB box the copy of a 49 GB model does not fit beside the file: the
     // placement ran at 39-52 MB/s and the machine thrashed (3.5 GB of swap in and out).
     E.low_ram = low_ram || std::getenv("STRATA_M2_LOW_RAM") != nullptr;
+    if (!dump_layers_path.empty()) {
+        E.dump_layers = std::fopen(dump_layers_path.c_str(), "wb");
+        if (!E.dump_layers) { std::fprintf(stderr, "strata-m2: cannot write %s\n", dump_layers_path.c_str()); return 2; }
+    }
     if (E.low_ram) std::fprintf(stderr, "strata-m2: low-RAM mode: the experts stay in the file, no host copy\n");
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
