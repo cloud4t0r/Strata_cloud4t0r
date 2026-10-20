@@ -3309,7 +3309,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaMalloc(&E.peer_ent_tok, nmax * 4));
         CK(cudaMalloc(&E.peer_ids, T * Kp * 4));
         CK(cudaMalloc(&E.peer_xq, K::native_q8_1_bytes((int) N, 1) * T));
-        E.peer_escr = dalloc(K::native_expert_scratch_bytes((int64_t) (T * Kp), (int64_t) g.n_ff));
+        // The scratch is sized the way native_expert_grouped sizes it: FOUR buffers of cap_entries x n_ff floats
+        // (gate, up, h, hq) and n_ff is the LAYER's (the expert's), not the geometry's.
+        int64_t ff_max = 0;
+        for (const Layer* L2 : all) ff_max = std::max<int64_t>(ff_max, L2->L.n_ff);
+        E.peer_escr = dalloc(K::native_expert_scratch_bytes((int64_t) (T * Kp), ff_max));
         CK(cudaMalloc(&E.peer_eparts, (size_t) T * Kp * N * 4));
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
