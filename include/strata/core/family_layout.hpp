@@ -64,6 +64,18 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
+    } else if (family == strata::ModelFamily::MiniMaxM2) {
+        // MiniMax-M2: full attention on EVERY layer, and its file says so by carrying no
+        // full_attention_interval key at all - an interval of 1 is what "every layer is a full-attention layer"
+        // means here, and it is what `is_qsa_layer` and `has_ssm` read.  No hyper-connections, no sparse indexer,
+        // no shared expert (shared_intermediate_size 0), no GDN, no MTP block in the published GGUFs.
+        g.qsa_interval = 1;
+        g.hc = g.hc_lr = 0;
+        g.idx_q_heads = g.idx_key_dim = 0;
+        g.n_ff_shexp = 0;
+        g.n_mtp_layers = 0;
+        g.ssm_state_size = g.ssm_k_heads = g.ssm_v_heads = g.ssm_d_conv = 0;
+        g.ssm_value_dim = g.ssm_conv_channels = 0;
     } else {
         num("hyper_connection.count", g.hc);
         num("hyper_connection.low_rank", g.hc_lr);
@@ -81,13 +93,20 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
+    // The GDN keys only exist for a family that has a linear-attention layer.  MiniMax-M2 has none, and its file
+    // carries no ssm.* key at all, so the check is on the family, not on the keys.
+    const bool ssm = g.has_ssm();
     if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
-        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
-        g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
+        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.qsa_interval < 1 ||
+        (ssm && (g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 || g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 ||
+                  g.qsa_interval < 2)))
         return bad("a geometry key is zero or out of range");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
-    if (g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads) return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
-    if (g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
+    if (ssm) {
+        if (g.ssm_value_dim != g.ssm_state_size * g.ssm_v_heads)
+            return bad("ssm.inner_size != ssm.state_size * ssm.time_step_rank");
+        if (g.ssm_v_heads % g.ssm_k_heads) return bad("ssm.time_step_rank is not a multiple of ssm.group_count");
+    }
     if (g.n_head % g.n_head_kv) return bad("attention.head_count is not a multiple of attention.head_count_kv");
     if (g.n_layers % g.qsa_interval) return bad("the layer count is not a multiple of full_attention_interval");
     return true;
@@ -156,6 +175,28 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::MiniMaxM2) {
+        // MiniMax-M2, from the file itself (bartowski/MiniMaxAI_MiniMax-M2-GGUF, IQ2_XXS): full attention on
+        // every layer, the QK norms PER LAYER (one vector for all the query heads, one for all the KV heads - not
+        // the per-head norms of the other families), no shared expert, no GDN, and the router's per-expert
+        // selection bias.
+        const int64_t HQ = g.n_head * g.head_dim;       // 48 * 128 = 6144
+        const int64_t HK = g.n_head_kv * g.head_dim;    // 8 * 128 = 1024
+        add("attn_norm.weight", {N});
+        add("attn_q.weight", {N, HQ});
+        add("attn_k.weight", {N, HK});
+        add("attn_v.weight", {N, HK});
+        add("attn_output.weight", {HQ, N});
+        add("attn_q_norm.weight", {HQ});
+        add("attn_k_norm.weight", {HK});
+        add("ffn_norm.weight", {N});
+        add("ffn_gate_inp.weight", {N, NE});
+        add("ffn_gate_exps.weight", {N, FF, NE});
+        add("ffn_up_exps.weight", {N, FF, NE});
+        add("ffn_down_exps.weight", {FF, N, NE});
+        add("exp_probs_b.bias", {NE});
+        return t;
+    }
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});
@@ -234,7 +275,9 @@ inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
 }
 
 /// Whether the family's table names every blk.* tensor its files carry (then an unnamed one is an error).
-inline bool layout_table_complete(const ModelGeometry& g) { return g.family == strata::ModelFamily::Qwen35Moe; }
+inline bool layout_table_complete(const ModelGeometry& g) {
+    return g.family == strata::ModelFamily::Qwen35Moe || g.family == strata::ModelFamily::MiniMaxM2;
+}
 
 /// Checks the model `m` (all shards) against the layout table of `g`.  `checked` counts the tensors found.
 inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g, std::string& err,

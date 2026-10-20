@@ -95,6 +95,26 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
 add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# The ROCm SDK's own headers must reach EVERY HIP translation unit, and they are named by the SDK, not by
+# the project.  The SDK's include dir reaches the targets that link `hip::device` / `hip::amdhip64`
+# directly, but not every one of them: strata_prefill compiles against the SYSTEM ROCm's /usr/include/hip
+# while the compiler is ROCm 10's, and the two header sets do not mix (ROCm 10's compiler with ROCm 7's
+# headers: "use of undeclared identifier '__ocml_exp10_f32'" in
+# /usr/include/hip/amd_detail/amd_hip_bf16.h).  Declaring the SDK's include dir at the directory level
+# makes the headers the compiler sees the ones the compiler belongs to, on every ROCm version and on every
+# target, whatever the link chain does.
+if(HIP_INCLUDE_DIRS)
+  foreach(_hip_inc IN LISTS HIP_INCLUDE_DIRS)
+    if(IS_DIRECTORY "${_hip_inc}" AND NOT "${_hip_inc}" MATCHES "^/usr(/|$)")
+      # The flag goes through the language's own flag variable, not through include_directories(): a
+      # directory-level include reaches the CXX translation units of a target but not its HIP ones, and
+      # the INTERFACE include of strata_hip_runtime does not reach every target either (the plain and
+      # the keyword link signatures do not compose).  CMAKE_HIP_FLAGS reaches every HIP compile.
+      string(APPEND CMAKE_HIP_FLAGS " -isystem${_hip_inc}")
+      target_include_directories(strata_hip_runtime BEFORE INTERFACE "${_hip_inc}")
+    endif()
+  endforeach()
+endif()
 target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
 option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on gfx1012" OFF)
 if(STRATA_GFX1012_PORTABLE_DOT)
