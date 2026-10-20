@@ -2638,6 +2638,19 @@ struct Engine {
         CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, st));
         CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, st));
         CK(cudaEventRecord(ev_xq, st));   // the copies are done (and the quantization was before them)
+        if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the activations, byte for byte
+            std::vector<uint8_t> a((size_t) K::native_q8_1_bytes(N, 1) * (size_t) T), b(a.size());
+            CK(cudaMemcpyAsync(a.data(), xq, a.size(), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            CK(cudaMemcpyAsync(b.data(), peer_xq, a.size(), cudaMemcpyDeviceToHost, peer_st));
+            CK(cudaStreamSynchronize(peer_st));
+            long ndiff = 0, first = -1;
+            for (size_t z = 0; z < a.size(); ++z)
+                if (a[z] != b[z]) { if (first < 0) first = (long) z; ++ndiff; }
+            std::fprintf(stderr, "XQ   layer %d T=%d : %ld differing bytes (first at %ld of %zu)\n", (int) li, T,
+                         ndiff, first, a.size());
+            std::fflush(stderr);
+        }
         // From here on, every call on the peer's stream needs the PEER's device current: HIP refuses a launch
         // on a stream that belongs to another device.
         CK(cudaSetDevice(peer_device));
@@ -2651,6 +2664,34 @@ struct Engine {
                                              peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok);
         K::native_expert_grouped(L.L, peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, peer_xq, peer_escr, peer_eparts, peer_st);
+        if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the PRIMARY's own rows (its GPU) for the same entries
+            int shown = 0;
+            std::fprintf(stderr, "PRIMROW layer %d T=%d :", (int) li, T);
+            for (int e = 0; e < n_ent && shown < 4; ++e) {
+                const int32_t x = h_ids[e];
+                const int slot = (peer_device >= 0 && li < peer_hy.size()) ? peer_hy[(size_t) li].slot_of[(size_t) x] : -1;
+                if (slot < 0) continue;
+                ++shown;
+                const int row = ent_dst[e];   // the entry's row in the primary's own output
+                for (int j = 0; j < 3; ++j) std::fprintf(stderr, " %.9g", eparts[(size_t) row * N + j]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the peer's own rows, for the entries it took
+            CK(cudaStreamSynchronize(peer_st));
+            int shown = 0;
+            std::fprintf(stderr, "PEERROW layer %d T=%d :", (int) li, T);
+            for (int e = 0; e < n_ent && shown < 4; ++e) {
+                const int32_t x = h_ids[e];
+                const int slot = (peer_device >= 0 && li < peer_hy.size()) ? peer_hy[(size_t) li].slot_of[(size_t) x] : -1;
+                if (slot < 0) continue;
+                ++shown;
+                for (int j = 0; j < 3; ++j) std::fprintf(stderr, " %.9g", cpu_out[(size_t) e * N + j]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
         CK(cudaEventRecord(peer_done, peer_st));
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
@@ -2693,7 +2734,7 @@ struct Engine {
             if (!h_miss[e]) continue;
             // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
             // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
-            if (peer_slots && (*peer_slots)[(size_t) x] >= 0) continue;
+            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
             ++n_miss;
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
@@ -2760,6 +2801,19 @@ struct Engine {
                 std::fprintf(stderr, "\n");
                 std::fflush(stderr);
             }
+        }
+        if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the CPU pool's rows, for the same entries
+            int shown = 0;
+            std::fprintf(stderr, "CPUROW layer %d T=%d :", (int) li, T);
+            for (int e = 0; e < n_ent && shown < 4; ++e) {
+                const int32_t x = h_ids[e];
+                const int slot = (peer_device >= 0 && li < peer_hy.size()) ? peer_hy[(size_t) li].slot_of[(size_t) x] : -1;
+                if (slot < 0) continue;
+                ++shown;
+                for (int z = 0; z < 3; ++z) std::fprintf(stderr, " %.9g", cpu_out[(size_t) e * N + z]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
         }
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
@@ -3560,6 +3614,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                     CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
                 }
                 P.slot_of[(size_t) e] = s;
+                if (li == 0 && getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the peer's slot content
+                    static std::vector<uint8_t> want, got;
+                    want.resize(L.L.bytes);
+                    got.resize(L.L.bytes);
+                    for (int s2 = 0; s2 < S_peer && s2 < 4; ++s2) {
+                        const int e2 = S + s2;
+                        expert_blob(L, e2, want.data());
+                        CK(cudaMemcpy(got.data(), L.peer_blobs + (size_t) s2 * L.stride, L.L.bytes, cudaMemcpyDeviceToHost));
+                        long nd = 0, fi = -1;
+                        for (size_t z = 0; z < want.size(); ++z)
+                            if (want[z] != got[z]) { if (fi < 0) fi = (long) z; ++nd; }
+                        std::fprintf(stderr, "SLOT %d (expert %d) : %ld differing bytes (first at %ld of %zu)\n", s2, e2, nd, fi, want.size());
+                    }
+                    std::fflush(stderr);
+                }
             }
             CK(cudaMalloc(&P.slot_of_d, (size_t) ne * 4));
             CK(cudaMemcpy(P.slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
