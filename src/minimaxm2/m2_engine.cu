@@ -492,6 +492,23 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
         }
     }
 }
+/// The peer's rows into the host rows: the entries it computed.  `peer_row[e]` is the entry's row in the peer's
+/// OWN output (-1: the peer did not compute it).  The rows go where the CPU pool's rows go, so the merge that
+/// follows takes them like the CPU's.  grid (n_ent), block 256.
+__global__ void k_peer_rows(const float* src, float* dst, const int32_t* peer_row, int n_ent, int n) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_ent) return;
+    const int row = peer_row[e];
+    if (row < 0) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[(size_t) e * n + i] = src[(size_t) row * n + i];
+}
+/// The inverse of the grouping's table: the entry whose row is p.  grid (n_rows), block 256.
+__global__ void k_peer_rowmap(const int32_t* ent_dst, int32_t* peer_row, int n_rows) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_rows) return;
+    const int e = ent_dst[p];
+    if (e >= 0) peer_row[e] = p;
+}
 /// The CPU pool's expert rows into the entries' rows: parts[e] = cpu[e] where miss[e].  grid (n_ent), block 256.
 __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
     const int e = blockIdx.x;
@@ -930,6 +947,7 @@ struct Layer {
     const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
     size_t src_gsz = 0, src_dsz = 0;
     uint8_t* hblobs = nullptr;  // hybrid mode: every expert's blob in host memory, `stride` apart
+    uint8_t* peer_blobs = nullptr;   // the peer's slots (the experts the primary does not hold), on its card
     int n_slots = 0;            // hybrid mode: the experts resident in VRAM
 };
 
@@ -1323,6 +1341,33 @@ struct Engine {
 #endif
     };
     std::vector<Hy> hy;
+    // ---- the peer tier: a second card with its own expert slots ----
+    // The primary keeps what it had: the dense weights, the KV cache, its own expert slots.  The peer holds the
+    // experts the primary does not, and computes the rows of the entries routed to them, straight into the same
+    // pinned host rows the CPU pool writes (portable, so both cards see the same addresses).  The rows are
+    // bit-identical whichever card computes them: the same kernels, the same activations.
+    int peer_device = -1;              // the second card (--peer-device N), -1: none
+    cudaStream_t peer_st = nullptr;     // the peer's stream
+    cudaEvent_t peer_done = nullptr;    // the peer's share of a layer is done
+    struct PeerHy {
+        std::vector<int32_t> slot_of;  // [n_expert]: the peer's slot, or -1
+        int32_t* slot_of_d = nullptr;  // the same, on the peer's device
+    };
+    std::vector<PeerHy> peer_hy;
+    // the peer's own buffers (on its device)
+    unsigned long long* peer_grp_ptr = nullptr;
+    int32_t* peer_grp_start = nullptr;
+    int32_t* peer_n_groups = nullptr;
+    int32_t* peer_ent_dst = nullptr;
+    int32_t* peer_ent_tok = nullptr;
+    int32_t* peer_ids = nullptr;        // the routed ids, copied over
+    void* peer_xq = nullptr;            // the q8_1 activations, copied over
+    void* peer_escr = nullptr;          // the expert scratch
+    float* peer_eparts = nullptr;       // the experts' rows, on the peer
+    int32_t* peer_slot_of_d = nullptr;  // the peer's slot table, ON THE PRIMARY (the primary's kernels read it)
+    int32_t* peer_row = nullptr;        // [n_ent] on the peer: the entry's row in the peer's own output (-1: none)
+    size_t peer_rows_max = 0;           // the dense rows the peer's buffers hold (the experts of a layer)
+    long long hy_peer = 0;
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
@@ -2148,7 +2193,10 @@ struct Engine {
                                      std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
         }
         // MiniMax-M2 has NO shared expert: nothing beside the routed experts' parts.
-        if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
+        if (hy_rows) {
+            moe_hybrid_peer(li, T);          // the second card's share (its rows go into the host rows)
+            moe_hybrid_cpu(li, T);           // the CPU pool's experts (while the GPU runs the rest), merged
+        }
         // the combine, the residual add and the next norm in one launch
         moe_end(T, prow, sy, sgate, wn, hout, 1);
     }
@@ -2339,6 +2387,43 @@ struct Engine {
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
     }
+    /// The peer's share of a layer: the entries whose expert the PEER holds (the primary's slot table says no).
+    /// The peer groups them with its own slot table, computes their rows with the same kernels as the primary
+    /// (so the rows are bit-identical), and writes them into the same pinned host rows the CPU pool writes.
+    void moe_hybrid_peer(size_t li, int T) {
+        if (peer_device < 0 || peer_hy.empty()) return;
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k;
+        const int n_ent = T * Kp;
+        const Layer& L = layer_at((int) li);
+        PeerHy& P = peer_hy[li];
+        // The peer's stream waits for the routing (the ids) and for the activations.  EVERY call on the peer's
+        // stream needs the PEER's device current: HIP refuses a launch on a stream that belongs to another device.
+        CK(cudaSetDevice(peer_device));
+        CK(cudaStreamWaitEvent(peer_st, ev_route, 0));
+        // the ids and the activations, copied to the peer's card (a device-to-device copy does not cross cards)
+        CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, peer_st));
+        CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, peer_st));
+        // the grouping on the peer: only the entries whose expert it holds
+        // the DENSE rows (one per expert the peer holds), not the entries: the table is the grouping's, and it
+        // has one row per expert
+        CK(cudaMemsetAsync(peer_ent_dst, 0xff, peer_rows_max * 4, peer_st));
+        k_group_hy<<<1, 256, 0, peer_st>>>(peer_ids, n_ent, Kp, (int) g.n_expert, P.slot_of_d, L.peer_blobs, L.stride,
+                                             peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok);
+        K::native_expert_grouped(L.L, peer_grp_ptr, peer_grp_start, peer_n_groups, peer_ent_dst, peer_ent_tok,
+                                 std::min<int64_t>(n_ent, g.n_expert), n_ent, peer_xq, peer_escr, peer_eparts, peer_st);
+        // the rows into the host rows (where the CPU pool's rows go): the scatter runs ON THE PEER, for it reads
+        // the peer's own output and writes the portable host rows over PCIe
+        CK(cudaMemsetAsync(peer_row, 0xff, (size_t) n_ent * 4, peer_st));
+        k_peer_rowmap<<<grid1((int) peer_rows_max), kThreads, 0, peer_st>>>(peer_ent_dst, peer_row, (int) peer_rows_max);
+        k_peer_rows<<<grid1(n_ent), kThreads, 0, peer_st>>>(peer_eparts, cpu_out, peer_row, n_ent, N);
+        CK(cudaEventRecord(peer_done, peer_st));
+        CK(cudaSetDevice(0));
+        CK(cudaGetLastError());
+        // the primary waits for the peer's rows before the merge reads them
+        CK(cudaStreamWaitEvent(st, peer_done, 0));
+        hy_peer += n_ent;
+    }
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
     void moe_hybrid_cpu(size_t li, int T) {
@@ -2360,6 +2445,8 @@ struct Engine {
         std::vector<char> quantized((size_t) T, 0);
         int n_miss = 0;
         std::map<int, size_t> open;   // expert -> its job with room
+        const std::vector<int32_t>* peer_slots =
+            (peer_device >= 0 && li < peer_hy.size()) ? &peer_hy[li].slot_of : nullptr;
         const bool defer = rows_deferred && li < m->layers.size();
         if (defer) {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
@@ -2370,6 +2457,8 @@ struct Engine {
             if (!defer) H.score[(size_t) x] += 1.0;
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
+            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
+            if (peer_slots && (*peer_slots)[(size_t) x] >= 0) continue;
             ++n_miss;
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
@@ -3035,6 +3124,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // VRAM budget", so 0 could not do it).
     int S = slots < 0 ? 0 : (slots > 0 ? (int) std::min<int64_t>(ne, slots)
                                           : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot));
+    // The peer's own budget: the slots it takes are on ITS card, with its own free VRAM.  It holds the experts
+    // the primary does not, so the two tiers together hold S + S_peer of the layer's experts.
+    int S_peer = 0;
+    if (E.peer_device >= 0) {
+        size_t pfr = 0, ptot = 0, pslot = 0;
+        CK(cudaSetDevice(E.peer_device));
+        CK(cudaMemGetInfo(&pfr, &ptot));
+        CK(cudaGetLastError());
+        pslot = pfr > (reserve + (size_t) (1ull << 30)) ? pfr - reserve - (size_t) (1ull << 30) : 0;
+        CK(cudaSetDevice(0));
+        CK(cudaGetLastError());
+        S_peer = (int) std::min<size_t>((size_t) std::max<int64_t>(0, ne - S), pslot / per_slot);
+        std::fprintf(stderr, "strata-m2: the peer (device %d) takes %d of %d experts per layer (%.2f GiB)\n",
+                     E.peer_device, S_peer, ne, (double) (S_peer * per_slot) / (1 << 30));
+    }
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
@@ -3082,6 +3186,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t off = 0;
     E.hy.resize(all.size());
+    if (E.peer_device >= 0) E.peer_hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
@@ -3132,6 +3237,49 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             H.slot_of[(size_t) s] = s;
             H.exp_in_slot[(size_t) s] = s;
         }
+        // The peer's slots: the experts the primary does not hold, on the peer's card.
+        if (S_peer > 0) {
+            Engine::PeerHy& P = E.peer_hy[li];
+            P.slot_of.assign((size_t) ne, -1);
+            CK(cudaSetDevice(E.peer_device));
+            // The card's real free VRAM, which can be less than the budget said (another program, the display):
+            // the layer takes as many slots as fit, and the ones that do not fit go to the CPU pool.
+            size_t pfr = 0, ptot = 0;
+            CK(cudaMemGetInfo(&pfr, &ptot));
+            CK(cudaGetLastError());
+            const size_t want = L.stride * (size_t) S_peer + kMmqTail;
+            if (want > pfr) {
+                const int fit = (int) std::max<size_t>(0, (pfr - (64u << 20)) / L.stride);
+                std::fprintf(stderr, "strata-m2: the peer takes %d of %d experts per layer here (%.2f GiB free)\n",
+                             fit, ne, (double) pfr / (double) (1ull << 30));
+                S_peer = fit;
+            }
+            if (S_peer <= 0) {
+                CK(cudaSetDevice(0));
+                CK(cudaGetLastError());
+                continue;   // no room on the peer for this layer: its experts go to the CPU pool
+            }
+            CK(cudaMalloc(&L.peer_blobs, L.stride * (size_t) S_peer + kMmqTail));
+            CK(cudaMemset(L.peer_blobs, 0, L.stride * (size_t) S_peer + kMmqTail));
+            for (int s = 0; s < S_peer; ++s) {
+                const int e = S + s;
+                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) e * L.stride : nullptr;
+                if (src) {
+                    CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
+                } else {
+                    expert_blob(L, e, E.repack.data());
+                    CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
+                P.slot_of[(size_t) e] = s;
+            }
+            CK(cudaMalloc(&P.slot_of_d, (size_t) ne * 4));
+            CK(cudaMemcpy(P.slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
+            // the primary's kernels read the peer's table too (to tell the peer's entries from the CPU's)
+            if (!E.peer_slot_of_d) CK(cudaMalloc(&E.peer_slot_of_d, (size_t) ne * 4));
+            CK(cudaMemcpy(E.peer_slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+        }
         H.score.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
@@ -3143,7 +3291,29 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
     CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
+    // the host rows the CPU pool writes: with a peer, PORTABLE, so the peer card writes into the same
+    // addresses (the peer's rows and the CPU's rows meet in the same buffer, and the merge picks both up)
+    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4,
+                      E.peer_device >= 0 ? (cudaHostAllocDefault | cudaHostAllocPortable) : cudaHostAllocDefault));
+    if (E.peer_device >= 0) {
+        CK(cudaSetDevice(E.peer_device));
+        CK(cudaMalloc(&E.peer_row, T * Kp * 4));
+        CK(cudaStreamCreateWithFlags(&E.peer_st, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&E.peer_done, cudaEventDisableTiming));
+        const size_t nmax = std::min<size_t>(T * Kp, (size_t) g.n_expert);
+        CK(cudaMalloc(&E.peer_grp_ptr, (nmax + 1) * sizeof(unsigned long long)));
+        CK(cudaMalloc(&E.peer_grp_start, (nmax + 1) * 4));
+        CK(cudaMalloc(&E.peer_n_groups, 4));
+        CK(cudaMalloc(&E.peer_ent_dst, nmax * 4));
+        E.peer_rows_max = nmax;
+        CK(cudaMalloc(&E.peer_ent_tok, nmax * 4));
+        CK(cudaMalloc(&E.peer_ids, T * Kp * 4));
+        CK(cudaMalloc(&E.peer_xq, K::native_q8_1_bytes((int) N, 1) * T));
+        E.peer_escr = dalloc(K::native_expert_scratch_bytes((int64_t) (T * Kp), (int64_t) g.n_ff));
+        CK(cudaMalloc(&E.peer_eparts, (size_t) T * Kp * N * 4));
+        CK(cudaSetDevice(0));
+        CK(cudaGetLastError());
+    }
     CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
@@ -3905,6 +4075,7 @@ int serve(Engine& E) {
 int strata::minimaxm2::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file, dump_layers_path;
     bool low_ram = false;
+    int peer_device = -1;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
@@ -3948,6 +4119,7 @@ int strata::minimaxm2::run(int argc, char** argv) {
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--low-ram") low_ram = true;   // no host copy of the experts: they stay in the mapping
+        else if (a == "--peer-device") peer_device = std::atoi(next().c_str());   // the second card's expert tier
         else if (a == "--dump-layers") dump_layers_path = next();
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
@@ -3993,6 +4165,28 @@ int strata::minimaxm2::run(int argc, char** argv) {
     // them where they lie).  On a 64 GB box the copy of a 49 GB model does not fit beside the file: the
     // placement ran at 39-52 MB/s and the machine thrashed (3.5 GB of swap in and out).
     E.low_ram = low_ram || std::getenv("STRATA_M2_LOW_RAM") != nullptr;
+    // the second card's expert tier (--peer-device N).  It must be a device the engine can use: the engine
+    // runs on device 0, so the peer is any other visible device.
+    if (peer_device >= 0) {
+        int n_dev = 1;
+        CK(cudaGetDeviceCount(&n_dev));
+        CK(cudaGetLastError());
+        if (n_dev < 2 || peer_device >= n_dev) {
+            std::fprintf(stderr, "strata-m2: --peer-device %d needs a second visible GPU (%d visible)\n", peer_device, n_dev);
+            return 2;
+        }
+        // EXPERIMENTAL: the peer's tier is written but not validated on a real card yet (a fault on the peer
+        // while the experts run there).  It stays behind an environment variable so it cannot be reached by
+        // accident; the layer split (the other way to use a second card) is not written at all.
+        if (std::getenv("STRATA_M2_PEER_EXPERIMENTAL") == nullptr) {
+            std::fprintf(stderr, "strata-m2: the second card's expert tier is experimental and not validated yet "
+                                 "(STRATA_M2_PEER_EXPERIMENTAL=1 to try it)\n");
+            return 2;
+        }
+        E.peer_device = peer_device;
+        std::fprintf(stderr, "strata-m2: the second card (device %d) takes part of the expert tier (experimental)\n",
+                     peer_device);
+    }
     if (!dump_layers_path.empty()) {
         E.dump_layers = std::fopen(dump_layers_path.c_str(), "wb");
         if (!E.dump_layers) { std::fprintf(stderr, "strata-m2: cannot write %s\n", dump_layers_path.c_str()); return 2; }
