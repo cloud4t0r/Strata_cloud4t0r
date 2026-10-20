@@ -756,6 +756,33 @@ Three bugs were found on the way, all of them mine:
     softmax weight into `sc[]`): with a 256-cell chunk and a 128-thread block - MiniMax-M2's head dim is 128
     - half the chunk's weights were never written.  The chunk is 128 cells now.
 
+### Where it still differs: the longer the context, the further the logits
+
+The answer is right on a short prompt, and the logits are close: on six tokens the maximum difference from
+llama.cpp is **1.09** (5.7% of the max logit) with 4 of the top-5 shared, and the greedy token is the same.
+
+**The longer the prompt, the further the logits drift**, and the greedy token can change:
+
+| prompt | max abs difference | mean | max logit, Strata / llama.cpp | same top-5 | same token |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 6 | 1.09 | 0.15 | 18.95 / 18.70 | 4/5 | yes |
+| 100 | 8.99 | 2.79 | 12.32 / 18.44 | - | yes |
+| 127 | 13.65 | 5.84 | 11.32 / 20.48 | - | **no** |
+| 128 | 9.95 | 3.47 | 13.92 / 19.90 | - | **no** |
+| 200 | 8.07 | 1.51 | 14.93 / 19.12 | 2/5 | yes |
+
+Two things this says, both measured:
+
+  * **It is not the chunking.** 100 and 127 tokens are a single 128-cell chunk, and the error is already
+    8.99 there.  The error grows with the context, it does not jump at the chunk boundary.
+  * **Strata's logits are systematically SMALLER** (12.3 against 18.4, 11.3 against 20.5): the hidden state
+    that reaches the head is too small, so the error is accumulated, not random.  A missing or mis-scaled
+    contribution that grows with the number of attended cells.
+
+The next step is to compare the layer outputs (`l_out-N`) between the two engines on a 100-token prompt,
+which says which layer starts to drift.  The reference tool already dumps them (`tools/qwen35/q36_llama_dump.cpp
+--dump-layers`); the engine path needs the same dump.
+
 ### The copy into VRAM, and the driver
 
 The second half of the placement - the slots' copy from the pinned host arena into VRAM - runs at **10 MB/s**
