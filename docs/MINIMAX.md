@@ -756,6 +756,43 @@ Three bugs were found on the way, all of them mine:
     softmax weight into `sc[]`): with a 256-cell chunk and a 128-thread block - MiniMax-M2's head dim is 128
     - half the chunk's weights were never written.  The chunk is 128 cells now.
 
+### The bug was the router (fixed)
+
+**The router's fast path only covered the decode's eight tokens at a time.**  A prompt of any length fell back on
+`native_router_topk` - the **softmax** router - so the prompt's experts were picked with the wrong gate: no
+sigmoid, no per-expert selection bias, a different normalisation.  That is why the answer was right on six
+tokens and wrong on a hundred, why the error grew with the context, and why the divergence started at layer 1:
+the prompt's hidden state was already wrong when the decode read it.
+
+`native_router_topk_sigmoid` is the same top-k with MiniMax-M2's gate - the biased values (the sigmoid plus the
+per-expert bias) decide which experts are picked, the weight of a pick is the **unbiased** sigmoid of its logit,
+the picks' weights are normalised to sum to one and scaled.  It covers a prompt of any length, and the existing
+softmax paths are untouched.
+
+Checked against llama.cpp, same file and same ids:
+
+| prompt | token | max abs difference | mean | max logit, Strata / llama.cpp | top-5 shared |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 6 | 8261 = " Paris" | 1.09 | 0.15 | 18.95 / 18.70 | 4/5 |
+| 100 | 4729 | 1.27 | 0.20 | 18.38 / 18.44 | 4/5 |
+| 700 | 58841 | 1.24 | 0.19 | 21.59 / 21.01 | 4/5 |
+
+**The difference no longer grows with the context** (1.09, 1.27, 1.24): it is the expert rows' quantization
+(Q8_K) and the accumulation order, the same order of magnitude as the six-token case.
+
+And the layers agree now, on the same 100-token prompt:
+
+| layer | max difference | mean | the reference's norm |
+| ---: | ---: | ---: | ---: |
+| 0 | 0.0064 | 0.0005 | 25.9 |
+| 1 | **0.0066** | 0.0006 | 29.2 |
+| 10 | 0.0658 | 0.0145 | 51.5 |
+| 30 | 0.7786 | 0.1698 | 71.1 |
+| 61 | 9.2648 | 0.9510 | 189.7 |
+
+Layer 1 was 3.56 before the fix; it is 0.0066 now.  What is left is the noise of the quantization, growing
+with the depth and staying at half a percent of the norm.
+
 ### Where it still differs: the longer the context, the further the logits
 
 The answer is right on a short prompt, and the logits are close: on six tokens the maximum difference from
