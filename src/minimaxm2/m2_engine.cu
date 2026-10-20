@@ -308,6 +308,16 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
 /// cache.  MiniMax-M2 has no attention output gate (attention_output_gate false), so the query is a plain [N, HQ]
 /// projection and not the [q | gate] pair the other families use.
 /// grid (T), block 256.
+// The device a pointer lives on (-1: unknown): the layer split's diagnostic.
+int dev_of(const void* p) {
+    hipPointerAttribute_t at{};
+    if (hipPointerGetAttributes(&at, p) != hipSuccess) {
+        (void) hipGetLastError();
+        return -1;
+    }
+    return at.device;
+}
+
 __global__ void k_attn_prep_m2(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                                 float* q, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
                                 const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
@@ -1183,6 +1193,15 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.head2 = mat("output.weight");
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
+        {   // The primary's LAST layer reads the NEXT layer's norm, and the next layer is on the second card:
+            // the primary gets a copy of that norm (12 KB) so it can read it.
+            const size_t nb = (size_t) g.n_embd * 4;
+            float* n0 = nullptr;
+            CK(cudaMalloc(&n0, nb));
+            CK(cudaMemcpyPeer(n0, 0, m.layers2[0].attn_norm, g_second_card, nb));
+            CK(cudaGetLastError());
+            m.layers[(size_t) g_split_first].attn_norm = n0;
+        }
         std::fprintf(stderr, "strata-m2: the second card has its own copy of the layers %d-%lld\n", g_split_first,
                      (long long) g.n_layers);
       }
@@ -1276,7 +1295,8 @@ struct Engine {
     X(float*, hmain) X(float*, hlast) X(void*, mq_x) X(void*, mq_hq) X(__half*, x16)             \
     X(__half*, att_p16) X(__half*, k16) X(__half*, v16) X(__half*, q16) X(float*, mq_gu)          \
     X(float*, mq_h) X(int32_t*, d_delta)                                                         \
-    X(cudaEvent_t, ev_route) X(cudaEvent_t, ev_xq) X(cublasHandle_t, blas)
+    X(cudaEvent_t, ev_route) X(cudaEvent_t, ev_xq) X(cublasHandle_t, blas)                    \
+    X(float*, vbuf) X(void*, vq) X(void*, vgrp) X(float*, vx_) X(float*, vh_)
     struct Buf {
 #define STRATA_M2_BUF_DECL(T, N) T N = nullptr;
         STRATA_M2_BUF_LIST(STRATA_M2_BUF_DECL)
@@ -1569,12 +1589,19 @@ struct Engine {
         // The cards' buffers: the same set, once per card (the layer split).  The stream and the events go
         // with it: a stream belongs to its card.
         auto alloc_core = [&](int card) {
+            d_delta = dalloc_t<int32_t>(1);   // the rotary offset: per card (it belongs to its card)
             // the stream, the events and the pool's buffers: per card (a stream and an event belong to their card)
             CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&ev_xq, cudaEventDisableTiming));
             ecpu = dalloc(T * Kp * N);
             d_miss = dalloc_t<int32_t>(T * Kp);
+            // the verify's scratch: per card too (they were allocated lazily, on whatever card was current)
+            vbuf = dalloc(8 * 16384);
+            vq = dalloc(K::native_q8_1_bytes((int) g.n_embd, 1) * 8);
+            vgrp = dalloc(2048);
+            vx_ = dalloc(8 * 2048);
+            vh_ = dalloc(8 * 2048);
             x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); hmain = dalloc(T * N);
             qkv = dalloc(T * C); hc = dalloc(T * C); z = dalloc(T * g.ssm_value_dim);
             alpha = dalloc(T * g.ssm_v_heads); beta = dalloc(T * g.ssm_v_heads); gdn_y = dalloc(T * g.ssm_value_dim);
@@ -1728,7 +1755,6 @@ struct Engine {
                 d_map = dalloc_t<int32_t>(T);
                 CK(cudaHostAlloc((void**) &h_map, T * sizeof(int32_t), cudaHostAllocDefault));
             }
-            d_delta = dalloc_t<int32_t>(1);
             cur = 0;
             load_cur();
 
@@ -2206,6 +2232,20 @@ struct Engine {
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
             }
+            if (split_dev >= 0 && (int) li >= split_layer && getenv("STRATA_M2_PEER_DEBUG")) {
+                static bool once = false;
+                if (!once) {
+                    once = true;
+                    std::fprintf(stderr,
+                                 "strata-m2: ATTN q_norm=%p(d%d) k_norm=%p(d%d) kc=%p(d%d) vc=%p(d%d) dpos=%p(d%d) "
+                                 "ddelta=%p(d%d) qg=%p(d%d) kx=%p(d%d) vx=%p(d%d) q=%p(d%d)\n",
+                                 (const void*) L.q_norm, dev_of(L.q_norm), (const void*) L.k_norm, dev_of(L.k_norm),
+                                 (const void*) kc[li], dev_of(kc[li]), (const void*) vc[li], dev_of(vc[li]),
+                                 (const void*) dpos, dev_of(dpos), (const void*) d_delta, dev_of(d_delta),
+                                 (const void*) qg, dev_of(qg), (const void*) kx, dev_of(kx), (const void*) vx,
+                                 dev_of(vx), (const void*) q, dev_of(q));
+                }
+            }
             k_attn_prep_m2<<<T, kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, rows_mode ? nullptr : kc[li],
                                                      rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                                                      m->rope_base, m->eps, d_delta, mtab_now, rs);
@@ -2372,7 +2412,10 @@ struct Engine {
             const bool last = l + 1 == m->layers.size();
             const bool on2 = split_dev >= 0 && (int) l >= split_layer;   // the second card's layers
             const Layer& L = layer_of(l);
-            const float* wn = last ? (on2 ? m->out_norm2 : m->out_norm) : layer_of(l + 1).attn_norm;
+            // the next layer's norm: the primary's copy for its own layers (the boundary one is copied there),
+            // the second card's copy for the second card's layers
+            const float* wn = last ? (on2 ? m->out_norm2 : m->out_norm)
+                                   : (on2 ? layer_of(l + 1).attn_norm : m->layers[l + 1].attn_norm);
             layer(L, l, T, p0, pos0, graph_mode, verify, wn, last ? hmain : h);
             if (dump_layers && T > 0) {
                 // the layer's output (the residual stream), like q36ref's and llama.cpp's l_out-N
@@ -3172,7 +3215,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const auto& g = m.g;
     const int64_t ne = g.n_expert;
     std::vector<Layer*> all;
-    for (Layer& L : m.layers) all.push_back(&L);
+    for (size_t i = 0; i < m.layers.size(); ++i) {
+        // the layer split: the second card's layers are the ones the engine runs, and the placement fills
+        // THEIR expert slots (on their card)
+        Layer* L = (E.split_dev >= 0 && (int) i >= E.split_layer && i - (size_t) E.split_layer < m.layers2.size())
+                       ? &m.layers2[i - (size_t) E.split_layer]
+                       : &m.layers[i];
+        all.push_back(L);
+    }
     if (m.has_mtp) all.push_back(&m.mtp);
     size_t total = 0, per_slot = 0, max_layer = 0;
     for (Layer* L : all) {
