@@ -796,7 +796,7 @@ Two things this says, both measured:
 accumulation: layer 1 computes something wrong from an input that is right.  What layer 1 has that layer 0 does
 not is a predecessor's output, the expert slots it may share with the rest of the model, and the router.
 
-Two more facts from the same work:
+Three more facts from the same work:
 
   * **the answer depends on the warmup.**  With the warmup (the default) the engine answers 4729 on that
     prompt, without it 6787 - the same prompt, the same reference.  The warmup is what fills the expert
@@ -806,6 +806,11 @@ Two more facts from the same work:
     carrying the byte distances to the up and down matrices.  The distances were wrong once (the `x` terms do
     not cancel for the down matrix, whose expert is a different size) and are fixed; the layer-1 divergence
     says that something in that path is still wrong.
+  * `--expert-slots 0` does NOT mean "no slots": the placement reads 0 as "use the VRAM budget" (48 of 256
+    per layer here), so there is no way to take the slots out of the picture from the command line.  A flag
+    that does (or an environment variable) is what the next bisect needs: if the answer then matches
+    llama.cpp, the hybrid mode's slot handling is where the bug is; if it still differs, it is the CPU pool's
+    in-place read.
 
 ### The copy into VRAM, and the driver
 
