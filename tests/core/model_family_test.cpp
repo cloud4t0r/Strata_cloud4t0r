@@ -53,7 +53,12 @@ struct Dims {
 const Dims kQwen36 = {41, 2048, 16, 2, 256, 256, 8, 512, 512, 4, 128, 16, 32, 4096, 4, 1, 0, 0, 0, 0};
 const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48, 6144, 4, 0, 4, 320, 4, 128};
 // tiny models of each family for the layout checks (every tensor F32, a few KB)
+// MiniMax-M2 (bartowski/MiniMaxAI_MiniMax-M2-GGUF, every quant): 62 layers of FULL attention (no GDN),
+// hidden 3072, 48 Q / 8 KV heads x 128, 256 experts top-8 of FF 1536, NO shared expert, NO MTP block in the
+// released GGUFs.  The ssm.* and the hyper-connection and the indexer fields are all zero: the model has none.
+const Dims kMiniMaxM2 = {62, 3072, 48, 8, 128, 256, 8, 1536, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
+const Dims kTinyM2 = {5, 64, 2, 1, 16, 4, 2, 32, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};
 
 std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
@@ -67,21 +72,30 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
                           fixture::u32(p + "attention.value_length", d.key_len),
                           fixture::u32(p + "expert_count", d.experts),
                           fixture::u32(p + "expert_used_count", d.used),
-                          fixture::u32(p + "expert_feed_forward_length", d.ff),
-                          fixture::u32(p + "expert_shared_feed_forward_length", d.ff_sh),
-                          fixture::u32(p + "ssm.conv_kernel", d.conv),
-                          fixture::u32(p + "ssm.state_size", d.state),
-                          fixture::u32(p + "ssm.group_count", d.groups),
-                          fixture::u32(p + "ssm.time_step_rank", d.v_heads),
-                          fixture::u32(p + "ssm.inner_size", d.inner),
-                          fixture::u32(p + "full_attention_interval", d.interval)};
-    if (std::string(arch) == "qwen35moe") {
-        kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));
+                          fixture::u32(p + "expert_feed_forward_length", d.ff)};
+    if (std::string(arch) == "minimax-m2") {
+        // MiniMax-M2's own key set, the one its published GGUFs carry: no ssm.* key (no GDN layer), no
+        // full_attention_interval (every layer is a full-attention layer), no expert_shared_feed_forward_length
+        // (no shared expert), no nextn_predict_layers (no MTP block in the released weights).
+        kv.push_back(fixture::f32(p + "attention.layer_norm_rms_epsilon", 1e-6f));
+        kv.push_back(fixture::u32(p + "expert_gating_func", 2));
+        kv.push_back(fixture::u32(p + "rope.dimension_count", 64));
     } else {
-        kv.push_back(fixture::u32(p + "hyper_connection.count", d.hc));
-        kv.push_back(fixture::u32(p + "hyper_connection.low_rank", d.hc_lr));
-        kv.push_back(fixture::u32(p + "attention.indexer.head_count", d.idx_heads));
-        kv.push_back(fixture::u32(p + "attention.indexer.key_length", d.idx_key));
+        kv.push_back(fixture::u32(p + "expert_shared_feed_forward_length", d.ff_sh));
+        kv.push_back(fixture::u32(p + "ssm.conv_kernel", d.conv));
+        kv.push_back(fixture::u32(p + "ssm.state_size", d.state));
+        kv.push_back(fixture::u32(p + "ssm.group_count", d.groups));
+        kv.push_back(fixture::u32(p + "ssm.time_step_rank", d.v_heads));
+        kv.push_back(fixture::u32(p + "ssm.inner_size", d.inner));
+        kv.push_back(fixture::u32(p + "full_attention_interval", d.interval));
+        if (std::string(arch) == "qwen35moe") {
+            kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));
+        } else {
+            kv.push_back(fixture::u32(p + "hyper_connection.count", d.hc));
+            kv.push_back(fixture::u32(p + "hyper_connection.low_rank", d.hc_lr));
+            kv.push_back(fixture::u32(p + "attention.indexer.head_count", d.idx_heads));
+            kv.push_back(fixture::u32(p + "attention.indexer.key_length", d.idx_key));
+        }
     }
     std::vector<std::string> tokens;
     for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
@@ -115,7 +129,7 @@ std::string layout_error(const fs::path& dir, const char* arch, const Dims& d, u
     strata::core::ModelGeometry g;
     int64_t k = 0;
     std::string err;
-    if (std::string(arch) == "qwen35moe") {
+    if (std::string(arch) == "qwen35moe" || std::string(arch) == "minimax-m2") {
         if (!geometry_of(meta, g, k, err)) return "geometry: " + err;
     } else {
         // the qwen4exp guard pins Flash-Next's own block count and widths, so the tiny model's geometry is set here
@@ -194,17 +208,31 @@ int main(int argc, char** argv) {
     {
         // the guards
         const fs::path q36 = d.path / "q36.gguf", fn = d.path / "fn.gguf", other = d.path / "other.gguf";
+        const fs::path m2 = d.path / "m2.gguf";
         fixture::write(q36, metadata("qwen35moe", kQwen36, 8), {});
         fixture::write(fn, metadata("qwen4exp", kFlashNext, 8), {});
+        fixture::write(m2, metadata("minimax-m2", kMiniMaxM2, 8), {});
         fixture::write(other, {fixture::str("general.architecture", "llama")}, {});
-        const strata::GgufFile a(q36.string()), b(fn.string()), c(other.string());
+        const strata::GgufFile a(q36.string()), b(fn.string()), c(other.string()), e2(m2.string());
         check(strata::model_family(a) == strata::ModelFamily::Qwen35Moe &&
                   strata::model_family(b) == strata::ModelFamily::Qwen4Exp &&
+                  strata::model_family(e2) == strata::ModelFamily::MiniMaxM2 &&
                   strata::model_family(c) == strata::ModelFamily::Unknown,
-              "model_family: qwen35moe, qwen4exp, unknown");
+              "model_family: qwen35moe, qwen4exp, minimax-m2, unknown");
         check(strata::check_architecture(a).empty(), "the architecture guard accepts qwen35moe");
         check(strata::check_architecture(b).empty(), "the architecture guard accepts qwen4exp");
+        check(strata::check_architecture(e2).empty(), "the architecture guard accepts minimax-m2");
         check(strata::check_architecture(c).find("'llama'") != std::string::npos, "and refuses llama, naming it");
+        const std::string e3 = strata::check_engine_architecture(e2);
+        check(e3.find("MiniMax-M2") != std::string::npos && e3.find("does not run it yet") != std::string::npos,
+              "the engine guard refuses MiniMax-M2 on the Flash-Next path: recognised, not supported there");
+        std::vector<Kv> kvm = metadata("minimax-m2", kMiniMaxM2, 8);
+        for (auto it = kvm.begin(); it != kvm.end(); ++it)
+            if (it->key == "minimax-m2.expert_gating_func") { kvm.erase(it); break; }
+        const fs::path missm2 = d.path / "missm2.gguf";
+        fixture::write(missm2, kvm, {});
+        check(strata::check_architecture(strata::GgufFile(missm2.string())).find("expert_gating_func") != std::string::npos,
+              "a minimax-m2 file without expert_gating_func is refused, naming the key");
         const std::string e = strata::check_engine_architecture(a);
         check(e.find("Qwen3.6-35B-A3B") != std::string::npos && e.find("does not run it yet") != std::string::npos,
               "the engine guard refuses Qwen3.6: recognised, not supported yet");
@@ -259,6 +287,41 @@ int main(int argc, char** argv) {
               "an inconsistent ssm.inner_size is refused");
     }
     {
+        // MiniMax-M2's geometry, from its metadata values
+        const fs::path m2 = d.path / "m2g.gguf";
+        fixture::write(m2, metadata("minimax-m2", kMiniMaxM2, 200064), {});
+        strata::core::ModelGeometry g;
+        int64_t k = 0;
+        std::string err;
+        const bool ok = geometry_of(m2, g, k, err);
+        check(ok, "MiniMax-M2 geometry reads" + (ok ? std::string() : ": " + err));
+        check(g.family == strata::ModelFamily::MiniMaxM2 && g.n_layers == 62 && g.n_mtp_layers == 0 &&
+                  g.n_embd == 3072,
+              "MiniMax-M2: 62 layers (no MTP block), hidden 3072");
+        check(g.qsa_interval == 1 && g.n_qsa_layers() == 62 && g.n_gdn_layers() == 0 && !g.has_ssm(),
+              "MiniMax-M2: every layer is a full-attention layer, no GDN");
+        check(strata::core::layer_kind(g, 0) == strata::core::LayerKind::Attention &&
+                  strata::core::layer_kind(g, 61) == strata::core::LayerKind::Attention,
+              "MiniMax-M2: layer 0 and layer 61 are both full attention");
+        check(g.n_head == 48 && g.n_head_kv == 8 && g.head_dim == 128 && !g.has_indexer() &&
+                  !g.has_hyper_connections(),
+              "MiniMax-M2 attention: 48 Q / 8 KV x 128, no indexer, no hyper-connections");
+        check(g.n_expert == 256 && k == 8 && g.n_ff == 1536 && !g.has_shared_expert() && g.n_vocab == 200064,
+              "MiniMax-M2 MoE: 256 experts top-8, FF 1536, no shared expert; vocab 200064");
+        check(g.ssm_state_size == 0 && g.ssm_k_heads == 0 && g.ssm_v_heads == 0 && g.ssm_d_conv == 0 &&
+                  g.ssm_value_dim == 0 && g.ssm_conv_channels == 0,
+              "MiniMax-M2: the GDN geometry is zero, not the Flash-Next default");
+        check(!strata::core::compiled_geometry_mismatch(g).empty(),
+              "MiniMax-M2 does not match the Flash-Next compiled kernels (it has its own path)");
+        Dims wrongm2 = kMiniMaxM2;
+        wrongm2.used = 0;
+        const fs::path wm2 = d.path / "wrongm2.gguf";
+        fixture::write(wm2, metadata("minimax-m2", wrongm2, 8), {});
+        strata::core::ModelGeometry g2;
+        check(!geometry_of(wm2, g2, k, err) && err.find("zero or out of range") != std::string::npos,
+              "a minimax-m2 file with expert_used_count 0 is refused");
+    }
+    {
         // the layout tables
         check(layout_error(d.path, "qwen35moe", kTiny36, 16, nullptr).empty(),
               "a complete qwen35moe file passes its layout (incl. the nextn MTP block)");
@@ -286,6 +349,25 @@ int main(int argc, char** argv) {
                 if (it->name == "blk.3.indexer.k_proj.weight") { ts.erase(it); break; }
         });
         check(e == "missing blk.3.indexer.k_proj.weight", "Flash-Next: a missing indexer tensor is refused (" + e + ")");
+        const std::string em2 = layout_error(d.path, "minimax-m2", kTinyM2, 16, nullptr);
+        check(em2.empty(), "a complete minimax-m2 file passes its layout" +
+                               (em2.empty() ? std::string() : ": " + em2));
+        e = layout_error(d.path, "minimax-m2", kTinyM2, 16, [](std::vector<Tensor>& ts) {
+            for (auto& t : ts)
+                if (t.name == "blk.1.attn_q_norm.weight") t.shape[0] += 1;
+        });
+        check(e.find("blk.1.attn_q_norm.weight") != std::string::npos && e.find("wants") != std::string::npos,
+              "MiniMax-M2: a wrong QK-norm shape is refused, naming the tensor and both shapes");
+        e = layout_error(d.path, "minimax-m2", kTinyM2, 16, [](std::vector<Tensor>& ts) {
+            for (auto it = ts.begin(); it != ts.end(); ++it)
+                if (it->name == "blk.2.exp_probs_b.bias") { ts.erase(it); break; }
+        });
+        check(e == "missing blk.2.exp_probs_b.bias", "MiniMax-M2: a missing router bias is refused");
+        e = layout_error(d.path, "minimax-m2", kTinyM2, 16, [](std::vector<Tensor>& ts) {
+            ts.push_back({"blk.0.ffn_gate_shexp.weight", {64, 32}, F32, 99});
+        });
+        check(e.find("blk.0.ffn_gate_shexp.weight") != std::string::npos && e.find("not in the") != std::string::npos,
+              "MiniMax-M2: a shared expert (which the model does not have) is refused");
     }
     std::printf(g_fail ? "FAILED (%d)\n" : "ALL PASSED\n", g_fail);
     return g_fail ? 1 : 0;
