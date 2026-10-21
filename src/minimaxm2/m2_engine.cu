@@ -1189,8 +1189,12 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         y.src_dsz = dsz;
       }
       if (pass == 1) {   // the second card's head (the last layer's output is read there)
-        m.out_norm2 = f32("output_norm.weight");
-        m.head2 = mat("output.weight");
+        // the second card does NOT keep its own copy of the head: the head's weights stay on the primary
+        // (card 0), and the last row's hidden is copied over (12 Ko) when the head is called.  Keeping the
+        // head on card 1 cost 2.46 Gio of VRAM that the card does not have (the head did not fit: cudaMalloc
+        // returned null, "invalid argument").
+        m.out_norm2 = nullptr;   // use the primary's norm
+        m.head2.d = nullptr;      // use the primary's head
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
         {   // The primary's LAST layer reads the NEXT layer's norm, and the next layer is on the second card:
@@ -2509,9 +2513,11 @@ struct Engine {
                 if (lhy(l)) seq.push_back((int) l);
             stream_begin(seq);
         }
-        // the layer split: the embedding and the first layers are on the first card, so the run starts there
-        if (split_dev >= 0 && cur_set != 0) {
-            use_set(0);
+        // the layer split: the embedding and the first layers are on the first card, so the run starts there.
+        // The head of the previous call may have left the second card current, so the device is set
+        // unconditionally (not only when the set changes).
+        if (split_dev >= 0) {
+            if (cur_set != 0) use_set(0);
             CK(cudaSetDevice(0));
             CK(cudaGetLastError());
         }
@@ -2580,7 +2586,24 @@ struct Engine {
                 std::fflush(dump_layers);   // the engine does not close the file: flush it as it goes
             }
         }
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (heads > 0) {
+            if (split_dev >= 0) {
+                // the head runs on the primary (card 0): copy the last row's hidden (12 Ko) from card 1
+                const size_t nh = (size_t) N * 4;
+                std::vector<float> hb((size_t) N);
+                CK(cudaMemcpyAsync(hb.data(), hmain + (size_t) (T - heads) * N, nh, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                CK(cudaSetDevice(0));
+                CK(cudaGetLastError());
+                use_set(0);   // the head's GEMM (gemm[]) and its stream belong to card 0
+                CK(cudaMemcpy(hlast, hb.data(), nh, cudaMemcpyHostToDevice));
+                head_rows(hlast, heads, logits, pick);
+                CK(cudaSetDevice(split_dev));
+                CK(cudaGetLastError());
+            } else {
+                head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+            }
+        }
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
