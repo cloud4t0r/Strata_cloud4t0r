@@ -953,6 +953,37 @@ One build note, for the two cards: the engine has to be compiled for **both** ca
 (`-DCMAKE_HIP_ARCHITECTURES="gfx1201;gfx1030"` here).  The peer runs its own copy of the expert kernels, so a
 build that targets only the primary's card cannot run the peer.
 
+### The layer split: the two cards, and what it cost the machine
+
+The layer split (`--layer-split N`, in `src/minimaxm2/m2_engine.cu`) gives the second card the layers
+`N..61`: it holds its own copy of their weights, their KV cache and their expert slots, and the residual,
+the normed hidden, the tokens and the position cross once per window.  The crossing is **byte-exact**
+(0 differing bytes on 25 MB for the prompt and 12 KB for the decode, measured), and the model runs on the
+two cards at the same time.
+
+**It does not answer correctly yet.**  The one-card run gives 8261 (the reference); the split gives 389.
+The layer dumps, compared byte for byte, show the split going **NaN inside the second card's layers**: the
+routing there is identical to the one-card run (the same eight experts per row, checked), so the fault is in
+the experts' computation on the second card, not in the crossing and not in the routing.
+
+**Two runs of the machine crashed on 2026-10-21, and the cause is in the split.**  The per-card budget
+counted the expert slots but not the KV cache and the buffers, which are allocated afterwards: the 16 GB
+card was left 0.8 GiB short, the driver served the VRAM from the host memory, and the GPU hung (a hard
+freeze, nothing in the kernel log, no OOM, no thermal event - the cards were at 31 C).  Two instances of
+the engine on the same cards, at the same time, made it worse.
+
+What changed:
+
+  * the budget of each card keeps room for that card's KV cache and its buffers;
+  * the crossing goes through the host by default (`STRATA_M2_SPLIT_COPY=peer` keeps the direct
+    device-to-device copy, which is the riskiest path between two different GPU generations);
+  * the loader's copy of the boundary layer's norm goes through the host too;
+  * `tools/run_m2_test.sh` runs one test at a time, with a timeout, so a blocked run is killed instead of
+    wedging the machine.
+
+**Not measured yet:** the split's speed, and whether the NaN survives those fixes.  The two cards are not
+touched again until they are checked one by one.
+
 ## The sources
 
 - `https://huggingface.co/MiniMaxAI/MiniMax-M3` - the card, `config.json`, `tokenizer.json`,
