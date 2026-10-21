@@ -2472,16 +2472,15 @@ struct Engine {
                 std::fflush(stderr);
             }
         }
-        // the combine, the residual add and the next norm in one launch
-        moe_end(T, prow, sy, sgate, wn, hout, 1);
-        // the layer split: the crossing's D2H copies MUST happen right after the combine, before the residual
-        // add / the next norm overwrite x and h (the crossing's D2H copy otherwise reads a stale h and
-        // writes a NaN into the second card)
+        // the layer split: the crossing's D2H copies MUST happen BEFORE the combine (moe_end), which adds
+        // the MoE to x and overwrites h: otherwise the D2H copy reads the residual (0) and writes 0
         if (split_dev >= 0 && (int) li == split_layer) {
             const size_t nx = (size_t) T * N;
             CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaMemcpyAsync(split_stage + nx, hout, nx * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(split_stage + nx, h, nx * 4, cudaMemcpyDeviceToHost, st));
         }
+        // the combine, the residual add and the next norm in one launch
+        moe_end(T, prow, sy, sgate, wn, hout, 1);
         {   // DIAG: what the combine wrote (the NaN must be in its inputs or in its write)
             const char* lay = std::getenv("STRATA_M2_DUMP_STATE");
             if (lay && (int) li == std::atoi(lay)) {
