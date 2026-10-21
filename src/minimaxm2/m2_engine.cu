@@ -1741,7 +1741,10 @@ struct Engine {
                     std::exit(1);
                 }
             }
-            for (Sess& ss : sess) alloc_session(ss);
+            // The sessions' KV cache: ONCE.  alloc_session puts each layer's K / V on the card that runs it
+            // (the layer split), so the second pass would only allocate a second, unused copy of the whole
+            // cache on the second card: 1.94 GiB of the 16 GB card, for nothing.
+            if (card == 0) for (Sess& ss : sess) alloc_session(ss);
             if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
                 const size_t ns = sess[0].conv.size();
                 std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
