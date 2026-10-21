@@ -2598,7 +2598,7 @@ struct Engine {
     }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
         const int b = i % 2;
-        const Layer& L = layer_at(stream_seq[(size_t) i]);
+        const Layer& L = layer_of((size_t) stream_seq[(size_t) i]);   // the layer's own card (the layer split)
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
@@ -2686,7 +2686,7 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int n_ent = T * Kp;
-        const Layer& L = layer_at((int) li);
+        const Layer& L = layer_of((size_t) li);   // the layer's own copy (the layer split)
         PeerHy& P = peer_hy[li];
         // The peer's stream waits for the routing (the ids) and for the activations.  EVERY call on the peer's
         // stream needs the PEER's device current: HIP refuses a launch on a stream that belongs to another device.
