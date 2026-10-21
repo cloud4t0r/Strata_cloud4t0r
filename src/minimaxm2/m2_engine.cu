@@ -2254,11 +2254,12 @@ struct Engine {
             }
             if (split_dev >= 0 && (int) li >= split_layer && getenv("STRATA_M2_PEER_DEBUG")) {
                 static bool once = false;
-                if (!once) {
+                if (true) {
                     once = true;
                     std::fprintf(stderr,
-                                 "strata-m2: ATTN q_norm=%p(d%d) k_norm=%p(d%d) kc=%p(d%d) vc=%p(d%d) dpos=%p(d%d) "
+                                 "strata-m2: ATTN layer %d q_norm=%p(d%d) k_norm=%p(d%d) kc=%p(d%d) vc=%p(d%d) dpos=%p(d%d) "
                                  "ddelta=%p(d%d) qg=%p(d%d) kx=%p(d%d) vx=%p(d%d) q=%p(d%d)\n",
+                                 (int) li,
                                  (const void*) L.q_norm, dev_of(L.q_norm), (const void*) L.k_norm, dev_of(L.k_norm),
                                  (const void*) kc[li], dev_of(kc[li]), (const void*) vc[li], dev_of(vc[li]),
                                  (const void*) dpos, dev_of(dpos), (const void*) d_delta, dev_of(d_delta),
@@ -2740,7 +2741,8 @@ struct Engine {
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int n_ent = T * Kp;
         Hy& H = hy[li];
-        const Layer& L = layer_at((int) li);
+        // the layer's OWN copy (the layer split: the second card's layers have their own weights)
+        const Layer& L = layer_of((size_t) li);
         while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
         }
         const auto t0 = Clock::now();
@@ -2865,7 +2867,8 @@ struct Engine {
         int left = max_swaps;
         for (size_t li = 0; li < hy.size() && left > 0; ++li) {
             Hy& H = hy[li];
-            const Layer& L = layer_at((int) li);
+            // the layer's OWN copy: the second card's slots are on its card (layer_at would give the first card's)
+            const Layer& L = layer_of((size_t) li);
             const int S = L.n_slots;
             if (S <= 0 || S >= ne) continue;
             std::vector<int> order((size_t) ne);
@@ -3683,11 +3686,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
-    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
+    // the host buffers the two cards share (the pool's rows, its activations): PORTABLE, so a stream on either
+    // card can copy from them (a pinned buffer bound to one device cannot be used by the other)
+    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault | cudaHostAllocPortable));
     // the host rows the CPU pool writes: with a peer, PORTABLE, so the peer card writes into the same
     // addresses (the peer's rows and the CPU's rows meet in the same buffer, and the merge picks both up)
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4,
-                      E.peer_device >= 0 ? (cudaHostAllocDefault | cudaHostAllocPortable) : cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault | cudaHostAllocPortable));
     if (E.peer_device >= 0) {
         CK(cudaSetDevice(E.peer_device));
         CK(cudaMalloc(&E.peer_row, T * Kp * 4));
@@ -3716,9 +3720,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
     }
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault | cudaHostAllocPortable));
+    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault | cudaHostAllocPortable));
+    CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault | cudaHostAllocPortable));
 
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
 
