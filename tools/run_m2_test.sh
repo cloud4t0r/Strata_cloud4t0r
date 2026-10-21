@@ -12,6 +12,7 @@
 #   STRATA_M2_MODEL     le fichier GGUF
 #   STRATA_M2_TIMEOUT   le delai maxi en secondes (900 par defaut)
 #   STRATA_M2_EXTRA     des options de plus pour le moteur (ex. --layer-split 31)
+#   STRATA_M2_DEVICES   les cartes a utiliser (ex. 0 pour la RX 6800 seule, 1 pour la RX 9070 seule)
 set -u
 
 mode=${1:-mono}
@@ -38,7 +39,8 @@ case "$mode" in
 esac
 
 cd "$BUILD" || exit 2
-export HIP_VISIBLE_DEVICES=$DEVICES
+# STRATA_M2_DEVICES : la liste des cartes (0 = la RX 6800, 1 = la RX 9070 sur cette machine)
+export HIP_VISIBLE_DEVICES=${STRATA_M2_DEVICES:-$DEVICES}
 export LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
 # timeout : un run bloque est tue (et l'etat des cartes note), pas laisse en plan
