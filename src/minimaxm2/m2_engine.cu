@@ -1196,10 +1196,16 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         {   // The primary's LAST layer reads the NEXT layer's norm, and the next layer is on the second card:
             // the primary gets a copy of that norm (12 KB) so it can read it.
             const size_t nb = (size_t) g.n_embd * 4;
+            // through the host, not a peer copy: a device-to-device copy between two different GPU generations
+            // is the path that hung this machine
+            float* nh = (float*) std::malloc(nb);
+            CK(cudaMemcpy(nh, m.layers2[0].attn_norm, nb, cudaMemcpyDeviceToHost));
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
             float* n0 = nullptr;
             CK(cudaMalloc(&n0, nb));
-            CK(cudaMemcpyPeer(n0, 0, m.layers2[0].attn_norm, g_second_card, nb));
-            CK(cudaGetLastError());
+            CK(cudaMemcpy(n0, nh, nb, cudaMemcpyHostToDevice));
+            std::free(nh);
             m.layers[(size_t) g_split_first].attn_norm = n0;
         }
         std::fprintf(stderr, "strata-m2: the second card has its own copy of the layers %d-%lld\n", g_split_first,
@@ -1315,6 +1321,8 @@ struct Engine {
         if (split_dev >= 0 && split_layer < (int) m->layers.size() && m->head2.d) return m->head2;
         return m->head;
     }
+    float* split_stage = nullptr;   // the crossing's host staging (the peer copy is opt-in)
+    bool split_copy_peer = false;    // a device-to-device copy between the two cards (the risky path)
     Buf set[2];           // the two cards' sets
     int cur_set = 0;      // the current card's set
     int split_dev = -1;   // the second card (--layer-split), -1: none
@@ -2450,10 +2458,20 @@ struct Engine {
             if (split_dev >= 0 && (int) l == split_layer) {
                 // The layer split: the residual (x), the normed hidden (h), the tokens and the position cross
                 // to the second card, which takes over the buffers and the stream.
-                CK(cudaMemcpyPeerAsync(set[1].x, split_dev, x, 0, (size_t) T * N * 4, st));
-                CK(cudaMemcpyPeerAsync(set[1].h, split_dev, h, 0, (size_t) T * N * 4, st));
-                CK(cudaMemcpyPeerAsync(set[1].tok, split_dev, tok, 0, (size_t) T * 4, st));
-                CK(cudaMemcpyPeerAsync(set[1].pos0, split_dev, pos0, 0, 4, st));
+                const size_t nx = (size_t) T * N;
+                if (split_copy_peer) {
+                    CK(cudaMemcpyPeerAsync(set[1].x, split_dev, x, 0, nx * 4, st));
+                    CK(cudaMemcpyPeerAsync(set[1].h, split_dev, h, 0, nx * 4, st));
+                    CK(cudaMemcpyPeerAsync(set[1].tok, split_dev, tok, 0, (size_t) T * 4, st));
+                    CK(cudaMemcpyPeerAsync(set[1].pos0, split_dev, pos0, 0, 4, st));
+                } else {
+                    // through the host: a device-to-device copy between two different GPU generations is the
+                    // riskiest thing this engine does (it hung a 9070 + a 6800), the host path is only slower
+                    CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(split_stage + nx, h, nx * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx), tok, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx) + T, pos0, 4, cudaMemcpyDeviceToHost, st));
+                }
                 CK(cudaEventRecord(ev_cross, st));
                 if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: what arrives on the second card
                     std::vector<uint8_t> a((size_t) T * N * 4), b(a.size());
@@ -2474,6 +2492,12 @@ struct Engine {
                 CK(cudaSetDevice(split_dev));
                 CK(cudaGetLastError());
                 CK(cudaStreamWaitEvent(st, ev_cross, 0));
+                if (!split_copy_peer) {   // the second card's stream takes the rows from the host
+                    CK(cudaMemcpyAsync(set[1].x, split_stage, nx * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(set[1].h, split_stage + nx, nx * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(set[1].tok, (int32_t*) (split_stage + 2 * nx), (size_t) T * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(set[1].pos0, (int32_t*) (split_stage + 2 * nx) + T, 4, cudaMemcpyHostToDevice, st));
+                }
             }
             const bool last = l + 1 == m->layers.size();
             const bool on2 = split_dev >= 0 && (int) l >= split_layer;   // the second card's layers
@@ -3390,8 +3414,19 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const size_t reserve = (size_t) 768 << 20;
+    // The layer split: a card's KV cache and its buffers are allocated AFTER the expert slots, so the budget
+    // must keep room for them.  On a 16 GB card the slots alone left 0.8 GiB short, the driver then served the
+    // VRAM from the host memory, and the GPU hung (this machine, 2026-10-21).  The reserve is the KV of the
+    // card's layers plus the buffers (the attention scores, the expert parts, the scratch, the partials).
+    const size_t kv_one = (size_t) g.n_head_kv * g.head_dim * 2 * 4 * (size_t) E.ctx;
+    const size_t buf_reserve = (size_t) 1536 << 20;
+    const size_t n_layers0 = (size_t) (E.split_dev >= 0 ? std::min<int64_t>((int64_t) E.split_layer, (int64_t) g.n_layers)
+                                                        : (int64_t) g.n_layers);
+    const size_t n_layers1 = (size_t) g.n_layers - n_layers0;
+    const size_t card_reserve0 = n_layers0 * kv_one + buf_reserve;
+    const size_t card_reserve1 = n_layers1 * kv_one + buf_reserve;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
-                                        : (fr > reserve ? fr - reserve : 0);
+                                        : (fr > reserve + card_reserve0 ? fr - reserve - card_reserve0 : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
     // room, UD-Q6_K_XL on 32 GB): drop them - the decode reads the GGUF layout then, bitwise the same outputs, a little
     // slower - rather than run the hybrid mode with its CPU share and streamed prompt layers.  STRATA_Q36_KEEP_PACKED=1
@@ -3559,7 +3594,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 size_t f = 0, t = 0;
                 CK(cudaMemGetInfo(&f, &t));
                 CK(cudaGetLastError());
-                size_t sb = vram_gib >= 0 ? budget : (f > reserve ? f - reserve : 0);
+                // the second card's own room: its KV and its buffers come out of it too
+                size_t sb = vram_gib >= 0 ? budget
+                                          : (f > reserve + card_reserve1 ? f - reserve - card_reserve1 : 0);
                 if (sb + staging + ((size_t) 256 << 20) > f)
                     sb = f > staging + ((size_t) 512 << 20) ? f - staging - ((size_t) 512 << 20) : 0;
                 slot_off = S;   // the second card takes the experts the primary does not hold
@@ -3689,6 +3726,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // the host buffers the two cards share (the pool's rows, its activations): PORTABLE, so a stream on either
     // card can copy from them (a pinned buffer bound to one device cannot be used by the other)
     CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault | cudaHostAllocPortable));
+    // the crossing's staging: the rows go through the host unless the peer copy is asked for
+    E.split_copy_peer = std::getenv("STRATA_M2_SPLIT_COPY") != nullptr &&
+                        std::string(std::getenv("STRATA_M2_SPLIT_COPY")) == "peer";
+    CK(cudaHostAlloc((void**) &E.split_stage, (2 * T * N + T + 1) * 4, cudaHostAllocDefault | cudaHostAllocPortable));
     // the host rows the CPU pool writes: with a peer, PORTABLE, so the peer card writes into the same
     // addresses (the peer's rows and the CPU's rows meet in the same buffer, and the merge picks both up)
     CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault | cudaHostAllocPortable));
