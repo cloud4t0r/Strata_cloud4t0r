@@ -2371,10 +2371,11 @@ struct Engine {
                     CK(cudaMemcpyAsync(w.data(), ewts, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaMemcpyAsync(lg.data(), logits_r, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaStreamSynchronize(st));
-                    std::fprintf(stderr, "ROUTW layer %d T=%d ewts :", (int) li, T);
-                    for (int i = 0; i < 8 && i < n_ent; ++i) std::fprintf(stderr, " %.9g", w[(size_t) i]);
-                    std::fprintf(stderr, " | logits :");
-                    for (int i = 0; i < 4 && i < n_ent; ++i) std::fprintf(stderr, " %.9g", lg[(size_t) i]);
+                    const int e = 12544;   // the first entry of the first bad row (1568)
+                    std::fprintf(stderr, "ROUTW layer %d T=%d entry %d (row %d) ewts :", (int) li, T, e, e / (int) m->top_k);
+                    std::fprintf(stderr, " %.9g", w[(size_t) e]);
+                    std::fprintf(stderr, "  (NaN=%d) | logits :", (int) std::isnan(w[(size_t) e]));
+                    std::fprintf(stderr, " %.9g (NaN=%d)\n", lg[(size_t) e], (int) std::isnan(lg[(size_t) e]));
                     std::fprintf(stderr, "\n");
                     std::fflush(stderr);
                 }
@@ -2446,8 +2447,54 @@ struct Engine {
             moe_hybrid_peer(li, T);          // the second card's share (its rows go into the host rows)
             moe_hybrid_cpu(li, T);           // the CPU pool's experts (while the GPU runs the rest), merged
         }
+        {   // DIAG: a bad entry's rows (the NaN lives in the rows from 1568 on)
+            const char* lay = std::getenv("STRATA_M2_DUMP_STATE");
+            if (lay && (int) li == std::atoi(lay)) {
+                const int e = 1568 * (int) m->top_k;   // the first entry of the first bad row
+                static std::vector<float> g, c;
+                g.resize((size_t) N); c.resize((size_t) N);
+                CK(cudaMemcpyAsync(g.data(), eparts + (size_t) e * N, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(c.data(), cpu_out + (size_t) e * N, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                std::fprintf(stderr, "BADROW layer %d entry %d (row %d): GPU eparts first 4:", (int) li, e, e / (int) m->top_k);
+                for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", g[(size_t) i]);
+                std::fprintf(stderr, "  (NaN=%d)\n", (int) std::isnan(g[0]));
+                std::fprintf(stderr, "BADROW layer %d entry %d (row %d): pool  cpu_out first 4:", (int) li, e, e / (int) m->top_k);
+                for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", c[(size_t) i]);
+                std::fprintf(stderr, "  (NaN=%d)  d_miss=%d  id=%d\n", (int) std::isnan(c[0]), h_miss[e], h_ids[e]);
+                std::fprintf(stderr, "WN layer %d first 4:", (int) li);
+                if (wn) for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", wn[(size_t) i]);
+                std::fprintf(stderr, "  (NaN=%d)  eps=%.3g\n", (int)(wn && std::isnan(wn[0])), m->eps);
+                std::fflush(stderr);
+            }
+        }
         // the combine, the residual add and the next norm in one launch
         moe_end(T, prow, sy, sgate, wn, hout, 1);
+        // the layer split: the crossing's D2H copies MUST happen right after the combine, before the residual
+        // add / the next norm overwrite x and h (the crossing's D2H copy otherwise reads a stale h and
+        // writes a NaN into the second card)
+        if (split_dev >= 0 && (int) li == split_layer) {
+            const size_t nx = (size_t) T * N;
+            CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(split_stage + nx, hout, nx * 4, cudaMemcpyDeviceToHost, st));
+        }
+        {   // DIAG: what the combine wrote (the NaN must be in its inputs or in its write)
+            const char* lay = std::getenv("STRATA_M2_DUMP_STATE");
+            if (lay && (int) li == std::atoi(lay)) {
+                static std::vector<float> vx, vh;
+                vx.resize((size_t) N); vh.resize((size_t) N);
+                CK(cudaMemcpyAsync(vx.data(), x, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(vh.data(), hout, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                std::fprintf(stderr, "AFTERCOMB layer %d T=%d x first 4:", (int) li, T);
+                for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", vx[(size_t) i]);
+                std::fprintf(stderr, " (NaN=%d)\n", (int) std::isnan(vx[0]));
+                std::fprintf(stderr, "AFTERCOMB layer %d T=%d hout first 4:", (int) li, T);
+                for (int i = 0; i < 4; ++i) std::fprintf(stderr, " %.9g", vh[(size_t) i]);
+                std::fprintf(stderr, " (NaN=%d)\n", (int) std::isnan(vh[0]));
+                std::fflush(stderr);
+            }
+        }
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -2482,10 +2529,9 @@ struct Engine {
                     CK(cudaMemcpyPeerAsync(set[1].tok, split_dev, tok, 0, (size_t) T * 4, st));
                     CK(cudaMemcpyPeerAsync(set[1].pos0, split_dev, pos0, 0, 4, st));
                 } else {
-                    // through the host: a device-to-device copy between two different GPU generations is the
-                    // riskiest thing this engine does (it hung a 9070 + a 6800), the host path is only slower
-                    CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
-                    CK(cudaMemcpyAsync(split_stage + nx, h, nx * 4, cudaMemcpyDeviceToHost, st));
+                    // through the host: the x and h rows were already copied to split_stage right after the
+                    // combine (in layer()), before they could be overwritten; only the tokens and the
+                    // position still need to cross here (they never change after the embedding)
                     CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx), tok, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx) + T, pos0, 4, cudaMemcpyDeviceToHost, st));
                 }
