@@ -981,8 +981,19 @@ What changed:
   * `tools/run_m2_test.sh` runs one test at a time, with a timeout, so a blocked run is killed instead of
     wedging the machine.
 
-**Not measured yet:** the split's speed, and whether the NaN survives those fixes.  The two cards are not
-touched again until they are checked one by one.
+**After the fixes (2026-10-21, the cards checked one by one first):**  the RX 9070 alone gives 8261 with
+the reference's 64 tokens, the RX 6800 alone gives the same, and the split runs on the two cards **without
+freezing the machine** (the second card takes 45 of the 256 experts per layer, 11.94 GiB free, the crossing
+goes through the host).  It still answers 389.
+
+**Where the NaN is, measured:**  the second card's first layer takes a finite input (`h` and `x` finite), its
+routing is identical to the one-card run's (the same eight experts per row) and its routing weights are
+finite (0.135, 0.132, ...), and the pool's rows and the GPU's rows are finite for the first entries.  The
+NaN is therefore in the **experts' rows** (`eparts`) of the rows from 1568 on, of that layer only - the
+combine sums finite rows with finite weights and still comes out NaN, so one of the entries it reads holds a
+NaN.  What is left is to read the groups' bounds and the rows of a bad entry.
+
+**Not measured yet:** the split's speed.
 
 ## The sources
 

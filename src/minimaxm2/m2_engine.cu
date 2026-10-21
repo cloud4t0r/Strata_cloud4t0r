@@ -2364,6 +2364,20 @@ struct Engine {
                 v.resize((size_t) N);
                 const char* names[3] = {"h", "moe_out", "x"};
                 const float* srcs[3] = {h, moe_out, x};
+                {   // DIAG: the routing's weights and logits (a NaN here poisons the combine)
+                    static std::vector<float> w, lg;
+                    w.resize((size_t) n_ent);
+                    lg.resize((size_t) n_ent);
+                    CK(cudaMemcpyAsync(w.data(), ewts, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(lg.data(), logits_r, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaStreamSynchronize(st));
+                    std::fprintf(stderr, "ROUTW layer %d T=%d ewts :", (int) li, T);
+                    for (int i = 0; i < 8 && i < n_ent; ++i) std::fprintf(stderr, " %.9g", w[(size_t) i]);
+                    std::fprintf(stderr, " | logits :");
+                    for (int i = 0; i < 4 && i < n_ent; ++i) std::fprintf(stderr, " %.9g", lg[(size_t) i]);
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
                 for (int k = 0; k < 3; ++k) {
                     CK(cudaMemcpyAsync(v.data(), srcs[k], (size_t) N * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaStreamSynchronize(st));
