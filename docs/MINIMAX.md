@@ -473,6 +473,10 @@ is the engine's own counter.
 
 ## The same tables for MiniMax-M2
 
+> **Status (0.2.2, engine 0.1.47): MiniMax-M2 is operational.** Single card and two-card layer split both
+> produce the reference token **8261** (prompt `200034,517,5505,300,5969,355`), matching llama.cpp. See
+> [MINIMAX_M2.md](MINIMAX_M2.md) for build and run commands.
+
 MiniMax-M2 is the predecessor (June 2026), and on this machine it is a far better proposition than M3:
 **230B total, 10.4B active** (llama.cpp's `LLM_TYPE_230B_A10B`), against M3's 428B / 24.7B.
 
