@@ -1,0 +1,1 @@
+run_minimax_m2.sh
