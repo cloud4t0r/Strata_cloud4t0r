@@ -49,6 +49,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -636,6 +637,13 @@ MINIMAX2_FILES = {
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00001-of-00002.gguf": (39922661440, "84294b035551643111f15403c77d68a29e1b900fac9bf028d871c48851e9a178"),
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00002-of-00002.gguf": (14803701088, "4da31c4005c1e1f83ed403e4013cb2bb9bc1395b26b65c2fa962a8cdb645f091"),
 }
+# --m2-low-ram auto: below this much total RAM, MiniMax-M2 runs in the low-RAM mode (--low-ram, the experts read where
+# they lie in the file); from it on, in the normal mode (a host copy of its ~49 GB of experts beside the KV cache and
+# the OS).  Derived from the code, not measured: src/minimaxm2/m2_engine.cu notes that on a 64 GB box the copy did not
+# fit beside the file and the machine thrashed; 96 GB leaves the copy, the page cache's share and the OS room.
+M2_LOW_RAM_BELOW_GB = 96
+M2_EXE = "strata-m2.exe" if os.name == "nt" else "strata-m2"   # the MiniMax-M2 engine path on its own (CMake target)
+M2_RUN_SCRIPT = "run_minimax_m2.sh"                             # its start script (Linux), written by install_own_path
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -662,19 +670,23 @@ OWN_PATH_FAMILIES = {
                  "about": "230B mixture of experts with 10B active (256 experts, top-8), full attention on every "
                           "layer; the experts are read where they lie in the file, so the download is the disk's "
                           "business and the page cache does the rest",
-                 "hf": hf("bartowski/MiniMaxAI_MiniMax-M2-GGUF"),
-                 "file": "MiniMaxAI_MiniMax-M2-{q}.gguf", "tag": "minimax2-",
+                 # the repository keeps each size's shards in a folder of its own (MiniMaxAI_MiniMax-M2-IQ2_XXS/)
+                 "hf": hf("bartowski/MiniMaxAI_MiniMax-M2-GGUF") + "MiniMaxAI_MiniMax-M2-{q}/",
+                 "file": "MiniMaxAI_MiniMax-M2-{q}-0000{i}-of-00002.gguf", "shards": 2, "tag": "minimax2-",
                  "name": "minimax-m2",
                  "license": "MiniMax Community License: https://huggingface.co/MiniMaxAI/MiniMax-M2",
                  # RAM: the low-RAM mode keeps NO copy of the experts, so the engine's own memory is the KV cache
                  # and its buffers; the file's pages are the OS's page cache's business (it reads them as the
-                 # routing asks for them).
-                 "models": {"IQ2_XXS": {"about": "2-bit i-quant (the smallest M2 file), 54.7 GB", "ram_gb": 24}},
+                 # routing asks for them).  The normal mode (--m2-low-ram off) holds the copy: ram_gb_normal.
+                 "models": {"IQ2_XXS": {"about": "2-bit i-quant (the smallest M2 file), 54.7 GB", "ram_gb": 24,
+                                        "ram_gb_normal": M2_LOW_RAM_BELOW_GB}},
                  "sha256": MINIMAX2_FILES,
                  # the engine's KV cache per context token: 62 layers, 4 KV heads x 128, K and V in fp32 (strata-m2)
                  "kv_bytes_per_token": 62 * 4 * 128 * 2 * 4,
                  "mtp": 0,                      # the released weights carry no MTP block
-                 "low_ram": True,               # no host copy of the experts: they stay in the file
+                 # the low-RAM mode is chosen by --m2-low-ram (auto: by this PC's RAM, M2_LOW_RAM_BELOW_GB); on, no
+                 # host copy of the experts: they stay in the file
+                 "low_ram": True,
                  "vision": False, "state_gb": 0.0}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
@@ -7275,10 +7287,127 @@ def own_path_context(fam: dict, vram_gb: float) -> int:
     return 32768 if vram_gb <= 16.5 else 65536 if vram_gb <= 24.5 else 131072
 
 
+def own_path_files(fam: dict, model: str) -> list:
+    """The GGUF file names of one size of an own-path family, in order: one file (Qwen3.6), or its shards ("shards":
+    MiniMax-M2's two; the engine opens the first and finds the rest beside it)."""
+    return [fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 1) + 1)]
+def own_path_bytes(fam: dict, model: str) -> int:
+    """The download of one size of an own-path family: every file of it, pinned sizes."""
+    return sum(fam["sha256"][f][0] for f in own_path_files(fam, model))
+def own_path_ram_need(fam: dict, model: str, low_ram: bool = True) -> int:
+    """GB of RAM one size needs: "ram_gb", or in the normal mode of a family with a low-RAM choice (MiniMax-M2 with
+    --m2-low-ram off) "ram_gb_normal" (the host copy of the experts)."""
+    d = fam["models"][model]
+    return d["ram_gb"] if low_ram or not fam.get("low_ram") else d.get("ram_gb_normal", d["ram_gb"])
+def m2_low_ram_mode(choice: str, ram: float) -> tuple:
+    """MiniMax-M2's low-RAM mode (--m2-low-ram): (on, why).  "on" / "off" as asked; "auto" by this PC's total RAM,
+    below M2_LOW_RAM_BELOW_GB on."""
+    if choice == "on":
+        return True, "--m2-low-ram on"
+    if choice == "off":
+        return False, "--m2-low-ram off"
+    if ram < M2_LOW_RAM_BELOW_GB:
+        return True, (f"{ram:.0f} GB of RAM is below {M2_LOW_RAM_BELOW_GB} GB: a host copy of the ~49 GB of experts "
+                      "would not fit beside the file and the OS")
+    return False, f"{ram:.0f} GB of RAM (at least {M2_LOW_RAM_BELOW_GB} GB): the experts are copied into RAM"
+def m2_build_dir(hip: bool, meta: dict):
+    """The build folder setup compiled this engine in (strata-m2 is built there too), or None: a ready-made engine, the
+    Intel Arc (SYCL) stub, the app's engine component or Windows (no build folder setup can reuse)."""
+    if WIN or CONTROL:
+        return None
+    if hip:
+        return ROOT / "build-hip" if meta.get("backend") == "hip" and meta.get("source") == "local-hip" else None
+    if meta.get("source") != "local" or meta.get("backend"):
+        return None
+    return ROOT / ("build-cuda12" if meta.get("toolkit") == 12 else "build")
+def build_m2_engine(eng: Path, hip: bool, meta: dict):
+    """MiniMax-M2: compile strata-m2 (the engine path on its own; `strata` carries the same path and switches to it from
+    the file's architecture) in the build folder the engine was compiled in, and copy it next to the engine.  A failed
+    or impossible build is said and setup goes on: the start script runs `strata`, which does not need strata-m2.
+    Returns its path, or None."""
+    bdir = m2_build_dir(hip, meta)
+    if bdir is None or not (bdir / "CMakeCache.txt").is_file():
+        warn(f"{M2_EXE} (the MiniMax-M2 engine on its own) is not compiled on this backend / engine (a ready-made or "
+             "Intel Arc engine, or Windows): the model still runs through strata, which carries its engine path")
+        return None
+    say(f"  Compiling {M2_EXE}, the MiniMax-M2 engine (only what changed) ...")
+    try:
+        cmake, _ = ensure_build_tools()
+        build = [cmake, "--build", str(bdir), "--target", "strata-m2", "-j", str(max(2, (os.cpu_count() or 4) // 2))]
+        done_ok = run(build, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        say(f"  ({e})")
+        done_ok = False
+    if not done_ok or not (bdir / M2_EXE).is_file():
+        warn(f"the {M2_EXE} build failed (see the output above): setup goes on, the model runs through strata; to retry: "
+             f"cmake --build {bdir} --target strata-m2")
+        return None
+    shutil.copy2(bdir / M2_EXE, eng / M2_EXE)
+    ok(f"MiniMax-M2 engine compiled: {eng / M2_EXE}")
+    return eng / M2_EXE
+def write_m2_run_script(cfg_path, port, open_browser=True, low_ram=True, why=""):
+    """run_minimax_m2.sh (Linux/macOS shells): the server with MiniMax-M2's config, as write_run_script writes it, plus
+    the low-RAM mode setup chose as the default, overridable for one run without reinstalling: M2_LOW_RAM=1|0 or the
+    script's own --low-ram / --no-low-ram.  The config carries setup's choice; another mode runs a copy of it with
+    --low-ram added or left out.  STRATA_M2_LOW_RAM is always unset: the engine turns the mode on when that variable
+    merely exists (any value, even 0), so the flag alone decides.  M2_DRY_RUN=1 prints the command instead."""
+    q = shlex.quote
+    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", "$CONFIG",
+             "--port", str(port)] + (["--open"] if open_browser else [])
+    cmd = " ".join('"$CONFIG"' if x == "$CONFIG" else q(x) for x in serve)
+    default = "1" if low_ram else "0"
+    text = f"""#!/bin/sh
+# {M2_RUN_SCRIPT} - written by setup.py: MiniMax-M2 through the Strata server (serve/server.py, sampling from the
+# model card: temperature 1.0, top_p 0.95).
+# The low-RAM mode (--low-ram: the experts are read where they lie in the file, no copy of them in RAM) is
+# {"on" if low_ram else "off"} by default, as setup chose it ({why or "--m2-low-ram"}).  For one run, without reinstalling:
+#   M2_LOW_RAM=1 ./{M2_RUN_SCRIPT}    or  ./{M2_RUN_SCRIPT} --low-ram       (low-RAM mode on)
+#   M2_LOW_RAM=0 ./{M2_RUN_SCRIPT}    or  ./{M2_RUN_SCRIPT} --no-low-ram    (normal mode: the experts copied into RAM)
+# M2_DRY_RUN=1 prints the command instead of starting it.
+cd {q(str(ROOT))} || exit 1
+CONFIG={q(str(cfg_path))}
+DEFAULT={default}
+LOW_RAM="${{M2_LOW_RAM:-$DEFAULT}}"
+for arg in "$@"; do
+  case "$arg" in
+    --low-ram) LOW_RAM=1 ;;
+    --no-low-ram) LOW_RAM=0 ;;
+    *) echo "{M2_RUN_SCRIPT}: unknown argument $arg (--low-ram or --no-low-ram)" >&2; exit 2 ;;
+  esac
+done
+case "$LOW_RAM" in
+  1|on|yes|true) LOW_RAM=1 ;;
+  0|off|no|false) LOW_RAM=0 ;;
+  *) echo "{M2_RUN_SCRIPT}: M2_LOW_RAM must be 1 or 0, not $LOW_RAM" >&2; exit 2 ;;
+esac
+# the engine turns the low-RAM mode on when STRATA_M2_LOW_RAM merely exists (even =0): the --low-ram flag decides
+unset STRATA_M2_LOW_RAM
+if [ "$LOW_RAM" != "$DEFAULT" ]; then
+  # the config carries setup's choice: this run uses a copy of it with --low-ram added or left out
+  RUNCFG="$(dirname "$CONFIG")/.run_minimax_m2.override.json"
+  {q(sys.executable)} - "$CONFIG" "$RUNCFG" "$LOW_RAM" <<'EOF' || exit 1
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+cfg["args"] = [x for x in cfg["args"] if x != "--low-ram"] + (["--low-ram"] if sys.argv[3] == "1" else [])
+json.dump(cfg, open(sys.argv[2], "w", encoding="utf-8"), indent=1)
+EOF
+  CONFIG="$RUNCFG"
+fi
+if [ "$LOW_RAM" = 1 ]; then echo "MiniMax-M2: low-RAM mode on (--low-ram)"; else echo "MiniMax-M2: normal mode (no --low-ram)"; fi
+if [ -n "$M2_DRY_RUN" ]; then
+  echo {cmd}
+  exit 0
+fi
+exec {cmd}
+"""
+    script = home() / M2_RUN_SCRIPT
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
 def own_path_size(fam: dict, ram: float) -> str:
     """The recommended size: the largest file whose RAM need this PC has (the smallest when none fits)."""
     fits = [m for m, d in fam["models"].items() if ram >= d["ram_gb"]]
-    return max(fits, key=lambda m: fam["sha256"][fam["file"].format(q=m)][0]) if fits else next(iter(fam["models"]))
+    return max(fits, key=lambda m: own_path_bytes(fam, m)) if fits else next(iter(fam["models"]))
 
 
 def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
@@ -7288,6 +7417,10 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     default answer is yes; what is asked for with --vision gpu / cpu is kept, with a note (recommend, never force)."""
     asked = a.vision
     vram = float(gpu.get("vram_gb", 0.0))
+    if not fam.get("vision", True):                  # a family without a picture reader (MiniMax-M2)
+        if asked not in (None, "no", "none"):
+            warn(f"{fam['title']} has no image encoder: images off")
+        return "none"
     if asked in ("no", "none"):
         return "none"
     if asked is None:
@@ -7328,7 +7461,7 @@ PARALLEL_SMALL_SHARE = 0.35     # a card that does not hold every expert: the sl
 def own_path_parallel_fits_all(fam: dict, model: str, vram_gb: float, ctx: int, n: int) -> bool:
     """True where every routed expert still sits in VRAM beside n slots' sessions (one more session than the slots: the
     solo path's own)."""
-    size = fam["sha256"][fam["file"].format(q=model)][0] / 1e9
+    size = own_path_bytes(fam, model) / 1e9
     base = size * 0.93 + 4.5       # the routed experts + the dense weights and buffers (the file's 7% beyond them)
     return base + (n + 1) * own_path_parallel_slot_gb(fam, ctx) <= vram_gb
 
@@ -7401,21 +7534,31 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     names = list(fam["models"])
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    low_ram, low_why = True, ""
+    m2_choice = getattr(a, "m2_low_ram", None) or "auto"
+    if fam.get("low_ram"):                             # MiniMax-M2: the low-RAM mode by --m2-low-ram (auto: by the RAM)
+        low_ram, low_why = m2_low_ram_mode(m2_choice, ram)
+        ok(f"low-RAM mode: {'on (--low-ram)' if low_ram else 'off (normal mode)'} - {low_why}")
+    elif m2_choice != "auto":
+        warn(f"--m2-low-ram is MiniMax-M2's setting: {fam['title']} does not use it")
     say()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
-        fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
+        size = own_path_bytes(fam, m)
+        need = own_path_ram_need(fam, m, low_ram)
+        fit = "" if ram >= need else f"   <- needs {need} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
     rec = own_path_size(fam, ram)
     if not a.model:
         say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
                                      str(names.index(rec) + 1), a.yes)) - 1]
-    if ram < fam["models"][model]["ram_gb"]:
-        confirm_risk(f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB: the "
-                     "OS may page and it may not start", bool(a.model), a.yes,
-                     f"{model} needs about {fam['models'][model]['ram_gb']} GB of RAM",
+    need = own_path_ram_need(fam, model, low_ram)
+    if ram < need:
+        confirm_risk(f"{model} needs about {need} GB of RAM" + ("" if low_ram else " in the normal mode") +
+                     f"; this PC has {ram:.0f} GB: the OS may page and it may not start",
+                     bool(a.model) or bool(fam.get("low_ram") and m2_choice == "off"), a.yes,
+                     f"{model} needs about {need} GB of RAM",
                      f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?")
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
@@ -7454,10 +7597,13 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
              "does not use them")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    gguf = folder / fam["file"].format(q=model)
-    size = fam["sha256"][gguf.name][0]
-    part = gguf.with_name(gguf.name + ".part")
-    left = 0 if gguf.exists() and done(gguf) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+    shards = [folder / f for f in own_path_files(fam, model)]
+    gguf = shards[0]                                   # the engine opens the first shard and finds the rest beside it
+    left = 0
+    for s in shards:
+        part = s.with_name(s.name + ".part")
+        if not (s.exists() and done(s)):
+            left += (fam["sha256"][s.name][0] - (part.stat().st_size if part.is_file() else 0)) / 1e9
     if left and free_gb(folder) < left:
         fail(f"not enough free disk space in {folder}: need ~{left:.0f} GB, {free_gb(folder):.0f} GB free", "use --models-dir on a bigger drive")
     if left and free_gb(folder) < left + 1:
@@ -7468,7 +7614,12 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
 
     step(4, "the Strata engine")
+    if family == "minimax2" and not WIN and not CONTROL and not getattr(a, "prebuilt", None):
+        # MiniMax-M2: the engine is compiled here (its engine path, then strata-m2 below), not taken ready-made
+        a.build = True
     llama, eng, meta, lib_dirs, gpu, vision = engine_step(a, gpu, hip, amd, cuda_tk, vision)
+    if family == "minimax2":
+        build_m2_engine(eng, hip, meta)
     reader = None
     if hip and vision != "none":
         vision, reader = hip_reader(eng, vision, gpu)
@@ -7481,15 +7632,16 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok("engine: the engine component (looked up when the model loads)" if CONTROL else f"engine: {eng / EXE}")
 
     step(5, f"downloading {fam['title']} {model}")
-    if gguf.exists() and done(gguf):
-        ok(f"{gguf.name} already downloaded")
-    else:
-        if a.gguf_dir:
-            fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
-        download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name], own=bool(a.gguf_dir))
-    ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
+    for s in shards:
+        if s.exists() and done(s):
+            ok(f"{s.name} already downloaded")
+        else:
+            if a.gguf_dir:
+                fail(f"{s} is missing", f"put {s.name} in {folder}, or drop --gguf-dir to download it")
+            download(fam["hf"].format(q=model) + s.name, s)
+        verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))
+    ok(f"model file: {gguf}" + (f" (+ {len(shards) - 1} more shard{'s' if len(shards) > 2 else ''})" if len(shards) > 1 else ""))
+    mmproj = folder / fam.get("mmproj", "")           # MiniMax-M2 has none (its images are always off)
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
         if mmproj.exists() and done(mmproj):
             ok(f"{mmproj.name} already downloaded")
@@ -7510,7 +7662,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
-    if fam.get("low_ram"):
+    if fam.get("low_ram") and low_ram:
         # the experts stay in the file (a copy of them does not fit beside it, and it empties the page cache)
         args += ["--low-ram"]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
@@ -7561,13 +7713,18 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
-    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    if family == "minimax2" and not WIN:               # its own start script, with the low-RAM switch (M2_LOW_RAM)
+        script = write_m2_run_script(cfg_path, port, cfg.get("open_browser") is not False, low_ram, low_why)
+    else:
+        script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
     say()
     say("All set.")
     say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
     say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
     say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
+    if family == "minimax2" and not WIN:
+        say(f"  Low-RAM mode:     M2_LOW_RAM=1 or M2_LOW_RAM=0 ./{script.name} switches it for one run")
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
     if par is None and not par_said:                   # the opt-in, said once (nothing changes)
@@ -7593,7 +7750,7 @@ def preview_family(a) -> int:
     ram = ram_gb()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
+        size = own_path_bytes(fam, m)
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
     if a.check:
@@ -7933,6 +8090,10 @@ def main() -> int:
                          "and code only (~110 MiB less VRAM, English answers 1-2%% faster), cyrillic = English, code "
                          "and the Cyrillic script (Ukrainian, Russian... answers decode ~30%% faster), fr = English, "
                          "code and French (French answers: 18%% more drafts accepted)")
+    ap.add_argument("--m2-low-ram", choices=["auto", "on", "off"], default="auto",
+                    help="MiniMax-M2 (--family minimax2): its low-RAM mode (--low-ram: the experts read where they lie in "
+                         f"the file, no copy in RAM); auto: on below {M2_LOW_RAM_BELOW_GB} GB of RAM. The start script "
+                         f"{M2_RUN_SCRIPT} keeps it as its default; M2_LOW_RAM=1|0 switches it for one run")
     ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
                     help="read the model's experts from one file in its folder instead of copying them all into RAM "
                          "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "

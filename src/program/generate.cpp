@@ -2325,11 +2325,14 @@ int main(int argc, char** argv) {
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
+            std::printf("qwen4exp");
 #if defined(STRATA_HAVE_QWEN35)
-            std::printf("qwen4exp qwen35moe\n");
-#else
-            std::printf("qwen4exp\n");
+            std::printf(" qwen35moe");
 #endif
+#if defined(STRATA_HAVE_MINIMAXM2)
+            std::printf(" minimax-m2");
+#endif
+            std::printf("\n");
             return 0;
         }
     }

@@ -75,11 +75,14 @@ class EveryFileIsPinned(unittest.TestCase):
                     if fam_name in setup.FAMILIES:
                         for i in range(1, setup.model_shards(fam, model) + 1):
                             self.pinned(fam["hf"].format(q=model) + setup.model_file(fam, model, i))
-                    else:
-                        self.pinned(fam["hf"] + fam["file"].format(q=model))
+                    else:                      # one file, or its shards (MiniMax-M2)
+                        for f in setup.own_path_files(fam, model):
+                            self.pinned(fam["hf"].format(q=model) + f)
 
     def test_the_picture_reader_of_every_family(self):
         for name, fam in {**setup.FAMILIES, **setup.OWN_PATH_FAMILIES}.items():
+            if "mmproj" not in fam:                    # a family without pictures (MiniMax-M2)
+                continue
             with self.subTest(family=name):
                 self.pinned(fam["mmproj_hf"] + fam["mmproj"])
 
