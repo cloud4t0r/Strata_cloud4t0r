@@ -86,6 +86,41 @@ class LowRamMode(unittest.TestCase):
         self.assertEqual(setup.own_path_ram_need(q, "Q8_0", False), q["models"]["Q8_0"]["ram_gb"])
 
 
+class Context(unittest.TestCase):
+    """The recommended context follows MiniMax-M2's fp32 KV cache on the one card the engine runs on; Qwen3.6's rule
+    is unchanged."""
+    M2 = setup.OWN_PATH_FAMILIES["minimax2"]
+    Q36 = setup.OWN_PATH_FAMILIES["qwen36"]
+
+    def test_the_kv_cache_matches_the_gguf(self):
+        # 62 layers, attention.head_count_kv = 8, key/value_length 128, fp32 K and V: 15.5 GiB per 32K tokens
+        self.assertEqual(self.M2["kv_bytes_per_token"], 62 * 8 * 128 * 2 * 4)
+        self.assertAlmostEqual(self.M2["kv_bytes_per_token"] * 32768 / 2 ** 30, 15.5)
+
+    def test_a_16_gb_card_gets_a_context_that_fits(self):
+        for vram in (16.0, 17095983104 / 2 ** 30):            # 16 GB, and the RX 6800's sysfs figure (15.92 GiB)
+            rec = setup.own_path_context(self.M2, vram)
+            self.assertNotEqual(rec, 131072)
+            self.assertEqual(rec, 16384, vram)
+            b = self.M2["vram_budget"]
+            self.assertLessEqual(rec * self.M2["kv_bytes_per_token"] / 2 ** 30 + b["dense_gib"] + b["fixed_gib"], vram)
+            self.assertLessEqual(setup.own_path_ctx_need_gib(self.M2, rec) + b["experts_gib"], vram)
+            self.assertGreater(setup.own_path_ctx_need_gib(self.M2, 32768), vram)   # 32K cannot start there
+
+    def test_a_bigger_card_gets_a_longer_context(self):
+        self.assertEqual(setup.own_path_context(self.M2, 24.0), 32768)
+        self.assertEqual(setup.own_path_context(self.M2, 48.0), 65536)
+        self.assertGreater(setup.own_path_context(self.M2, 48.0), setup.own_path_context(self.M2, 16.0))
+        self.assertEqual(setup.own_path_context(self.M2, 8.0), 8192)    # nothing fits: the smallest
+
+    def test_qwen36_is_unchanged(self):
+        self.assertNotIn("vram_budget", self.Q36)
+        for vram, ctx in ((12.0, 32768), (16.0, 32768), (24.0, 65536), (32.0, 131072)):
+            self.assertEqual(setup.own_path_context(self.Q36, vram), ctx, vram)
+        self.assertEqual(setup.own_path_contexts(self.Q36), [c for c in setup.CONTEXTS if c <= 262144])
+        self.assertIn(16384, setup.own_path_contexts(self.M2))
+
+
 class BuildDir(unittest.TestCase):
     def test_where_strata_m2_is_built(self):
         with mock.patch.object(setup, "WIN", False), mock.patch.object(setup, "CONTROL", None):
@@ -148,10 +183,57 @@ class Install(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def install(self, family="minimax2", ram=64.0, **kw):
-        gpu = {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}
+    def install(self, family="minimax2", ram=64.0, gpu=None, multi=None, **kw):
+        gpu = gpu or {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}
         return run(setup.install_own_path, args(models_dir=str(self.root / "models"), family=family, **kw), family, gpu,
-                   True, [], None, [], 8080, ram, None)
+                   True, [], None, multi or [], 8080, ram, None)
+
+    def ctx(self):
+        a = self.cfg["args"]
+        return a[a.index("--max-context") + 1]
+
+    def test_a_16_gb_card_writes_a_context_that_fits(self):
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ctx(), "16384")
+        self.assertNotIn("context does not fit", out)             # no warning for the recommended context
+
+    def test_two_16_gb_cards_get_the_one_cards_context(self):
+        # the main card as setup hands it over with two AMD cards (--gpus 0,1 or none): its own VRAM, not the sum
+        gpu = {"index": 0, "count": 2, "vram_gb": 17163091968 / 2 ** 30, "name": "AMD Radeon RX 9070",
+               "archs": ["gfx1030", "gfx1201"]}
+        rc, out = self.install(gpu=gpu, multi=[0, 1])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("runs on one GPU so far", out)
+        self.assertEqual(self.ctx(), "16384")
+        self.assertEqual(self.cfg["gpu"], 0)
+
+    def test_a_48_gb_card_writes_a_longer_context(self):
+        rc, out = self.install(gpu={"index": 0, "count": 1, "vram_gb": 48.0, "name": "Test GPU"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ctx(), "65536")
+
+    def test_an_explicit_context_that_does_not_fit_is_said_and_kept(self):
+        rc, out = self.install(context=131072)                    # --context 131072 --yes: the user's choice
+        self.assertEqual(rc, 0, out)
+        self.assertIn("a 128K context does not fit MiniMax-M2", out)
+        self.assertIn("its KV cache alone is 62.0 GB", out)
+        self.assertIn("kept as you chose", out)
+        self.assertEqual(self.ctx(), "131072")
+
+    def test_yes_alone_never_writes_a_context_that_cannot_start(self):
+        rc, out = self.install(gpu={"index": 0, "count": 1, "vram_gb": 6.0, "name": "Test GPU"})
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("does not fit the 6 GB card", out)
+        self.assertEqual(self.cfg, {})                            # no config written
+
+    def test_the_context_menu_shows_the_kv_cache(self):
+        with mock.patch.object(setup, "ask", lambda q, choices, default, yes=False: default):
+            rc, out = self.install(yes=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2) 16K tokens   (KV cache 7.8 GB)   (recommended for your GPU)", out)
+        self.assertIn("3) 32K tokens   (KV cache 15.5 GB: does not fit your 16 GB card)", out)
+        self.assertEqual(self.ctx(), "16384")
 
     def builds(self):
         return [c[1] for c in self.calls if c[0] == "run" and "--target" in c[1]]

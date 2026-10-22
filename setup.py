@@ -642,6 +642,26 @@ MINIMAX2_FILES = {
 # the OS).  Derived from the code, not measured: src/minimaxm2/m2_engine.cu notes that on a 64 GB box the copy did not
 # fit beside the file and the machine thrashed; 96 GB leaves the copy, the page cache's share and the OS room.
 M2_LOW_RAM_BELOW_GB = 96
+# MiniMax-M2's VRAM beside its context, on the ONE card the engine runs on (GiB; setup's vram_gb is in GiB too).  Its
+# fp32 KV cache (62 layers, 8 KV heads x 128) is ~15.5 GiB per 32K tokens, so the context decides what fits:
+# own_path_context picks the largest that leaves these, and setup asks before writing one that cannot start.
+M2_DENSE_GPU_GIB = 1.86        # MEASURED: IQ2_XXS's dense weights on the GPU ("1.86 GiB on the GPU", 2026-10-22)
+# from the code (m2_engine.cu Engine::init and place_experts, one session - setup writes no --batch): the buffers sized
+# by the prompt chunk, per row - the activations (x, h, y, hmain, qg, q, gate, att, kx, vx, the router's logits), the
+# expert parts and the CPU pool's copies (ecpu, eparts, moe_out, sy, the hybrid outputs), the q8 / FP16 operands, the
+# split-K partials and the expert scratch (8 entries x (3 x 1536 x 4 B + q8_1)) - and the fixed ones: the attention
+# scores (256 MiB fp32 + 128 MiB fp16), the GEMM workspace (32 MiB) and dequant scratch (3072 x 6144 x 2 B), the logits
+M2_PREFILL_CHUNK = 2048        # --prefill auto on a card that cannot hold every expert, >= 7.5 GiB free after the weights
+M2_CHUNK_ROW_BYTES = 713612
+M2_FIXED_BUFFER_BYTES = (64 << 20) * 6 + (32 << 20) + 3072 * 6144 * 2 + 8 * 200064 * 4
+M2_BUFFERS_GIB = (M2_PREFILL_CHUNK * M2_CHUNK_ROW_BYTES + M2_FIXED_BUFFER_BYTES) / 2 ** 30   # 1.81 GiB
+M2_ENGINE_RESERVE_GIB = 0.75   # from the code: the 768 MiB the expert placement leaves free (m2_engine.cu reserve)
+M2_RUNTIME_GIB = 0.5           # ESTIMATE: the CUDA / HIP context and the BLAS libraries' workspaces
+M2_EXPERT_ROOM_GIB = 2.0       # ESTIMATE: room the recommendation keeps for the most-used experts' slots, so the
+                               # low-RAM / hybrid mode does not run every expert on the CPU (a choice may use it)
+# from the code: what else grows with the context, per token: the FP16 K / V of one layer (k16 / v16: 8 x 128 x 2 B x
+# 2) and the prompt attention's partials (pacc / pm / pl: 48 heads x 64 rows / 128 cells x (128 + 2) x 4 B)
+M2_CTX_EXTRA_BYTES_PER_TOKEN = 8 * 128 * 2 * 2 + 48 * 64 // 128 * (128 + 2) * 4
 M2_EXE = "strata-m2.exe" if os.name == "nt" else "strata-m2"   # the MiniMax-M2 engine path on its own (CMake target)
 M2_RUN_SCRIPT = "run_minimax_m2.sh"                             # its start script (Linux), written by install_own_path
 OWN_PATH_FAMILIES = {
@@ -681,8 +701,16 @@ OWN_PATH_FAMILIES = {
                  "models": {"IQ2_XXS": {"about": "2-bit i-quant (the smallest M2 file), 54.7 GB", "ram_gb": 24,
                                         "ram_gb_normal": M2_LOW_RAM_BELOW_GB}},
                  "sha256": MINIMAX2_FILES,
-                 # the engine's KV cache per context token: 62 layers, 4 KV heads x 128, K and V in fp32 (strata-m2)
-                 "kv_bytes_per_token": 62 * 4 * 128 * 2 * 4,
+                 # the engine's KV cache per context token: 62 layers, 8 KV heads x 128 (the GGUF's
+                 # attention.head_count_kv), K and V in fp32 (strata-m2): 15.5 GiB per 32K tokens
+                 "kv_bytes_per_token": 62 * 8 * 128 * 2 * 4,
+                 # the KV cache bounds the context on one card: the context is chosen against this budget
+                 # (own_path_context, own_path_ctx_gib), and 16K is offered between 8K and 32K
+                 "vram_budget": {"dense_gib": M2_DENSE_GPU_GIB,
+                                 "fixed_gib": M2_BUFFERS_GIB + M2_ENGINE_RESERVE_GIB + M2_RUNTIME_GIB,
+                                 "experts_gib": M2_EXPERT_ROOM_GIB,
+                                 "extra_bytes_per_token": M2_CTX_EXTRA_BYTES_PER_TOKEN},
+                 "extra_contexts": [16384],
                  "mtp": 0,                      # the released weights carry no MTP block
                  # the low-RAM mode is chosen by --m2-low-ram (auto: by this PC's RAM, M2_LOW_RAM_BELOW_GB); on, no
                  # host copy of the experts: they stay in the file
@@ -4284,6 +4312,32 @@ def rocm_dev_missing(sysroot: Path) -> list:
     return [name for name, paths in need.items() if not any(p.is_file() for p in paths)]
 
 
+def system_rocm_ok() -> bool:
+    """The system ROCm rocm_root would take (hipcc, hipBLAS, ROCm 7 or newer, the HIP development files), checked without
+    a word: only it compiles for cards of two GPU families (AMD's wheels hold one family's libraries)."""
+    sysroot = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
+    if not ((sysroot / "bin" / "hipcc").exists() and list((sysroot / "lib").glob("libhipblas.so*"))):
+        return False
+    ver = rocm_version(sysroot)
+    return (ver is None or ver >= ROCM_SYSTEM_MIN) and not rocm_dev_missing(sysroot)
+
+
+def amd_build_archs(chosen: list, usable: list) -> list:
+    """The architectures the HIP engine is compiled for: the chosen cards' (the main one, or a layer split's), and on a
+    Linux PC with two or more usable AMD cards every one of theirs too - the config's "gpu" can name another card later
+    (an RX 6800 gfx1030 beside an RX 9070 gfx1201: an engine with gfx1030 code only stopped on GPU 1 with "device kernel
+    image is invalid").  Without a system ROCm a card of another GPU family than the chosen ones is left out (AMD's
+    wheels hold one family).  Sorted, no duplicates; one card (and Windows, whose engine is ready-made): as before."""
+    archs = sorted({g["arch"] for g in chosen})
+    if WIN or len(usable) < 2:
+        return archs
+    extra = {g["arch"] for g in usable} - set(archs)
+    if extra and not system_rocm_ok():
+        families = {rocm_index(x) for x in archs}
+        extra = {x for x in extra if rocm_index(x) in families}
+    return sorted(set(archs) | extra)
+
+
 def rocm_root(archs):
     """ROCm for compiling and running the HIP engine for `archs` (one arch or a list: the cards of a layer split):
     (root, library folders).  A system ROCm 7 with hipcc, hipBLAS and the HIP development files (#446), else AMD's
@@ -4378,10 +4432,27 @@ def hipblaslt_table(arch, lib_dirs, ver=None, extra_dirs=()):
     return None
 
 
+def hip_cache_archs(bdir: Path) -> list | None:
+    """The HIP architectures a build folder is configured for (CMAKE_HIP_ARCHITECTURES in its CMakeCache.txt, features
+    such as :xnack- dropped), or None when it has no cache or no such entry.  strata-m2 is compiled from that cache
+    (build_m2_engine), so a folder configured by hand for fewer cards than engine/BUILD.json says is configured again."""
+    try:
+        text = (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"^CMAKE_HIP_ARCHITECTURES(?::[A-Z]+)?=(.*)$", text, re.M)
+    if m is None:
+        return None
+    return [x.split(":")[0] for x in re.split(r"[;\s]+", m.group(1).strip()) if x]
+
+
 def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
-    gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
-    (#304): the image encoder too, for the CPU (there is no HIP encoder build yet)."""
+    gpu["archs"]: every architecture it needs code for (the cards of a layer split; amd_build_archs: every usable
+    card's on a PC with several), else gpu["arch"].  CMAKE_HIP_ARCHITECTURES and, with two or more AMD cards,
+    GPU_TARGETS get that same list on every configure, so a build folder's cache (ROCm's GPU_TARGETS lists every card
+    it detects) cannot disagree.  vision "cpu" (#304): the image encoder too, for the CPU (there is no HIP encoder
+    build yet)."""
     acquisition.require("an engine build")
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
@@ -4389,7 +4460,8 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
-    has_archs = set(archs) <= set(meta.get("archs", []))
+    cached = hip_cache_archs(ROOT / "build-hip")         # a stale CMAKE_HIP_ARCHITECTURES there: configure again
+    has_archs = set(archs) <= set(meta.get("archs", [])) and (cached is None or set(archs) <= set(cached))
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
     engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs and \
         (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
@@ -4418,6 +4490,8 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     cmake_build(ROOT, ROOT / "build-hip", "strata",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
                  "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+                 # several AMD cards: ROCm's GPU_TARGETS (cached from every card it detects) the same list
+                 *(["-DGPU_TARGETS=" + ";".join(archs)] if len(archs) > 1 or int(gpu.get("count") or 1) > 1 else []),
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
@@ -6652,6 +6726,10 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
         else:
             g = next((x for x in amd if x["index"] == (use if use is not None else x["index"])
                       and amd_problem(x) is None), None)
+            built = (engine_archs_hip() or []) if use is not None else []
+            if g is not None and built and g["arch"] not in built:   # else the engine stops: "device kernel image is invalid"
+                fail(f"the engine was built for {', '.join(built)} only; GPU {g['index']} ({g['name']}) is {g['arch']}",
+                     "re-run setup to rebuild it for this card: ./setup.sh --setup --backend hip --gpu " + str(g["index"]))
             if g is not None:
                 ok(f"GPU: {g['name']} ({g['vram_gb']:.0f} GB, AMD)")
     else:
@@ -7281,10 +7359,38 @@ def engine_families(eng: Path) -> set:
     return names if "qwen4exp" in names else {"qwen4exp"}
 
 
+def own_path_contexts(fam: dict) -> list:
+    """The contexts offered for an own-path family: CONTEXTS up to the 262144 this engine path runs without rope
+    scaling, plus the family's "extra_contexts" (MiniMax-M2: 16K, between 8K and 32K)."""
+    return sorted({c for c in CONTEXTS if c <= 262144} | set(fam.get("extra_contexts", ())))
+
+
+def own_path_ctx_gib(fam: dict, ctx: int) -> float:
+    """GiB of VRAM the context takes for a family with a "vram_budget": its KV cache and what else grows with it."""
+    b = fam["vram_budget"]
+    return ctx * (fam["kv_bytes_per_token"] + b["extra_bytes_per_token"]) / 2 ** 30
+
+
+def own_path_ctx_need_gib(fam: dict, ctx: int) -> float:
+    """GiB of VRAM the engine needs on its card to start at this context (a "vram_budget" family): the context, the
+    dense weights and the engine's buffers - the experts' slots not counted (the low-RAM mode can run them all on the
+    CPU)."""
+    b = fam["vram_budget"]
+    return own_path_ctx_gib(fam, ctx) + b["dense_gib"] + b["fixed_gib"]
+
+
 def own_path_context(fam: dict, vram_gb: float) -> int:
-    """The recommended context for an own-path family: its KV cache (VRAM) beside the dense weights and the most-used
-    experts - 32K up to 16 GB, 64K up to 24 GB, 128K above."""
-    return 32768 if vram_gb <= 16.5 else 65536 if vram_gb <= 24.5 else 131072
+    """The recommended context for an own-path family, for the VRAM of the ONE card the engine runs on.  A family with
+    a "vram_budget" (MiniMax-M2, whose fp32 KV cache is ~15.5 GiB per 32K tokens): the largest offered context whose
+    cache, beside the dense weights, the engine's buffers and room for the most-used experts, fits that card (the
+    smallest when none does).  The others (Qwen3.6, whose cache is small): 32K up to 16 GB, 64K up to 24 GB, 128K
+    above."""
+    if "vram_budget" not in fam:
+        return 32768 if vram_gb <= 16.5 else 65536 if vram_gb <= 24.5 else 131072
+    room = fam["vram_budget"]["experts_gib"]
+    ctxs = own_path_contexts(fam)
+    fits = [c for c in ctxs if own_path_ctx_need_gib(fam, c) + room <= vram_gb]
+    return max(fits) if fits else ctxs[0]
 
 
 def own_path_files(fam: dict, model: str) -> list:
@@ -7563,18 +7669,37 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    rec_ctx = own_path_context(fam, gpu.get("vram_gb", 0.0))
+    card_vram = float(gpu.get("vram_gb", 0.0))       # the ONE card the engine runs on (the main GPU), never a sum
+    bounded = "vram_budget" in fam                    # MiniMax-M2: the KV cache decides which context fits the card
+    rec_ctx = own_path_context(fam, card_vram)
     if a.context:
         ctx = a.context
     else:
-        ctxs = [c for c in CONTEXTS if c <= 262144]   # the model's trained length; no rope scaling on this path yet
+        ctxs = own_path_contexts(fam)                 # the model's trained length; no rope scaling on this path yet
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
             f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
         for i, c in enumerate(ctxs, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
+            note = ""
+            if bounded:                               # the cache per option, and whether it fits this card
+                note = f"   (KV cache {c * fam['kv_bytes_per_token'] / 2**30:.1f} GB" + (
+                    f": does not fit your {card_vram:.0f} GB card)"
+                    if 0 < card_vram < own_path_ctx_need_gib(fam, c) else ")")
+            say(f"  {i}) {c // 1024}K tokens" + note + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
+    if bounded and 0 < card_vram < own_path_ctx_need_gib(fam, ctx):
+        # recommend, never force: said with the numbers and asked; --yes goes on only for an explicit --context
+        b = fam["vram_budget"]
+        confirm_risk(f"a {ctx // 1024}K context does not fit {fam['title']} on GPU {gpu.get('index', 0)} "
+                     f"({card_vram:.1f} GB): its KV cache alone is {ctx * fam['kv_bytes_per_token'] / 2**30:.1f} GB "
+                     f"(fp32), and with the dense weights ({b['dense_gib']:.2f} GB) and the engine's "
+                     f"buffers (~{b['fixed_gib']:.2f} GB) the engine needs about {own_path_ctx_need_gib(fam, ctx):.1f} GB "
+                     "on that one card. It would stop at start (out of memory).",
+                     bool(a.context), a.yes, f"a {ctx // 1024}K context does not fit the {card_vram:.0f} GB card",
+                     f"choose {rec_ctx // 1024}K (--context {rec_ctx}) or less, or --context {ctx} --yes to write it "
+                     "anyway", "  Use it anyway?")
+        warn(f"context {ctx}: kept as you chose; the engine may not start")
     if ctx > 262144:
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
@@ -8336,8 +8461,15 @@ def main() -> int:
                 say(f"  Using GPU {gpu['index']} ({gpu['name']}); setup recommends the card with its own memory over "
                     "the APU's shared memory. To use another: "
                     + ", ".join(f"--gpu {g['index']} ({g['name']})" for g in others))
-        # the engine is compiled for every chosen card's architecture
-        gpu = {**gpu, "count": len(amd), "archs": sorted({g["arch"] for g in chosen})}
+        # the engine is compiled for every chosen card's architecture, and with several AMD cards for every usable one's
+        gpu = {**gpu, "count": len(amd), "archs": amd_build_archs(chosen, usable)}
+        if not WIN and len(usable) > 1:
+            left = [g for g in usable if g["arch"] not in gpu["archs"]]
+            say(f"  The engine is compiled for every AMD card here ({', '.join(gpu['archs'])}), so the config's \"gpu\" "
+                "can name any of them" if not left else
+                f"  The engine is compiled for {', '.join(gpu['archs'])}: "
+                + ", ".join(f"GPU {g['index']} ({g['name']}, {g['arch']})" for g in left)
+                + " is of another GPU family, which AMD's ROCm wheels cannot add (a system ROCm 7 in /opt/rocm can)")
         chosen = [gpu] + chosen[1:]
         sel = [g["index"] for g in chosen]
         multi = sel if len(sel) > 1 else []
