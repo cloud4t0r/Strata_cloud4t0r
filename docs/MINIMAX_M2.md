@@ -15,8 +15,9 @@ same path on its own. The model is ~54.7 GB (IQ2_XXS, bartowski's GGUF, two file
   The low-RAM mode (`--low-ram`) keeps no copy of the experts in host RAM; they are read from the file on demand.
   Without it, the engine copies the ~49 GB of experts into RAM. See [Low-RAM mode or normal mode](#low-ram-mode-or-normal-mode).
 - **Two cards (split):** RX 9070 (gfx1201) as card 0 + RX 6800 (gfx1030) as card 1. The first card runs
-  layers 0-30, the second runs layers 31-61 and the output head. The head runs on the primary (card 0);
-  the last row's hidden (12 KB) crosses from card 1.
+  layers 0-30, the embedding and the output head. It also holds a copy of every layer's dense weights. The
+  second card runs layers 31-61 with its own copy of their dense weights. The last row's hidden (12 KB)
+  crosses back from card 1 to the head on card 0. (From the engine's loader code.)
 - Linux with ROCm 10 under `/opt/rocm`. Windows/Mac paths are not validated for M2 yet.
 
 ## Install with setup (Linux)
@@ -38,14 +39,23 @@ What setup does for this model:
   54.7 GB in all. It checks the size and SHA-256 of each one.
 - **No pictures.** The model has no image reader and no picture file to download. `--vision yes|gpu|cpu`
   only gives a warning; images stay off.
-- **One card.** With several cards, setup uses one and says so. The two-card split is run by hand (below).
-  The engine is still compiled for every AMD card's architecture (RX 9070 + RX 6800: gfx1201 and gfx1030), so
-  `"gpu": 1` in the config does not stop on `device kernel image is invalid`.
-- **It picks the context from that one card's VRAM.** The KV cache is fp32 on all 62 layers (8 KV heads):
-  15.5 GiB per 32K tokens. It must fit on the one card beside the dense weights (1.86 GiB, measured) and the
-  engine's buffers, so setup recommends 16K on a 16 GB card, 32K on 24-32 GB and 64K on 48 GB. For a context
-  that does not fit, setup prints the numbers and asks first. With `--yes`, it goes on only if you passed
-  `--context` yourself.
+- **One card by default.** Without `--gpus`, setup uses one card. The engine is still compiled for every AMD
+  card's architecture (RX 9070 + RX 6800: gfx1201 and gfx1030), so `"gpu": 1` in the config does not stop on
+  `device kernel image is invalid`.
+- **Two cards when you ask** (AMD, Linux): `./setup.sh --setup --family minimax2 --gpus 1,0`. See
+  [Two cards with setup](#two-cards-with-setup). NVIDIA cards and Windows stay on one card. Qwen3.6 also stays
+  on one card.
+- **It picks the context from the VRAM.** The KV cache is fp32 on all 62 layers (8 KV heads): 15.5 GiB per
+  32K tokens.
+  - One card: the cache must fit on that one card beside the dense weights (1.86 GiB, measured) and the
+    engine's buffers. Setup recommends 16K on a 16 GB card, 32K on 24-32 GB and 64K on 48 GB. It never adds
+    up the VRAM of several cards.
+  - Two cards: each card holds the cache of its own layers (about half: 7.75 GiB per 32K tokens), its own
+    buffers and its dense weights. Setup subtracts the VRAM other programs use right now (the desktop). The
+    tighter card decides. Two 16 GB cards get 32K. This is derived from the code, not measured. Close other
+    GPU programs before you run setup.
+  - For a context that does not fit, setup prints the numbers and asks first. With `--yes`, it goes on only
+    if you passed `--context` yourself.
 - **It picks the low-RAM mode or the normal mode** (next section) and writes the start script
   `run_minimax_m2.sh` in the Strata folder.
 
@@ -75,7 +85,8 @@ M2_LOW_RAM=0 ./run_minimax_m2.sh       # normal mode for this run (same as: ./ru
 M2_DRY_RUN=1 ./run_minimax_m2.sh       # print the command, start nothing
 ```
 
-It starts the Strata server (`serve/server.py`) with MiniMax-M2's config, on one card. A mode other than
+It starts the Strata server (`serve/server.py`) with MiniMax-M2's config, on the card or the two cards the
+config names. A mode other than
 setup's runs from a copy of the config (`.run_minimax_m2.override.json`, next to it); setup's config is not
 changed. The script always unsets `STRATA_M2_LOW_RAM`: the engine turns the low-RAM mode on when that variable
 exists at all, even set to `0`, so only `--low-ram` decides. On Windows setup writes no such script.
@@ -118,6 +129,30 @@ STRATA_M2_DEVICES=1 tools/run_m2_test.sh mono
 ```
 
 ## Run: two cards (layer split)
+
+### Two cards with setup
+
+```sh
+./setup.sh --setup --family minimax2 --gpus 1,0
+./run_minimax_m2.sh
+```
+
+- The cards are used in the order you give. The first card gets layers 0-30, the embedding, the output head
+  and a copy of all the dense weights. The second card gets layers 31-61.
+- `1,0` puts the RX 9070 first. It is the only order measured (the run that matched llama.cpp). The repository
+  does not record why that order was chosen. The first card carries a bit more (the embedding, the output head
+  and the dense weights). `--gpus 0,1` also works; it is not measured. Setup sizes the context on the VRAM free
+  at the time, so stop a running model before you run setup.
+- `--layer-split N` moves the split (2 to 48; 31 by default, the measured one). Above 48 the engine would not
+  copy the second card's weights, so setup refuses it.
+- With three or more cards in `--gpus`, setup uses the first two and says so.
+- Setup writes `"gpu": [1, 0]` and `"layer_split": "31"` in `strata-minimax2-iq2_xxs.json`. It writes no
+  `--layer-split` in `"args"`: the server adds `--layer-split 31` and sets `HIP_VISIBLE_DEVICES=1,0`.
+- The server turns `"layer_split": "auto"` (or no `"layer_split"`) into 31 for this model on two cards. Its
+  engine has no automatic split.
+- Limits: `--vram-reserve-mib` and the parallel-requests advice are still sized on the first card only.
+
+### Two cards by hand (the engine alone)
 
 ```sh
 HIP_VISIBLE_DEVICES=1,0 LD_LIBRARY_PATH=/opt/rocm/lib \
@@ -162,6 +197,8 @@ answer is 8261.
 - Decode speed split vs mono: to be measured.
 - The layer split runs on both cards; the residual and the normed hidden cross once per verify window
   (a few hundred KB through pinned RAM), not twice per layer.
+- The layer split runs without the decode graph (from the engine code), so its decode may be slower per token
+  than one card's. Not measured.
 
 ## Notes
 
@@ -171,5 +208,3 @@ answer is 8261.
   runner (`tools/run_m2_test.sh`) serializes runs with a timeout.
 - M2.5 (same architecture, 62 layers, 256 experts, 8 active) reuses the same engine path; only weights and
   3 config entries change. Smallest GGUF quant is Q2_K (~78-83 GB).
-path">
-/mnt/gygabyte/llm_models/Strata_cloudat0r/docs/MINIMAX_M2.md

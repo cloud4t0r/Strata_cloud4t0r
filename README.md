@@ -154,7 +154,7 @@ Smaller sizes are faster. Larger sizes are a bit smarter.
 ### Other models
 
 Strata also runs **MiniMax-M2** (230B, 10B active, 256 experts top-8) on its own engine path, on one card, or
-split across two by hand. It needs ~55 GB on disk (IQ2_XXS, two files). On Linux, setup installs it:
+split across two (`--gpus 1,0`, AMD on Linux). It needs ~55 GB on disk (IQ2_XXS, two files). On Linux, setup installs it:
 
 ```sh
 ./setup.sh --family minimax2
