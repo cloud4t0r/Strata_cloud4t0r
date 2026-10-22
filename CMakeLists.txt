@@ -786,22 +786,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata PRIVATE strata_minimaxm2)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAXM2=1)
 
-  # the engine path for MiniMax-M2 (GGUF architecture minimax-m2): src/minimaxm2/m2_engine.cu, a library that
-  # `strata` switches to for a minimax-m2 model (the family switch at the top of its main) and that strata-m2
-  # wraps on its own
-  add_library(strata_minimaxm2 STATIC src/minimaxm2/m2_engine.cu)
-  target_include_directories(strata_minimaxm2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata_minimaxm2 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
-  if(STRATA_NATIVE_EXPERTS)
-    # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic
-    target_link_libraries(strata_minimaxm2 PRIVATE strata_kernels_cpu)
-    target_compile_definitions(strata_minimaxm2 PRIVATE STRATA_Q36_CPU_POOL=1)
-  endif()
-  add_executable(strata-m2 src/minimaxm2/m2_main.cpp)
-  target_link_libraries(strata-m2 PRIVATE strata_minimaxm2 ${_strata_gpu_runtime_target})
-  target_link_libraries(strata PRIVATE strata_minimaxm2)
-  target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAXM2=1)
-
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
