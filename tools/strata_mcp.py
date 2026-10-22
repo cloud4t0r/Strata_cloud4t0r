@@ -554,7 +554,7 @@ class Strata:
         d = (getattr(self.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
         if not d or model not in d["models"]:
             return None
-        size_gb = d["sha256"][d["file"].format(q=model)][0] / 1e9
+        size_gb = sum(d["sha256"][f][0] for f in own_files(d, model)) / 1e9
         return {"about": d["models"][model]["about"], "download_gb": round(size_gb, 1), "ram_gb": d["models"][model]["ram_gb"],
                 # the routed experts are ~93% of the file (setup.own_path_parallel_fits_all); the dense part and buffers ~1 GB more
                 "arena_gb": round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
@@ -1379,6 +1379,11 @@ def shard_gaps(ggufs) -> list:
     return gaps
 
 
+def own_files(fam: dict, model: str) -> list:
+    """The GGUF file names of one size of an own-path family (setup.own_path_files): one file, or its shards."""
+    return [fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 1) + 1)]
+
+
 def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -> list:
     """The files setup fetches for one install, with the sizes it can know before the download starts:
     [{path, bytes|None, role}] where role is "model" (the shards or the pack's files) or "vision" (the picture reader).
@@ -1388,8 +1393,8 @@ def expected_files(S, family: str, model: str, models_dir: Path, vision: bool) -
         own = (getattr(S, "OWN_PATH_FAMILIES", None) or {}).get(family)
         if own:                                         # Qwen3.6: the GGUF and the picture reader in the model's folder
             folder = Path(models_dir) / (own["tag"] + model)
-            name = own["file"].format(q=model)
-            out.append({"path": str(folder / name), "bytes": own["sha256"][name][0], "role": "model"})
+            for name in own_files(own, model):          # one file, or its shards (MiniMax-M2)
+                out.append({"path": str(folder / name), "bytes": own["sha256"][name][0], "role": "model"})
             if vision:
                 out.append({"path": str(folder / own["mmproj"]), "bytes": own["sha256"][own["mmproj"]][0], "role": "vision"})
             return out
