@@ -829,6 +829,24 @@ def btrace(*a):
 
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
+# The end-of-turn texts a reply stops at: Qwen's <|im_end|> / <|endoftext|>, MiniMax-M2's "[e~[".
+END_OF_TURN_TEXTS = ("<|im_end|>", "<|endoftext|>", "[e~[")
+
+
+def stop_token_ids(tokenizer) -> set:
+    """The ids a reply stops at: each END_OF_TURN_TEXTS entry that is ONE token of this tokenizer (a control token).  A
+    text the vocabulary does not have as a token is not a stop: MiniMax-M2's tokenizer has no <|im_end|>, which encoded
+    as its pieces ('<', '|', 'im', ...) - a reply then ended at its first '<' or '|', and never at its "[e~["."""
+    controls = getattr(tokenizer, "control_tokens", None)
+    ids = set()
+    for text in END_OF_TURN_TEXTS:
+        if controls is not None and text not in controls:
+            continue
+        enc = tokenizer.encode(text, parse_special=True)
+        if len(enc) == 1:
+            ids.add(enc[0])
+    return ids
+
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
 # finished, #267): the process may stay alive and even print DONE, but it must not take another request.
@@ -2913,13 +2931,22 @@ def engine_silence_s(cfg: dict) -> float:
     return float(v)
 
 
+#: MiniMax-M2 ("arch": "minimax-m2"): its engine has no auto split - it reads --layer-split auto as 0, which is no split
+#: (the first card alone) - so a two-card config without a number gets 31, the validated split (docs/MINIMAX_M2.md)
+M2_ARCH = "minimax-m2"
+M2_LAYER_SPLIT = 31
+
+
 def layer_split_value(cfg: dict) -> str:
     """#644: the config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the FIRST LAYER of
     each later GPU's share - one rising number per GPU after the first, e.g. "24,36,42" for 4 GPUs (layers 0-23 on the
     first card, 24-35, 36-41, 42 to the end) - as a string or a JSON list ([24, 36, 42]).  ValueError with the format
-    and an example for anything else, such as per-card layer counts ("24,16,12,12")."""
+    and an example for anything else, such as per-card layer counts ("24,16,12,12").  MiniMax-M2 on two GPUs: "auto"
+    (or none) is M2_LAYER_SPLIT, as its engine has no auto split."""
     v = cfg.get("layer_split")
     if v is None or (isinstance(v, str) and v.strip().lower() in ("", "auto")):
+        if cfg.get("arch") == M2_ARCH and len(gpu_list(cfg)) == 2:
+            return str(M2_LAYER_SPLIT)
         return "auto"
     n = len(gpu_list(cfg))
     items = v if isinstance(v, (list, tuple)) else str(v).split(",") if isinstance(v, (str, int)) else None
@@ -3768,8 +3795,7 @@ class Service:
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = stop_token_ids(tokenizer)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.

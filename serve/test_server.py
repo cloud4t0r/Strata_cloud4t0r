@@ -816,6 +816,31 @@ class LiteralControlTokens(unittest.TestCase):
         self.assertEqual(ThinkTokenizer().control_tokens, ByteTokenizer.SPECIALS)
 
 
+class StopTokens(unittest.TestCase):
+    """A reply stops at the model's own end-of-turn token only.  MiniMax-M2's vocabulary has no <|im_end|>: it encoded
+    as its pieces, so a reply ended at its first '<' or '|' and ran past "[e~[" (its end of turn) to max_tokens."""
+
+    def test_minimax_stops_at_its_end_of_turn_only(self):
+        import strata_tokenizer as ST
+        from serve.server import stop_token_ids
+        b2u = ST.bytes_to_unicode()
+        tokens = [b2u[b] for b in range(256)] + ["<think>", "</think>", "[e~[", "]~b]"]
+        tok = ST.Tokenizer(tokens, [], [1] * 256 + [4, 4, 3, 3])
+        self.assertEqual(stop_token_ids(tok), {258})
+        for b in b"<|":
+            self.assertNotIn(b, stop_token_ids(tok))
+
+    def test_qwen_keeps_im_end_and_endoftext(self):
+        import strata_tokenizer as ST
+        from serve.server import stop_token_ids
+        b2u = ST.bytes_to_unicode()
+        tokens = [b2u[b] for b in range(256)] + ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+        self.assertEqual(stop_token_ids(ST.Tokenizer(tokens, [], [1] * 256 + [3, 3, 3])), {257, 258})
+        self.assertEqual(stop_token_ids(ByteTokenizer()), {257, 258})
+        svc = Service(MockEngine(ByteTokenizer(), "ok"), ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertEqual(svc.stop_ids, {257, 258})
+
+
 class EffortAtTheEnd(unittest.TestCase):
     """#458 (opt-in "effort_position": "end"): a non-default effort goes in a system turn right before the answer, so
     a request that changes only the effort keeps the cached conversation.  The engine's checkpoint rule is simulated
@@ -2652,6 +2677,23 @@ class LayerSplit(unittest.TestCase):
     def test_one_gpu_ignores_it(self):
         self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
                          ["--native", "x"])
+
+    def test_minimax_has_no_auto_split(self):
+        # the M2 engine reads --layer-split auto as 0 (no split): two GPUs get its validated split, 31
+        for v in (..., None, "", "auto"):
+            c = {**self.cfg(v, gpus=(1, 0)), "arch": "minimax-m2"}
+            self.assertEqual(engine_args(c)[-2:], ["--layer-split", "31"], v)
+        self.assertEqual(engine_args({**self.cfg("29", gpus=(1, 0)), "arch": "minimax-m2"})[-2:], ["--layer-split", "29"])
+        self.assertEqual(engine_args(self.cfg("auto", gpus=(1, 0)))[-2:], ["--layer-split", "auto"])   # other models
+        self.assertEqual(engine_args({**self.cfg("auto", gpus=(1, 0, 2)), "arch": "minimax-m2"})[-2:],
+                         ["--layer-split", "auto"])
+        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": 1, "arch": "minimax-m2"}), ["--native", "x"])
+
+    def test_minimax_keeps_the_card_order(self):
+        from serve.server import ordered_gpus
+        c = {"arch": "minimax-m2", "gpu": [1, 0], "args": [], "backend": "hip"}
+        self.assertEqual(ordered_gpus(c, {0: 1.0, 1: 9.0}), [1, 0])
+        self.assertEqual(ordered_gpus({k: v for k, v in c.items() if k != "arch"}, {0: 1.0, 1: 9.0}), [0, 1])
 
 
 class DraftHeadHint(unittest.TestCase):
