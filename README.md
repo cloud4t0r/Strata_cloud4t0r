@@ -151,6 +151,12 @@ Prefer to build it yourself? See [Build from source](#build-from-source).
 The app and `strata launch` recommend a model for your memory. It is one model in several sizes, compressed more or less.
 Smaller sizes are faster. Larger sizes are a bit smarter.
 
+### Other models
+
+Strata also runs **MiniMax-M2** (230B, 10B active, 256 experts top-8) through the dedicated `strata-m2` binary,
+on one card or split across two. It needs ~55 GB on disk (IQ2_XXS) and a build from source. See
+[docs/MINIMAX_M2.md](docs/MINIMAX_M2.md).
+
 ### Low on memory? Try Gyro
 
 [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) (by agentionai) is the smallest way to run this model.
