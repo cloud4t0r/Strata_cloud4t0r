@@ -115,6 +115,31 @@ class Rx6000Detection(KfdDetection):
         self.assertEqual(setup.win_amd_arch(0x744C, "AMD Radeon RX 7900 XTX"), "gfx1100")      # an RX 7000 card is not RDNA2
 
 
+class AmdVramUsed(unittest.TestCase):
+    """amd_vram_used_gib: the VRAM in use per card (mem_info_vram_used), numbered as amd_gpus numbers the cards."""
+    setUp, tearDown = KfdDetection.setUp, KfdDetection.tearDown
+
+    def used(self, minor, gib):
+        (self.root / f"class/drm/renderD{minor}/device/mem_info_vram_used").write_text(str(int(gib * 2 ** 30)))
+
+    def test_two_cards(self):
+        fake_sysfs(self.root, [(0, 0, 0, None, 0), (100300, 60, 128, None, 16 << 30), (120001, 64, 129, None, 16 << 30)])
+        self.used(128, 0.5)
+        self.used(129, 1.25)
+        self.assertEqual(setup.amd_vram_used_gib(str(self.root)), {0: 0.5, 1: 1.25})
+        self.assertEqual([g["index"] for g in setup.amd_gpus(str(self.root))], [0, 1])   # the same numbers
+
+    def test_a_card_without_the_file_has_no_key(self):
+        fake_sysfs(self.root, [(0, 0, 0, None, 0), (100300, 60, 128, None, 16 << 30), (120001, 64, 129, None, 16 << 30)])
+        self.used(129, 0.75)
+        self.assertEqual(setup.amd_vram_used_gib(str(self.root)), {1: 0.75})
+
+    def test_no_topology_and_windows(self):
+        self.assertEqual(setup.amd_vram_used_gib(str(self.root)), {})
+        setup.WIN = True
+        self.assertEqual(setup.amd_vram_used_gib(str(self.root)), {})
+
+
 class GpuLists(unittest.TestCase):
     """--gpus with AMD cards: every chosen card must be supported; the first is the main one."""
     AMD = [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "arch": "gfx1201"},
@@ -692,6 +717,36 @@ class EngineLaunchEnv(unittest.TestCase):
                 found = setup.hip_devices(probe)
             self.assertEqual(found[0]["arch"], "gfx1100")
             self.assertEqual(seen["env"]["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
+
+    def test_linux_engine_built_here_gets_its_rocm_on_ld_library_path(self):
+        # an engine compiled on this PC records the ROCm it links (BUILD.json "lib_dirs": ["/opt/rocm/lib"]); a
+        # `strata --families` run without it on LD_LIBRARY_PATH did not load (libhipblaslt.so.1, exit 127)
+        with tempfile.TemporaryDirectory() as t:
+            eng, rocm = Path(t) / "engine", Path(t) / "opt-rocm" / "lib"
+            eng.mkdir()
+            rocm.mkdir(parents=True)
+            (eng / "BUILD.json").write_text(f'{{"backend": "hip", "lib_dirs": ["{rocm.as_posix()}"]}}', encoding="utf-8")
+            with mock.patch.object(setup, "WIN", False), \
+                    mock.patch.dict("os.environ", {"PATH": "/usr/bin", "LD_LIBRARY_PATH": "/lib64"}):
+                env = setup.engine_env(eng)
+            self.assertEqual(env["LD_LIBRARY_PATH"], str(rocm) + setup.os.pathsep + "/lib64")
+
+    def test_linux_ld_library_path_without_an_earlier_value(self):
+        with tempfile.TemporaryDirectory() as t:
+            eng, rocm = Path(t) / "engine", Path(t) / "opt-rocm" / "lib"
+            eng.mkdir()
+            rocm.mkdir(parents=True)
+            (eng / "BUILD.json").write_text(f'{{"backend": "hip", "lib_dirs": ["{rocm.as_posix()}"]}}', encoding="utf-8")
+            with mock.patch.object(setup, "WIN", False), mock.patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+                env = setup.engine_env(eng)
+            self.assertEqual(env["LD_LIBRARY_PATH"], str(rocm))
+
+    def test_windows_leaves_ld_library_path_alone(self):
+        with tempfile.TemporaryDirectory() as t:
+            eng = self.engine(Path(t))
+            with mock.patch.object(setup, "WIN", True), mock.patch.dict("os.environ", {"PATH": "C:\\Windows"}, clear=True):
+                env = setup.engine_env(eng)
+            self.assertNotIn("LD_LIBRARY_PATH", env)
 
 
 class MultiArchBuild(unittest.TestCase):

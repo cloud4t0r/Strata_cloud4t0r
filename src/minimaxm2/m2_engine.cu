@@ -918,6 +918,8 @@ __global__ void __launch_bounds__(128) k_gdn_norm(const float* o_raw, const floa
 // The layer split: the second card's device and the first layer it runs.  The cards do not share their
 // memory (no P2P between them), so the second card gets its own copy of the weights it reads.
 int g_second_card = -1;
+// The end-of-turn id the serve loop stops at (is_eos): the GGUF's tokenizer.ggml.eos_token_id, -1 when absent.
+int32_t g_eos_id = -1;
 int g_split_first = 0;
 
 struct Mat {
@@ -1079,6 +1081,8 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
     if (const strata::MetaValue* v = gm.meta().get(p + "expert_weights_scale")) m.expert_weights_scale = (float) v->num();
+    if (const strata::MetaValue* v = gm.meta().get("tokenizer.ggml.eos_token_id"); v && v->is_num())
+        g_eos_id = (int32_t) v->u;
     uint64_t bytes = 0;
     auto find = [&](const std::string& name, size_t& s) -> const strata::TensorInfo* {
         const strata::TensorInfo* t = gm.find(name, &s);
@@ -1392,6 +1396,13 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
+    // The prompt attention on the FP16 GEMMs, per card (the layer split: the cards can differ).  Off on gfx103x: there
+    // the hipBLAS strided-batched FP16-in / FP32-out GEMMs of the scores and the values returned non-finite rows from
+    // finite operands inside this engine (RX 6800, ROCm 7.1 / hipBLAS 3: a 25-token prompt went NaN at a different layer
+    // each run, the logits were NaN, the server's sampled replies one byte token repeated - the same GEMMs alone,
+    // 12000 calls, never failed).  The split-K kernels the decode uses take the chunk instead.  STRATA_M2_ATT_GEMM=1 / 0
+    // forces either path.
+    bool att_gemm[2] = {true, true};
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
     // the prompt's MMQ experts
     bool use_mmq = false;
@@ -1655,6 +1666,25 @@ struct Engine {
             if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
                 std::fprintf(stderr, "strata-m2: cuBLAS handle failed\n");
                 std::exit(1);
+            }
+            {   // the prompt attention's path on this card (see att_gemm)
+                int dev = 0;
+                cudaDeviceProp pr{};
+                CK(cudaGetDevice(&dev));
+                CK(cudaGetDeviceProperties(&pr, dev));
+#if defined(__HIPCC__)
+                const bool gfx103 = std::strncmp(pr.gcnArchName, "gfx103", 6) == 0;
+                const char* arch = pr.gcnArchName;
+#else
+                const bool gfx103 = false;
+                const char* arch = pr.name;
+#endif
+                const char* fe = std::getenv("STRATA_M2_ATT_GEMM");
+                att_gemm[card] = fe ? fe[0] == '1' : !gfx103;
+                if (!att_gemm[card])
+                    std::fprintf(stderr, "strata-m2: card %d (%s): the prompt attention on the split-K kernels, not the FP16 "
+                                 "GEMMs (%s)\n", card, arch, fe ? "STRATA_M2_ATT_GEMM=0" : "their FP32 output is not reliable "
+                                 "on gfx103x; STRATA_M2_ATT_GEMM=1 forces them");
             }
             att_s = dalloc(kAttScoreFloats);
             sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
@@ -2313,7 +2343,7 @@ struct Engine {
             k_attn_prep_m2<<<T, kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, rows_mode ? nullptr : kc[li],
                                                      rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                                                      m->rope_base, m->eps, d_delta, mtab_now, rs);
-            if (T > kGemmT) {
+            if (T > kGemmT && att_gemm[cur_set]) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
@@ -2621,11 +2651,22 @@ struct Engine {
                 use_set(0);   // the head's GEMM (gemm[]) and its stream belong to card 0
                 CK(cudaMemcpy(hlast, hb.data(), nh, cudaMemcpyHostToDevice));
                 head_rows(hlast, heads, logits, pick);
-                CK(cudaSetDevice(split_dev));
-                CK(cudaGetLastError());
             } else {
                 head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
             }
+        }
+        if (split_dev >= 0) {
+            // The layer split: the call ends on the first card, its set AND its device current.  A chunk without a
+            // head (a long prompt's first chunks) ended with the second card's set current: the next chunk's tokens
+            // and position went to the second card's tok / pos0 while the embedding read the first card's (a prompt
+            // over one chunk faulted in embed_rows).  After a head the first card's set was current but the second
+            // card's device, and the caller's copies of logits / pick ran with the wrong device current.
+            if (cur_set != 0) {
+                CK(cudaStreamSynchronize(st));   // the second card's layers are done before its set is put away
+                use_set(0);
+            }
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
         }
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
@@ -3968,7 +4009,10 @@ std::vector<int32_t> parse_ids(const char* s) {
     return v;
 }
 
-bool is_eos(int t) { return t == 248044 || t == 248046; }
+// The end-of-turn ids: the GGUF's tokenizer.ggml.eos_token_id (MiniMax-M2: 200020, "[e~["), set by load(); the Qwen
+// ids (<|endoftext|>, <|im_end|>) stood here before and are kept for a file without the key.  With only those, a
+// MiniMax-M2 answer never ended: the server read past "[e~[" to max_tokens.
+bool is_eos(int t) { return g_eos_id >= 0 ? t == g_eos_id : t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ pictures
 constexpr int32_t kImagePad = 248056;   // <|image_pad|>
@@ -4705,10 +4749,16 @@ int strata::minimaxm2::run(int argc, char** argv) {
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
     setenv("STRATA_Q8_PACKED", "1", 0);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
     setenv("STRATA_MMQ_KQ", "1", 0);      // the K-quant MMQ prompt kernels (every expert of this family is a K-quant)
+    // gfx103x (RX 6800): the prompt's dense GEMMs as SGEMMs on FP32 copies (prefill/gemm.cu rdna2_sgemm; other cards
+    // keep the native call).  The native FP16-in / FP32-out rocBLAS GEMMs there gave NaN rows in this engine: a
+    // 2048-token chunk went non-finite from layer 1 on (the logits NaN, the pick 0x7fffffff, a fault in embed_rows).
+    // STRATA_RDNA2_SGEMM=0 turns it off.
+    setenv("STRATA_RDNA2_SGEMM", "1", 0);
 #else
     if (std::getenv("STRATA_MMQ_KQ") == nullptr) _putenv_s("STRATA_MMQ_KQ", "1");
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
+    if (std::getenv("STRATA_RDNA2_SGEMM") == nullptr) _putenv_s("STRATA_RDNA2_SGEMM", "1");   // as on Linux (above)
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-m2: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-m2: bad --chunk / --max-context\n"); return 2; }

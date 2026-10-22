@@ -664,6 +664,10 @@ M2_EXPERT_ROOM_GIB = 2.0       # ESTIMATE: room the recommendation keeps for the
 M2_CTX_EXTRA_BYTES_PER_TOKEN = 8 * 128 * 2 * 2 + 48 * 64 // 128 * (128 + 2) * 4
 M2_EXE = "strata-m2.exe" if os.name == "nt" else "strata-m2"   # the MiniMax-M2 engine path on its own (CMake target)
 M2_RUN_SCRIPT = "run_minimax_m2.sh"                             # its start script (Linux), written by install_own_path
+M2_LAYERS = 62                 # the GGUF's block_count: MiniMax-M2's 62 layers
+M2_LAYER_SPLIT = 31            # VALIDATED: the two-card run that matched llama.cpp's token 8261 (docs/MINIMAX_M2.md)
+M2_LAYER_SPLIT_MAX = 48        # from the code: strata-m2 checks --layer-split against its default 48 layers BEFORE it
+                               # reads the GGUF (m2_engine.cu), so a split past 48 would not copy the second card's weights
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -711,6 +715,9 @@ OWN_PATH_FAMILIES = {
                                  "experts_gib": M2_EXPERT_ROOM_GIB,
                                  "extra_bytes_per_token": M2_CTX_EXTRA_BYTES_PER_TOKEN},
                  "extra_contexts": [16384],
+                 # the two-card layer split (--gpus with two AMD cards, Linux): the first layer of the second card.
+                 # Only this family has it (its engine splits across two cards); the others stay on one card
+                 "n_layers": M2_LAYERS, "layer_split": M2_LAYER_SPLIT,
                  "mtp": 0,                      # the released weights carry no MTP block
                  # the low-RAM mode is chosen by --m2-low-ram (auto: by this PC's RAM, M2_LOW_RAM_BELOW_GB); on, no
                  # host copy of the experts: they stay in the file
@@ -3819,6 +3826,35 @@ def amd_gpus(sysfs="/sys"):
     return found
 
 
+def amd_vram_used_gib(sysfs="/sys") -> dict:
+    """{index: GiB of VRAM in use now} for the AMD cards, numbered as amd_gpus numbers them (the KFD GPU nodes in
+    order), from amdgpu's mem_info_vram_used: what the desktop and other programs hold.  A card whose file cannot be
+    read has no key.  Windows: {} (not read there)."""
+    if WIN:
+        return {}
+    base = Path(sysfs) / "class/kfd/kfd/topology/nodes"
+    used, index = {}, 0
+    if not base.is_dir():
+        return used
+    for node in sorted((p for p in base.iterdir() if p.name.isdigit()), key=lambda p: int(p.name)):
+        try:
+            props = {}
+            for line in (node / "properties").read_text().splitlines():
+                k, _, v = line.partition(" ")
+                props[k] = v.strip()
+            if int(props.get("gfx_target_version") or 0) == 0 or int(props.get("simd_count") or 0) == 0:
+                continue
+        except (OSError, ValueError):
+            continue
+        dev = Path(sysfs) / f"class/drm/renderD{props.get('drm_render_minor', '')}/device"
+        try:
+            used[index] = int((dev / "mem_info_vram_used").read_text()) / 2 ** 30
+        except (OSError, ValueError):
+            pass
+        index += 1
+    return used
+
+
 def amd_problem(g):
     if g["arch"] not in AMD_ARCHS:
         return (f"not supported - Strata's AMD backend runs on {AMD_CARDS} only, this is {g['arch']}"
@@ -4016,6 +4052,12 @@ def engine_env(eng: Path) -> dict:
     dirs = [str(d) for d in hip_lib_dirs(eng)]
     if dirs:
         env["PATH"] = os.pathsep.join(dirs + [env.get("PATH", "")])
+        if not WIN:
+            # Linux: an engine compiled here links the ROCm it was built with (BUILD.json "lib_dirs", e.g. /opt/rocm/lib),
+            # which the loader finds through LD_LIBRARY_PATH only.  Without it, `strata --families` failed to load
+            # (libhipblaslt.so.1 not found, exit 127) whenever setup had not compiled in this run, and setup read
+            # "Flash-Next only" and refused MiniMax-M2.
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [env.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
     return env
 
 
@@ -6332,7 +6374,7 @@ def choices_from_config(cfg_path: Path) -> dict:
         vis = cfg.get("vision")
         return {"family": own, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None, "kv": None,
                 "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none", "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
-                "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": None,
+                "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": cfg.get("layer_split"),
                 "cuda": 12 if config_toolkit(cfg) == 12 else None, "vram_reserve_mib": None}
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
@@ -7393,6 +7435,51 @@ def own_path_context(fam: dict, vram_gb: float) -> int:
     return max(fits) if fits else ctxs[0]
 
 
+# The two-card layer split (a family with "layer_split": MiniMax-M2).  DERIVED from setup's vram_budget constants and
+# the engine's code (m2_engine.cu: load, alloc_session, alloc_core), not measured: the first card runs layers 0..k-1
+# and holds the embedding, the output head and a copy of EVERY layer's dense weights; the second runs layers k..61
+# with its own copy of their dense weights.  Each card holds the K / V of its own layers, and its own set of buffers.
+def own_path_split_layers(fam: dict, split: int) -> list:
+    """The layers each card runs: [first card, second card]."""
+    return [split, fam["n_layers"] - split]
+
+
+def own_path_split_need_gib(fam: dict, ctx: int, layers: int, first: bool) -> float:
+    """GiB of VRAM one card of the split needs to start at this context (DERIVED): its layers' share of the KV
+    cache, what else grows with the context (per card), its dense weights and its buffers (per card).  The first
+    card: all the dense weights (MEASURED total).  The second: their share by layer count (an ESTIMATE, an upper
+    bound: it includes the embedding and the head, which the second card does not hold)."""
+    b = fam["vram_budget"]
+    share = layers / fam["n_layers"]
+    kv = ctx * (fam["kv_bytes_per_token"] * share + b["extra_bytes_per_token"]) / 2 ** 30
+    return kv + (b["dense_gib"] if first else b["dense_gib"] * share) + b["fixed_gib"]
+
+
+def own_path_split_room_gib(fam: dict, layers: int) -> float:
+    """The room kept for the most-used experts' slots on one card of the split: the one-card room, by layer count."""
+    return fam["vram_budget"]["experts_gib"] * layers / fam["n_layers"]
+
+
+def own_path_split_context(fam: dict, avail: list, split: int) -> int:
+    """The recommended context for the split: the largest offered one that fits BOTH cards (the tighter card
+    decides) with the experts' room; avail = each card's free VRAM in GiB, in the split's order.  The smallest when
+    none fits (as on one card)."""
+    ctxs = own_path_contexts(fam)
+    layers = own_path_split_layers(fam, split)
+    fits = [c for c in ctxs if all(own_path_split_need_gib(fam, c, n, i == 0) + own_path_split_room_gib(fam, n) <= v
+                                   for i, (n, v) in enumerate(zip(layers, avail)))]
+    return max(fits) if fits else ctxs[0]
+
+
+def own_path_split_misfit(fam: dict, ctx: int, avail: list, split: int):
+    """The position (0 or 1) of the first card of the split this context cannot start on (its need above its free
+    VRAM, the experts' room not counted), else None.  A card whose VRAM is unknown (0) is not judged."""
+    for i, (n, v) in enumerate(zip(own_path_split_layers(fam, split), avail)):
+        if 0 < v < own_path_split_need_gib(fam, ctx, n, i == 0):
+            return i
+    return None
+
+
 def own_path_files(fam: dict, model: str) -> list:
     """The GGUF file names of one size of an own-path family, in order: one file (Qwen3.6), or its shards ("shards":
     MiniMax-M2's two; the engine opens the first and finds the rest beside it)."""
@@ -7635,8 +7722,31 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
-    if multi:
+    # the two-card layer split: a family whose engine has one (MiniMax-M2), two AMD cards named with --gpus, Linux
+    # (the only setup validated).  The others keep the one card, as before
+    two = bool(multi) and bool(fam.get("layer_split")) and hip and not WIN
+    if multi and not two:
         warn(f"{fam['title']} runs on one GPU so far: using GPU {gpu.get('index', 0)} ({gpu_name(gpu)}) only")
+    cards, split = [], None
+    if two:
+        nl = fam["n_layers"]
+        if len(multi) > 2:
+            warn(f"the {fam['title']} engine splits its layers across two cards: using GPU {multi[0]} and GPU "
+                 f"{multi[1]} (the first two of --gpus)")
+            multi = multi[:2]
+        byid = {g["index"]: g for g in amd}
+        cards = [gpu if i == gpu.get("index") else byid.get(i, {"index": i, "vram_gb": 0.0, "name": "?"})
+                 for i in multi]
+        ls = getattr(a, "layer_split", None)
+        if ls is None or str(ls).strip().lower() in ("", "auto"):
+            split = fam["layer_split"]
+        else:
+            top = min(nl - 1, M2_LAYER_SPLIT_MAX)
+            if not str(ls).strip().isdigit() or not 2 <= int(str(ls).strip()) <= top:
+                fail(f"{fam['title']} splits across two cards at one layer: --layer-split N (2-{top}), "
+                     f"default {fam['layer_split']}; got {ls}",
+                     f"--layer-split {fam['layer_split']} (the validated split), or leave it out")
+            split = int(str(ls).strip())
     names = list(fam["models"])
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
@@ -7672,6 +7782,23 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     card_vram = float(gpu.get("vram_gb", 0.0))       # the ONE card the engine runs on (the main GPU), never a sum
     bounded = "vram_budget" in fam                    # MiniMax-M2: the KV cache decides which context fits the card
     rec_ctx = own_path_context(fam, card_vram)
+    avail = []
+    if two:                                           # each card on its own: its VRAM minus what is in use now
+        used = amd_vram_used_gib()
+        nl = fam["n_layers"]
+        for i, c in enumerate(cards):
+            total = float(c.get("vram_gb", 0.0))
+            avail.append(max(0.0, total - used.get(c["index"], 0.0)))
+            span = f"layers 0-{split - 1}" if i == 0 else f"layers {split}-{nl - 1}"
+            what = (", the embedding, the output head and a copy of every layer's dense weights" if i == 0
+                    else " with its own copy of their dense weights")
+            if c["index"] in used:
+                ok(f"GPU {c['index']} ({c.get('name', '?')}): {span}{what}; {avail[-1]:.1f} GB of {total:.1f} GB free")
+            else:
+                ok(f"GPU {c['index']} ({c.get('name', '?')}): {span}{what}; {total:.1f} GB")
+                warn(f"the VRAM in use on GPU {c['index']} could not be read: counted as free (close the other "
+                     "programs that use this card)")
+        rec_ctx = own_path_split_context(fam, avail, split)
     if a.context:
         ctx = a.context
     else:
@@ -7681,14 +7808,35 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
         for i, c in enumerate(ctxs, 1):
             note = ""
-            if bounded:                               # the cache per option, and whether it fits this card
+            if bounded and two:                       # the split: about half the cache on each card
+                note = f"   (KV cache {c * fam['kv_bytes_per_token'] / 2**30:.1f} GB, about half on each card" + (
+                    ": does not fit your cards)" if own_path_split_misfit(fam, c, avail, split) is not None else ")")
+            elif bounded:                             # the cache per option, and whether it fits this card
                 note = f"   (KV cache {c * fam['kv_bytes_per_token'] / 2**30:.1f} GB" + (
                     f": does not fit your {card_vram:.0f} GB card)"
                     if 0 < card_vram < own_path_ctx_need_gib(fam, c) else ")")
-            say(f"  {i}) {c // 1024}K tokens" + note + ("   (recommended for your GPU)" if c == rec_ctx else ""))
+            say(f"  {i}) {c // 1024}K tokens" + note + ((f"   (recommended for your {'cards' if two else 'GPU'})")
+                                                         if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
-    if bounded and 0 < card_vram < own_path_ctx_need_gib(fam, ctx):
+    miss = own_path_split_misfit(fam, ctx, avail, split) if bounded and two else None
+    if miss is not None:
+        # the split's check, card by card (the tighter card decides): said with that card's numbers and asked
+        b = fam["vram_budget"]
+        c, n = cards[miss], own_path_split_layers(fam, split)[miss]
+        kv_c = ctx * fam["kv_bytes_per_token"] * n / fam["n_layers"] / 2 ** 30
+        dense_c = b["dense_gib"] if miss == 0 else b["dense_gib"] * n / fam["n_layers"]
+        whose = "all the dense weights" if miss == 0 else "its layers' dense weights"
+        confirm_risk(f"a {ctx // 1024}K context does not fit {fam['title']} on GPU {c['index']} "
+                     f"({avail[miss]:.1f} GB free): its share of the KV cache ({n} of {fam['n_layers']} layers) is "
+                     f"{kv_c:.1f} GB (fp32), and with {whose} ({dense_c:.2f} GB) and the engine's buffers (~{b['fixed_gib']:.2f} GB) the engine needs about "
+                     f"{own_path_split_need_gib(fam, ctx, n, miss == 0):.1f} GB on that card. It would stop at start "
+                     "(out of memory).",
+                     bool(a.context), a.yes, f"a {ctx // 1024}K context does not fit GPU {c['index']}",
+                     f"choose {rec_ctx // 1024}K (--context {rec_ctx}) or less, or --context {ctx} --yes to write it "
+                     "anyway", "  Use it anyway?")
+        warn(f"context {ctx}: kept as you chose; the engine may not start")
+    if bounded and not two and 0 < card_vram < own_path_ctx_need_gib(fam, ctx):
         # recommend, never force: said with the numbers and asked; --yes goes on only for an explicit --context
         b = fam["vram_budget"]
         confirm_risk(f"a {ctx // 1024}K context does not fit {fam['title']} on GPU {gpu.get('index', 0)} "
@@ -7805,6 +7953,12 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
+    if two:                                            # the layer split: both cards, in --gpus order; the server adds
+        cfg["gpu"] = list(multi)                       # --layer-split from "layer_split" (nothing in "args")
+        cfg["gpus_asked"] = True
+        cfg["layer_split"] = str(split)
+        ok(f"layer split: layers 0-{split - 1} on GPU {multi[0]}, {split}-{fam['n_layers'] - 1} on GPU {multi[1]} "
+           f"(the server adds --layer-split {split})")
     if a.host:
         cfg["host"] = a.host
     if a.api_key:

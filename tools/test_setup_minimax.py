@@ -27,13 +27,18 @@ import setup  # noqa: E402
 
 REPO = "bartowski/MiniMaxAI_MiniMax-M2-GGUF"
 SHARDS = ["MiniMaxAI_MiniMax-M2-IQ2_XXS-00001-of-00002.gguf", "MiniMaxAI_MiniMax-M2-IQ2_XXS-00002-of-00002.gguf"]
+# the user's two cards as amd_gpus() lists them (sysfs mem_info_vram_total)
+R6800 = {"index": 0, "name": "AMD Radeon RX 6800", "vram_gb": 17163091968 / 2 ** 30, "arch": "gfx1030",
+         "vendor": "amd"}
+R9070 = {"index": 1, "name": "AMD Radeon RX 9070", "vram_gb": 17095983104 / 2 ** 30, "arch": "gfx1201",
+         "vendor": "amd"}
 
 
 def args(**kw):
     base = dict(family="minimax2", model=None, check=False, yes=True, vision=None, models_dir=None, gguf_dir=None,
                 context=None, rope_scaling=None, rope_scale=None, kv=None, resident_budget_gib=None, low_ram="auto",
                 vram_reserve_mib=None, host=None, api_key=None, browser=None, no_start=True, data_dir=None, gpu=None,
-                build=False, prebuilt=None, m2_low_ram="auto")
+                build=False, prebuilt=None, m2_low_ram="auto", layer_split=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -121,6 +126,52 @@ class Context(unittest.TestCase):
         self.assertIn(16384, setup.own_path_contexts(self.M2))
 
 
+class SplitContext(unittest.TestCase):
+    """The two-card split's sizing (DERIVED from the vram_budget constants): each card on its own VRAM, the tighter
+    card decides."""
+    M2 = setup.OWN_PATH_FAMILIES["minimax2"]
+
+    def test_the_family_keys(self):
+        self.assertEqual(self.M2["layer_split"], 31)
+        self.assertEqual(self.M2["n_layers"], 62)
+        self.assertNotIn("layer_split", setup.OWN_PATH_FAMILIES["qwen36"])
+        self.assertEqual(setup.own_path_split_layers(self.M2, 31), [31, 31])
+        self.assertEqual(setup.own_path_split_layers(self.M2, 29), [29, 33])
+
+    def test_the_need_per_card(self):
+        self.assertAlmostEqual(setup.own_path_split_need_gib(self.M2, 32768, 31, True), 13.174, places=2)
+        self.assertAlmostEqual(setup.own_path_split_need_gib(self.M2, 32768, 31, False), 12.244, places=2)
+        self.assertAlmostEqual(setup.own_path_split_need_gib(self.M2, 65536, 31, True), 21.430, places=2)
+        self.assertAlmostEqual(setup.own_path_split_room_gib(self.M2, 31), 1.0)
+        # all 62 layers on one card: the one-card rule
+        self.assertAlmostEqual(setup.own_path_split_need_gib(self.M2, 32768, 62, True),
+                               setup.own_path_ctx_need_gib(self.M2, 32768))
+
+    def test_the_tighter_card_decides(self):
+        ctx = lambda avail: setup.own_path_split_context(self.M2, avail, 31)
+        self.assertEqual(ctx([15.922, 15.984]), 32768)
+        self.assertEqual(ctx([15.922 - 1.155, 15.968]), 32768)    # the RX 9070 with the desktop's share in use
+        self.assertEqual(ctx([16.0, 16.0]), 32768)
+        self.assertEqual(ctx([24.0, 24.0]), 65536)
+        self.assertEqual(ctx([12.0, 12.0]), 16384)
+        self.assertEqual(ctx([16.0, 10.0]), 16384)                # the 10 GB card decides
+        self.assertEqual(ctx([10.0, 16.0]), 8192)                 # first: it also holds all the dense weights
+        self.assertEqual(ctx([6.0, 6.0]), 8192)                   # nothing fits: the smallest
+        self.assertEqual(ctx([0.0, 16.0]), 8192)                  # an unknown card is not counted as roomy
+
+    def test_misfit(self):
+        self.assertEqual(setup.own_path_split_misfit(self.M2, 65536, [15.9, 15.9], 31), 0)
+        self.assertIsNone(setup.own_path_split_misfit(self.M2, 32768, [15.9, 15.9], 31))
+        self.assertEqual(setup.own_path_split_misfit(self.M2, 32768, [15.9, 12.0], 31), 1)
+        self.assertIsNone(setup.own_path_split_misfit(self.M2, 65536, [0.0, 0.0], 31))   # unknown: not judged
+
+    def test_one_card_sizing_is_unchanged(self):
+        # the one-card rule never sums the cards: 16 GB -> 16K, however many cards the PC has
+        self.assertEqual(setup.own_path_context(self.M2, R6800["vram_gb"]), 16384)
+        self.assertEqual(setup.own_path_context(self.M2, R9070["vram_gb"]), 16384)
+        self.assertEqual(setup.own_path_context(self.M2, R6800["vram_gb"] + R9070["vram_gb"]), 32768)   # a sum would
+
+
 class BuildDir(unittest.TestCase):
     def test_where_strata_m2_is_built(self):
         with mock.patch.object(setup, "WIN", False), mock.patch.object(setup, "CONTROL", None):
@@ -183,10 +234,11 @@ class Install(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def install(self, family="minimax2", ram=64.0, gpu=None, multi=None, **kw):
+    def install(self, family="minimax2", ram=64.0, gpu=None, multi=None, hip=True, amd=None, used=None, **kw):
         gpu = gpu or {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}
-        return run(setup.install_own_path, args(models_dir=str(self.root / "models"), family=family, **kw), family, gpu,
-                   True, [], None, multi or [], 8080, ram, None)
+        with mock.patch.object(setup, "amd_vram_used_gib", lambda *a, **k: dict(used or {})):
+            return run(setup.install_own_path, args(models_dir=str(self.root / "models"), family=family, **kw), family,
+                       gpu, hip, amd or [], None, multi or [], 8080, ram, None)
 
     def ctx(self):
         a = self.cfg["args"]
@@ -199,14 +251,138 @@ class Install(unittest.TestCase):
         self.assertNotIn("context does not fit", out)             # no warning for the recommended context
 
     def test_two_16_gb_cards_get_the_one_cards_context(self):
-        # the main card as setup hands it over with two AMD cards (--gpus 0,1 or none): its own VRAM, not the sum
-        gpu = {"index": 0, "count": 2, "vram_gb": 17163091968 / 2 ** 30, "name": "AMD Radeon RX 9070",
-               "archs": ["gfx1030", "gfx1201"]}
-        rc, out = self.install(gpu=gpu, multi=[0, 1])
+        # two AMD cards present, no --gpus: one card, sized on ITS OWN VRAM (16384 on 16 GB), never on the sum
+        gpu = {**R6800, "count": 2, "archs": ["gfx1030", "gfx1201"]}
+        rc, out = self.install(gpu=gpu, amd=[R6800, R9070], used={0: 0.016, 1: 0.767})
         self.assertEqual(rc, 0, out)
-        self.assertIn("runs on one GPU so far", out)
+        self.assertNotIn("runs on one GPU so far", out)
         self.assertEqual(self.ctx(), "16384")
         self.assertEqual(self.cfg["gpu"], 0)
+        self.assertNotIn("layer_split", self.cfg)
+        self.assertNotIn("layer split", out)
+
+    # ---- the two-card layer split (--gpus with two AMD cards, opt-in)
+    def split(self, main=None, multi=(1, 0), used=None, **kw):
+        main = main or R9070
+        amd = kw.pop("amd", [R6800, R9070])
+        gpu = {**main, "count": len(amd), "archs": ["gfx1030", "gfx1201"]}
+        return self.install(gpu=gpu, amd=amd, multi=list(multi),
+                            used={0: 0.016, 1: 0.767} if used is None else used, **kw)
+
+    def test_gpus_1_0_writes_a_layer_split(self):
+        rc, out = self.split()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["gpu"], [1, 0])
+        self.assertEqual(self.cfg["layer_split"], "31")
+        self.assertIs(self.cfg["gpus_asked"], True)
+        self.assertEqual(self.ctx(), "32768")                     # the tighter card (the RX 9070, 0.77 GB used) fits 32K
+        self.assertNotIn("--layer-split", self.cfg["args"])       # the server adds it from "layer_split"
+        self.assertNotIn("--peer-device", self.cfg["args"])
+        self.assertIn("--low-ram", self.cfg["args"])
+        self.assertNotIn("runs on one GPU so far", out)
+        self.assertIn("layers 0-30 on GPU 1, 31-61 on GPU 0", out)
+        self.assertIn("GPU 1 (AMD Radeon RX 9070): layers 0-30, the embedding", out)
+        self.assertIn("GPU 0 (AMD Radeon RX 6800): layers 31-61", out)
+
+    def test_gpus_0_1_keeps_the_order(self):
+        rc, out = self.split(main=R6800, multi=(0, 1))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["gpu"], [0, 1])
+        self.assertEqual(self.cfg["layer_split"], "31")
+        self.assertEqual(self.ctx(), "32768")
+        self.assertIn("layers 0-30 on GPU 0, 31-61 on GPU 1", out)
+
+    def test_layer_split_flag(self):
+        rc, out = self.split(layer_split="29")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["layer_split"], "29")
+        rc, out = self.split(layer_split="auto")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["layer_split"], "31")
+        for bad in ("16,32", "0", "1", "49", "62", "x"):
+            self.cfg = {}
+            rc, out = self.split(layer_split=bad)
+            self.assertNotEqual(rc, 0, (bad, out))
+            self.assertIn("one layer", out, bad)
+            self.assertEqual(self.cfg, {}, bad)
+
+    def test_split_context_that_does_not_fit_is_said_and_kept(self):
+        rc, out = self.split(context=65536)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("a 64K context does not fit MiniMax-M2 on GPU 1", out)   # the first card: all the dense weights
+        self.assertIn("its share of the KV cache (31 of 62 layers) is 15.5 GB", out)
+        self.assertIn("kept as you chose", out)
+        self.assertEqual(self.ctx(), "65536")
+
+    def test_split_yes_alone_never_writes_a_context_that_cannot_start(self):
+        small = [{**R6800, "vram_gb": 6.0}, {**R9070, "vram_gb": 6.0}]
+        rc, out = self.split(main=small[1], amd=small)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("does not fit GPU 1", out)
+        self.assertEqual(self.cfg, {})
+
+    def test_unreadable_used_vram_is_said(self):
+        rc, out = self.split(used={})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("could not be read", out)
+        self.assertEqual(self.ctx(), "32768")
+
+    def test_three_cards_use_the_first_two(self):
+        third = {"index": 2, "name": "AMD Radeon RX 9070", "vram_gb": 16.0, "arch": "gfx1201", "vendor": "amd"}
+        rc, out = self.split(multi=(1, 0, 2), amd=[R6800, R9070, third])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["gpu"], [1, 0])
+        self.assertIn("two cards", out)
+
+    def test_split_context_menu(self):
+        with mock.patch.object(setup, "ask", lambda q, choices, default, yes=False: default):
+            rc, out = self.split(yes=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("3) 32K tokens   (KV cache 15.5 GB, about half on each card)   (recommended for your cards)", out)
+        self.assertIn("4) 64K tokens   (KV cache 31.0 GB, about half on each card: does not fit your cards)", out)
+        self.assertEqual(self.ctx(), "32768")
+
+    def test_qwen36_with_gpus_stays_on_one_card(self):
+        rc, out = self.split(family="qwen36", vision="no")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("runs on one GPU so far: using GPU 1", out)
+        self.assertEqual(self.cfg["gpu"], 1)
+        self.assertNotIn("layer_split", self.cfg)
+
+    def test_nvidia_minimax_with_gpus_stays_on_one_card(self):
+        rc, out = self.install(gpu={"index": 0, "count": 2, "vram_gb": 16.0, "name": "Test GPU"}, multi=[0, 1],
+                               hip=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("runs on one GPU so far", out)
+        self.assertEqual(self.cfg["gpu"], 0)
+        self.assertNotIn("layer_split", self.cfg)
+        self.assertEqual(self.ctx(), "16384")
+
+    def test_one_card_config_is_unchanged(self):
+        folder = self.root / "models" / "minimax2-IQ2_XXS"
+        want = ["--native", str(folder / SHARDS[0]), "--max-context", "16384", "--prefill", "auto", "--mtp", "0",
+                "--low-ram"]
+        keys = {"exe", "args", "cwd", "tokenizer", "model_name", "arch", "log", "lib_dirs", "port", "backend"}
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["args"], want)
+        self.assertEqual(set(self.cfg), keys)
+        rc, out = self.install(gpu={**R6800, "count": 2, "archs": ["gfx1030", "gfx1201"]}, amd=[R6800, R9070])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.cfg["args"], want)
+        self.assertEqual(set(self.cfg), keys | {"gpu", "gpus_asked"})
+        self.assertEqual(self.cfg["gpu"], 0)
+
+    def test_choices_keep_the_split(self):
+        p = self.root / "strata-minimax2-iq2_xxs.json"
+        p.write_text(json.dumps({"args": ["--native", "x.gguf", "--max-context", "32768"], "gpu": [1, 0],
+                                 "layer_split": "31", "arch": "minimax-m2"}), encoding="utf-8")
+        ch = setup.choices_from_config(p)
+        self.assertEqual((ch["family"], ch["gpu"], ch["layer_split"], ch["context"]), ("minimax2", [1, 0], "31", 32768))
+        q = self.root / "strata-qwen36-ud-q4_k_xl.json"
+        q.write_text(json.dumps({"args": ["--native", "x.gguf", "--max-context", "32768"], "gpu": 1,
+                                 "arch": "qwen35moe"}), encoding="utf-8")
+        self.assertIsNone(setup.choices_from_config(q)["layer_split"])
 
     def test_a_48_gb_card_writes_a_longer_context(self):
         rc, out = self.install(gpu={"index": 0, "count": 1, "vram_gb": 48.0, "name": "Test GPU"})
