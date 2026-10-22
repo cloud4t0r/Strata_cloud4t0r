@@ -1193,7 +1193,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         // (card 0), and the last row's hidden is copied over (12 Ko) when the head is called.  Keeping the
         // head on card 1 cost 2.46 Gio of VRAM that the card does not have (the head did not fit: cudaMalloc
         // returned null, "invalid argument").
-        m.out_norm2 = nullptr;   // use the primary's norm
+        m.out_norm2 = nullptr;   // overwritten after the pass loop if split mode is active
         m.head2.d = nullptr;      // use the primary's head
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
@@ -1225,6 +1225,21 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     }
     m.out_norm = f32("output_norm.weight");
     m.head = mat("output.weight");
+    if (g_second_card >= 0) {
+        // the second card's last layer applies the output norm (out_norm) to produce hmain; give it its own copy
+        const size_t nb = (size_t) g.n_embd * 4;
+        float* nh = (float*) std::malloc(nb);
+        CK(cudaMemcpy(nh, m.out_norm, nb, cudaMemcpyDeviceToHost));
+        CK(cudaSetDevice(g_second_card));
+        CK(cudaGetLastError());
+        float* n2 = nullptr;
+        CK(cudaMalloc(&n2, nb));
+        CK(cudaMemcpy(n2, nh, nb, cudaMemcpyHostToDevice));
+        std::free(nh);
+        m.out_norm2 = n2;
+        CK(cudaSetDevice(0));
+        CK(cudaGetLastError());
+    }
     {
         size_t s = 0;
         const strata::TensorInfo* t = find("token_embd.weight", s);
@@ -2474,11 +2489,6 @@ struct Engine {
         }
         // the layer split: the crossing's D2H copies MUST happen BEFORE the combine (moe_end), which adds
         // the MoE to x and overwrites h: otherwise the D2H copy reads the residual (0) and writes 0
-        if (split_dev >= 0 && (int) li == split_layer) {
-            const size_t nx = (size_t) T * N;
-            CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaMemcpyAsync(split_stage + nx, h, nx * 4, cudaMemcpyDeviceToHost, st));
-        }
         // the combine, the residual add and the next norm in one launch
         moe_end(T, prow, sy, sgate, wn, hout, 1);
         {   // DIAG: what the combine wrote (the NaN must be in its inputs or in its write)
@@ -2534,9 +2544,10 @@ struct Engine {
                     CK(cudaMemcpyPeerAsync(set[1].tok, split_dev, tok, 0, (size_t) T * 4, st));
                     CK(cudaMemcpyPeerAsync(set[1].pos0, split_dev, pos0, 0, 4, st));
                 } else {
-                    // through the host: the x and h rows were already copied to split_stage right after the
-                    // combine (in layer()), before they could be overwritten; only the tokens and the
-                    // position still need to cross here (they never change after the embedding)
+                    // through the host: x and h are copied HERE, before use_set(1) switches to card 1's
+                    // buffers (the D2H must read card 0's x and h, which are still current)
+                    CK(cudaMemcpyAsync(split_stage, x, nx * 4, cudaMemcpyDeviceToHost, st));
+                    CK(cudaMemcpyAsync(split_stage + nx, h, nx * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx), tok, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
                     CK(cudaMemcpyAsync((int32_t*) (split_stage + 2 * nx) + T, pos0, 4, cudaMemcpyDeviceToHost, st));
                 }
