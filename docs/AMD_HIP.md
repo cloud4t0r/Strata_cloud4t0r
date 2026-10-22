@@ -50,7 +50,9 @@ the kernel's amdgpu driver (no ROCm install needed):
   as setup lists them; `--gpus all` = every supported card, the most VRAM first). Every chosen card must be one of the
   architectures above; the engine is compiled for each of them (cards of two families, e.g. gfx1100 + gfx1201, need
   a system ROCm 7: AMD's wheels hold one family). A split pays only when no single card holds the model's experts
-  (see RDNA4 below).
+  (see RDNA4 below). On Linux with two or more AMD cards, setup compiles the engine for every card's architecture
+  (`CMAKE_HIP_ARCHITECTURES` and `GPU_TARGETS` get the same list, e.g. `gfx1030;gfx1201`), even when it uses only one,
+  so a config's `"gpu"` can point at any of them later; without a system ROCm it leaves out a card of another family.
 - **Pictures:** on by default; the reader is the CPU one under 24 GB of VRAM and the GPU one from 24 GB (the same rule on NVIDIA and AMD, `strata_control/vision_reader.py`); `--vision gpu` / `--vision cpu` switch it. The engine package carries two picture readers: `strata-vision-hip`, which reads a picture on the
   card (llama.cpp's HIP backend; about 1.4 GiB of VRAM, measured on an R9700: 0.06 s for a 260-token picture and 0.4 s for 972
   tokens, against 3.1 s and 14 s on the CPU), and `strata-vision`, the CPU reader. If the GPU reader cannot start (the card is

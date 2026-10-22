@@ -694,6 +694,125 @@ class EngineLaunchEnv(unittest.TestCase):
             self.assertEqual(seen["env"]["PATH"].split(setup.os.pathsep)[0], str(eng / "rocm" / "bin"))
 
 
+class MultiArchBuild(unittest.TestCase):
+    """An RX 6800 (gfx1030) beside an RX 9070 (gfx1201): the HIP engine is compiled for both cards' architectures
+    (CMAKE_HIP_ARCHITECTURES and GPU_TARGETS the same list), so a config's "gpu": 1 does not stop on "device kernel
+    image is invalid"; one card keeps the cmake arguments it had; a build folder whose cache lacks an arch is
+    configured again."""
+    RX6800 = {"index": 0, "name": "AMD Radeon RX 6800", "vram_gb": 16.0, "arch": "gfx1030"}
+    RX9070 = {"index": 1, "name": "AMD Radeon RX 9070", "vram_gb": 15.9, "arch": "gfx1201"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.calls = []
+        calls, root = self.calls, self.root
+
+        def fake_build(src, bdir, target, defs, vcvars, bat):
+            calls.append(defs)
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / setup.EXE).write_text("engine")
+
+        class Sh:
+            which = staticmethod(lambda name: "/usr/bin/" + name)
+            copy2 = staticmethod(lambda a, b: Path(b).write_text(Path(a).read_text()))
+        self.patches = [mock.patch.object(setup, "WIN", False), mock.patch.object(setup, "ROOT", root),
+                        mock.patch.object(setup, "cmake_build", fake_build), mock.patch.object(setup, "shutil", Sh),
+                        mock.patch.object(setup, "ok", lambda *a: None), mock.patch.object(setup, "say", lambda *a: None),
+                        mock.patch.object(setup, "source_hash", lambda *a: "h"),
+                        mock.patch.object(setup, "source_version", lambda: "0.1.47"),
+                        mock.patch.object(setup, "stale_binary", lambda exe: False),
+                        mock.patch.object(setup, "cpu_floor", lambda avx2: ""),
+                        mock.patch.object(setup, "rocm_root", lambda archs: (root, [str(root / "lib")])),
+                        mock.patch.dict(setup.os.environ)]   # build_engine_hip sets ROCM_PATH / PATH: put them back
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        self.tmp.cleanup()
+
+    def build(self, gpu):
+        self.calls.clear()
+        setup.build_engine_hip(gpu, self.root / "llama")
+        return self.calls[-1] if self.calls else None
+
+    def stamp(self, archs):
+        import json
+        eng = self.root / "engine"
+        eng.mkdir(exist_ok=True)
+        (eng / setup.EXE).write_text("engine")
+        (eng / "BUILD.json").write_text(json.dumps({"source": "local-hip", "backend": "hip", "archs": archs, "src": "h"}))
+
+    def expected_single(self, arch):
+        """build_engine_hip's cmake definitions for one card, as they were before the multi-arch build."""
+        root = self.root
+        return ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+                "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON",
+                "-DCMAKE_HIP_ARCHITECTURES=" + arch,
+                f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+                "-DCMAKE_PREFIX_PATH=" + str(root),
+                f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={root / 'amdgcn' / 'bitcode'}",
+                f"-DSTRATA_GGML_DIR={root / 'llama'}"]
+
+    def test_two_cards_build_for_both(self):
+        with mock.patch.object(setup, "system_rocm_ok", lambda: True):
+            for chosen in ([self.RX6800], [self.RX9070], [self.RX9070, self.RX6800]):   # --gpu 0, --gpu 1, --gpus 1,0
+                with self.subTest(chosen=[g["index"] for g in chosen]):
+                    self.assertEqual(setup.amd_build_archs(chosen, [self.RX6800, self.RX9070]), ["gfx1030", "gfx1201"])
+        defs = self.build({**self.RX6800, "count": 2, "archs": ["gfx1030", "gfx1201"]})
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1030;gfx1201", defs)
+        self.assertIn("-DGPU_TARGETS=gfx1030;gfx1201", defs)
+        import json
+        self.assertEqual(json.loads((self.root / "engine" / "BUILD.json").read_text())["archs"], ["gfx1030", "gfx1201"])
+        self.assertIsNone(self.build({**self.RX9070, "count": 2, "archs": ["gfx1030", "gfx1201"]}))   # built: no compile
+
+    def test_another_family_needs_a_system_rocm(self):
+        """AMD's wheels hold one GPU family: without a system ROCm the other family's card is left out (rocm_root would
+        stop on two families); two cards of one family are both compiled for."""
+        rx7900 = {"index": 2, "name": "AMD Radeon RX 7900 XTX", "vram_gb": 24.0, "arch": "gfx1100"}
+        rx7800 = {"index": 3, "name": "AMD Radeon RX 7800 XT", "vram_gb": 16.0, "arch": "gfx1101"}
+        with mock.patch.object(setup, "system_rocm_ok", lambda: False):
+            self.assertEqual(setup.amd_build_archs([self.RX6800], [self.RX6800, self.RX9070]), ["gfx1030"])
+            self.assertEqual(setup.amd_build_archs([rx7900], [rx7900, rx7800]), ["gfx1100", "gfx1101"])
+
+    def test_one_card_unchanged(self):
+        def no_probe():
+            raise AssertionError("one card: no ROCm probe")
+        with mock.patch.object(setup, "system_rocm_ok", no_probe):
+            for g in (self.RX6800, self.RX9070):
+                self.assertEqual(setup.amd_build_archs([g], [g]), [g["arch"]])
+        with mock.patch.object(setup, "WIN", True):   # Windows takes the ready-made engine: as before
+            self.assertEqual(setup.amd_build_archs([self.RX6800], [self.RX6800, self.RX9070]), ["gfx1030"])
+        for gpu in ({**self.RX6800, "count": 1, "archs": ["gfx1030"]}, {"arch": "gfx1030"}):
+            (self.root / "engine" / "BUILD.json").unlink(missing_ok=True)
+            self.assertEqual(self.build(gpu), self.expected_single("gfx1030"))
+
+    def test_stale_cache_is_configured_again(self):
+        """engine/BUILD.json says both, but build-hip's CMakeCache.txt (strata-m2 is compiled from it) has gfx1030
+        only: configured and compiled again; a stamp with gfx1030 only is compiled again too; a matching one is not."""
+        bdir = self.root / "build-hip"
+        bdir.mkdir()
+        cache = bdir / "CMakeCache.txt"
+        cache.write_text("CMAKE_HIP_ARCHITECTURES:UNINITIALIZED=gfx1030\nGPU_TARGETS:STRING=gfx1030;gfx1201\n")
+        self.assertEqual(setup.hip_cache_archs(bdir), ["gfx1030"])
+        gpu = {**self.RX6800, "count": 2, "archs": ["gfx1030", "gfx1201"]}
+        self.stamp(["gfx1030", "gfx1201"])
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1030;gfx1201", self.build(gpu))
+        self.stamp(["gfx1030"])                                           # the stamp of this PC's first build
+        cache.write_text("CMAKE_HIP_ARCHITECTURES:UNINITIALIZED=gfx1030;gfx1201\n")
+        self.assertIn("-DGPU_TARGETS=gfx1030;gfx1201", self.build(gpu))
+        cache.write_text("CMAKE_HIP_ARCHITECTURES:STRING=gfx1030:xnack-;gfx1201\n")
+        self.assertEqual(setup.hip_cache_archs(bdir), ["gfx1030", "gfx1201"])
+        self.assertIsNone(self.build(gpu))                                # stamp and cache agree: nothing to do
+
+    def test_setup_and_start_use_it(self):
+        src = Path(setup.__file__).read_text(encoding="utf-8")
+        self.assertIn('"archs": amd_build_archs(chosen, usable)', src)
+        self.assertIn('the engine was built for {', src)              # the start names a card the engine has no code for
+
+
 class TdrPointer(unittest.TestCase):
     def test_setup_points_windows_gfx12_to_the_entry(self):
         src = Path(setup.__file__).read_text(encoding="utf-8")

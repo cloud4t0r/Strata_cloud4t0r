@@ -39,6 +39,13 @@ What setup does for this model:
 - **No pictures.** The model has no image reader and no picture file to download. `--vision yes|gpu|cpu`
   only gives a warning; images stay off.
 - **One card.** With several cards, setup uses one and says so. The two-card split is run by hand (below).
+  The engine is still compiled for every AMD card's architecture (RX 9070 + RX 6800: gfx1201 and gfx1030), so
+  `"gpu": 1` in the config does not stop on `device kernel image is invalid`.
+- **It picks the context from that one card's VRAM.** The KV cache is fp32 on all 62 layers (8 KV heads):
+  15.5 GiB per 32K tokens. It must fit on the one card beside the dense weights (1.86 GiB, measured) and the
+  engine's buffers, so setup recommends 16K on a 16 GB card, 32K on 24-32 GB and 64K on 48 GB. For a context
+  that does not fit, setup prints the numbers and asks first. With `--yes`, it goes on only if you passed
+  `--context` yourself.
 - **It picks the low-RAM mode or the normal mode** (next section) and writes the start script
   `run_minimax_m2.sh` in the Strata folder.
 
@@ -78,7 +85,7 @@ exists at all, even set to `0`, so only `--low-ram` decides. On Windows setup wr
 ```sh
 cmake -S . -B build-hip -G Ninja \
   -DSTRATA_ENABLE_HIP=ON \
-  -DCMAKE_HIP_ARCHITECTURES="gfx1201;gfx1030" \
+  -DCMAKE_HIP_ARCHITECTURES="gfx1201;gfx1030" -DGPU_TARGETS="gfx1201;gfx1030" \
   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
   -DCMAKE_PREFIX_PATH=/opt/rocm -DROCM_PATH=/opt/rocm \
   -DCMAKE_BUILD_TYPE=Release
