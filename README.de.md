@@ -186,6 +186,7 @@ Weitere Auswahl:
 - **[Swift 1.5](docs/MODELS.md#swift-15)** ist eine Feinabstimmung, die kürzer nachdenkt, bevor sie antwortet, bei etwa gleicher Qualität und gleichem RAM-Bedarf.
 - **[NVFP4](docs/NVFP4.md)** ist NVIDIAs 4-Bit-Version für NVIDIA-Karten. Sie braucht etwa 80 GB RAM, um alle Experten im RAM zu halten.
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** ist ein kleineres, anderes Modell, das Bilder liest und mehrere Anfragen gleichzeitig beantworten kann.
+- **[MiniMax-M2](docs/MINIMAX_M2.md)** (230B, 10B aktiv, 54,7 GB Download) ist ein größeres Modell, ohne Bilder. Unter Linux kompiliert `./setup.sh --family minimax2` die Engine und schreibt `run_minimax_m2.sh`. Unter 96 GB RAM nimmt es den Low-RAM-Modus (die Experten werden aus der Datei gelesen, nicht in den RAM kopiert); `--m2-low-ram on|off` erzwingt die Wahl, `M2_LOW_RAM=1` oder `M2_LOW_RAM=0` vor dem Skript ändert sie für einen Start. Die Grenze von 96 GB ist aus dem Code abgeleitet, nicht gemessen.
 - **[OrcaRouters Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** richtest du von Hand ein.
 
 Alle Größen, Downloads und was wo läuft: [docs/MODELS.md](docs/MODELS.md).

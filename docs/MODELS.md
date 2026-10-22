@@ -2,13 +2,14 @@
 
 Strata's main model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), in several **sizes**
 (the same model, compressed more or less) and several **versions** (the original, a coding version, a fine-tune, other
-makers' compressions). It also runs a smaller model, [Qwen3.6-35B-A3B](#qwen36-35b-a3b). The desktop app, the Terminal
+makers' compressions). It also runs a smaller model, [Qwen3.6-35B-A3B](#qwen36-35b-a3b), and a bigger one,
+[MiniMax-M2](#minimax-m2) (setup on Linux only). The desktop app, the Terminal
 (`strata launch`) and the installer recommend one for your PC; this page explains the choice. Back to the
 [README](../README.md).
 
 > **On this page:** [Pick by memory](#pick-by-memory) · [Speed](#how-fast-is-each-size) · [The sizes](#the-sizes) ·
 > [Will it fit?](#will-it-fit) · [The versions](#the-versions) · [Qwen3.6](#qwen36-35b-a3b) ·
-> [Adding another model](#adding-or-switching-models)
+> [MiniMax-M2](#minimax-m2) · [Adding another model](#adding-or-switching-models)
 
 ## Pick by memory
 
@@ -260,6 +261,27 @@ limits: [QWEN36.md](QWEN36.md).
 
 ```
 START-HERE.bat --setup --family qwen36 --model UD-Q4_K_XL
+```
+
+## MiniMax-M2
+
+A bigger model from another maker: [MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) (230 billion
+parameters, 10 billion active per token, 256 experts, MiniMax Community License). Strata runs
+[bartowski's IQ2_XXS](https://huggingface.co/bartowski/MiniMaxAI_MiniMax-M2-GGUF) (two files, 54.7 GB) on its own
+engine path. It is in setup (`--family minimax2`), on Linux; setup compiles the engine from source for it. It does
+not read pictures.
+
+| Mode | RAM setup plans for | In plain words |
+| --- | ---: | --- |
+| **Low-RAM** | 24 GB | the experts are read from the file, not copied into RAM. Chosen below 96 GB of RAM |
+| **Normal** | 96 GB | the ~49 GB of experts are copied into RAM. Chosen from 96 GB of RAM |
+
+The 96 GB line is derived from the code, not measured. `--m2-low-ram on|off` forces a mode; the start script
+`run_minimax_m2.sh` switches it for one run (`M2_LOW_RAM=1` or `M2_LOW_RAM=0`). The full guide:
+[MINIMAX_M2.md](MINIMAX_M2.md).
+
+```
+./setup.sh --setup --family minimax2
 ```
 
 ## Adding or switching models

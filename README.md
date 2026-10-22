@@ -153,9 +153,18 @@ Smaller sizes are faster. Larger sizes are a bit smarter.
 
 ### Other models
 
-Strata also runs **MiniMax-M2** (230B, 10B active, 256 experts top-8) through the dedicated `strata-m2` binary,
-on one card or split across two. It needs ~55 GB on disk (IQ2_XXS) and a build from source. See
-[docs/MINIMAX_M2.md](docs/MINIMAX_M2.md).
+Strata also runs **MiniMax-M2** (230B, 10B active, 256 experts top-8) on its own engine path, on one card, or
+split across two by hand. It needs ~55 GB on disk (IQ2_XXS, two files). On Linux, setup installs it:
+
+```sh
+./setup.sh --family minimax2
+```
+
+Setup compiles the engine from source, downloads the model and writes the start script `./run_minimax_m2.sh`.
+It also picks how the model uses your RAM: below 96 GB of RAM, the low-RAM mode (the experts are read from the
+file, not copied into RAM); from 96 GB, the normal mode. `--m2-low-ram on|off` forces one, and
+`M2_LOW_RAM=1` or `M2_LOW_RAM=0 ./run_minimax_m2.sh` switches it for one run. The 96 GB line is an estimate from
+the code, not a measurement. This model does not read pictures. Details: [docs/MINIMAX_M2.md](docs/MINIMAX_M2.md).
 
 ### Low on memory? Try Gyro
 

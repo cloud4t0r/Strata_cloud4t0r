@@ -524,6 +524,18 @@ tokens/s, most experts read from the SSD; it picks the same tokens as llama.cpp 
 the positions of short greedy answers, 90-91% after a 16K prompt, differing mostly at near-ties
 ([measured](UNSLOTH_Q4.md#quality-against-llamacpp-on-the-same-file)).
 
+### Another model: MiniMax-M2 (Linux)
+
+MiniMax-M2 (230B, 10B active) runs on its own engine path; the IQ2_XXS file is two shards, 54.7 GB. Setup compiles
+the engine from source for it, plus `strata-m2` (the same path on its own), and writes `run_minimax_m2.sh`. Below
+96 GB of RAM it picks the low-RAM mode (the experts read from the file, not copied into RAM); `--m2-low-ram on|off`
+forces it, `M2_LOW_RAM=1|0 ./run_minimax_m2.sh` switches it for one run. The 96 GB line is derived from the code,
+not measured. No pictures. Guide: **[docs/MINIMAX_M2.md](MINIMAX_M2.md)**.
+
+```
+./setup.sh --setup --family minimax2
+```
+
 ## Before you start
 
 You need **only a graphics driver**: NVIDIA 580 or newer (update it with the NVIDIA App or from

@@ -2,8 +2,9 @@
 
 MiniMax-M2 (`minimax-m2` GGUF architecture) is a 230B mixture-of-experts model with 10B active parameters
 (256 experts, top-8, full attention on every layer, no shared expert, no MTP block). Strata runs it on a
-normal PC with one or two graphics cards through the dedicated engine path `src/minimaxm2/` and the
-`strata-m2` binary. The model file is ~54.7 GB (IQ2_XXS, bartowski's GGUF).
+normal PC with one or two graphics cards through the dedicated engine path `src/minimaxm2/`. The `strata`
+engine carries that path and switches to it when it opens a `minimax-m2` file; the `strata-m2` binary is the
+same path on its own. The model is ~54.7 GB (IQ2_XXS, bartowski's GGUF, two files).
 
 **Status (0.2.2, engine 0.1.47):** single card and two-card layer split both produce the reference token
 **8261** for the 6-token prompt `200034,517,5505,300,5969,355`, matching llama.cpp.
@@ -11,13 +12,68 @@ normal PC with one or two graphics cards through the dedicated engine path `src/
 ## Hardware
 
 - **One card (mono):** RX 9070 (gfx1201) or equivalent with ~16 GB VRAM + enough RAM for the file's page cache.
-  The low-RAM mode (default) keeps no copy of the experts in host RAM; they are read from the file on demand.
+  The low-RAM mode (`--low-ram`) keeps no copy of the experts in host RAM; they are read from the file on demand.
+  Without it, the engine copies the ~49 GB of experts into RAM. See [Low-RAM mode or normal mode](#low-ram-mode-or-normal-mode).
 - **Two cards (split):** RX 9070 (gfx1201) as card 0 + RX 6800 (gfx1030) as card 1. The first card runs
   layers 0-30, the second runs layers 31-61 and the output head. The head runs on the primary (card 0);
   the last row's hidden (12 KB) crosses from card 1.
 - Linux with ROCm 10 under `/opt/rocm`. Windows/Mac paths are not validated for M2 yet.
 
-## Build
+## Install with setup (Linux)
+
+```sh
+./setup.sh --family minimax2
+```
+
+What setup does for this model:
+
+- **It compiles the engine from source.** A ready-made engine is not used, except with `--prebuilt`. Setup
+  checks that the engine runs the model (`strata --families` lists `minimax-m2`) and stops if it does not.
+- **It also compiles `strata-m2`** (the CMake target of the same name) in the engine's build folder
+  (`build/`, `build-cuda12/` or `build-hip/`) and copies it next to the engine. If that build fails, or cannot
+  be done (a ready-made engine, Intel Arc, Windows), setup says so and goes on: the model runs through
+  `strata`, which does not need `strata-m2`. To retry by hand: `cmake --build <build folder> --target strata-m2`.
+- **It downloads the two files** of IQ2_XXS from `bartowski/MiniMaxAI_MiniMax-M2-GGUF` (folder
+  `MiniMaxAI_MiniMax-M2-IQ2_XXS/`): `-00001-of-00002.gguf` (39.9 GB) and `-00002-of-00002.gguf` (14.8 GB),
+  54.7 GB in all. It checks the size and SHA-256 of each one.
+- **No pictures.** The model has no image reader and no picture file to download. `--vision yes|gpu|cpu`
+  only gives a warning; images stay off.
+- **One card.** With several cards, setup uses one and says so. The two-card split is run by hand (below).
+- **It picks the low-RAM mode or the normal mode** (next section) and writes the start script
+  `run_minimax_m2.sh` in the Strata folder.
+
+`./setup.sh --family minimax2 --m2-low-ram on` (or `off`) forces the mode. The end-to-end setup has not been
+tested yet; only setup's GPU-free tests (`python tools/test_setup_minimax.py`) and a HIP build have.
+
+### Low-RAM mode or normal mode
+
+| Mode | What it does | RAM setup plans for |
+| --- | --- | ---: |
+| **Low-RAM** (`--low-ram`) | the experts are read where they lie in the file; no copy in RAM | 24 GB |
+| **Normal** (no `--low-ram`) | the ~49 GB of experts are copied into RAM | 96 GB |
+
+`--m2-low-ram auto` (the default) picks the low-RAM mode when the PC has less than 96 GB of RAM in total, and
+the normal mode from 96 GB. Setup prints the mode and why. **The 96 GB line is derived from the code, not
+measured:** on a 64 GB box the copy did not fit beside the file and the machine thrashed (see
+[MINIMAX.md](MINIMAX.md#what-the-minimax-m2-integration-found-on-the-machine-2026-10-20)); 96 GB leaves room for
+the copy, the page cache and the OS. With `--m2-low-ram off` on a PC under 96 GB, setup warns and asks first (with `--yes`, it warns and goes on: the
+flag counts as your choice).
+
+### The start script: `run_minimax_m2.sh`
+
+```sh
+./run_minimax_m2.sh                    # the mode setup chose
+M2_LOW_RAM=1 ./run_minimax_m2.sh       # low-RAM mode for this run (same as: ./run_minimax_m2.sh --low-ram)
+M2_LOW_RAM=0 ./run_minimax_m2.sh       # normal mode for this run (same as: ./run_minimax_m2.sh --no-low-ram)
+M2_DRY_RUN=1 ./run_minimax_m2.sh       # print the command, start nothing
+```
+
+It starts the Strata server (`serve/server.py`) with MiniMax-M2's config, on one card. A mode other than
+setup's runs from a copy of the config (`.run_minimax_m2.override.json`, next to it); setup's config is not
+changed. The script always unsets `STRATA_M2_LOW_RAM`: the engine turns the low-RAM mode on when that variable
+exists at all, even set to `0`, so only `--low-ram` decides. On Windows setup writes no such script.
+
+## Build by hand
 
 ```sh
 cmake -S . -B build-hip -G Ninja \
@@ -33,8 +89,10 @@ Run with `LD_LIBRARY_PATH=/opt/rocm/lib`.
 
 ## Download the model
 
-The model is downloaded automatically by `setup.py` (entry `minimax2` in `OWN_PATH_FAMILIES`), or fetch it
-manually from `bartowski/MiniMaxAI_MiniMax-M2-GGUF` (IQ2_XXS, two shards, 54.7 GB total).
+`./setup.sh --family minimax2` downloads it (entry `minimax2` in `OWN_PATH_FAMILIES`), or fetch it by hand
+from `bartowski/MiniMaxAI_MiniMax-M2-GGUF`, folder `MiniMaxAI_MiniMax-M2-IQ2_XXS/`: two shards, 39.9 GB +
+14.8 GB = 54.7 GB. Keep both in the same folder and pass the first one (`-00001-of-00002.gguf`): the engine
+finds the second beside it.
 
 ## Run: single card (mono)
 

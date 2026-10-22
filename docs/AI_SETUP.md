@@ -224,8 +224,9 @@ The flags (all of them: `START-HERE.bat --help`):
 | Flag | Meaning |
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
-| `--family qwen\|swift\|coder\|unsloth` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
+| `--family qwen\|swift\|coder\|unsloth` | the model version (`minimax2`: MiniMax-M2, Linux, compiled from source; [MINIMAX_M2.md](MINIMAX_M2.md)) |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL, MiniMax-M2 IQ2_XXS) |
+| `--m2-low-ram auto\|on\|off` | MiniMax-M2 only: its low-RAM mode (experts read from the file, not copied into RAM). `auto`: on below 96 GB of RAM (derived from the code, not measured) |
 | `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
 | `--vision yes\|no\|gpu\|cpu` | read pictures. Pass `yes` to get the best reader for the card (the CPU under 24 GB, the GPU from 24 GB, any make); `no` turns them off |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
@@ -246,7 +247,8 @@ Linux:                 nohup ./run-iq2_xs.sh > strata-server.out 2>&1 &
 ```
 
 Setup prints the start script it wrote (`start script: run-<model>.bat`). The name is the family tag plus the size,
-lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`. The engine log is
+lower case: `run-iq2_xs`, `run-swift-iq2_xs`, `run-coder-iq1_m`, `run-unsloth-ud-iq4_xs`. MiniMax-M2 on Linux is the
+exception: `run_minimax_m2.sh` (`M2_LOW_RAM=1` or `M2_LOW_RAM=0` before it switches the low-RAM mode for one run). The engine log is
 `strata-<model>.log` in the Strata folder. Then continue with step 7.
 
 Notes:
