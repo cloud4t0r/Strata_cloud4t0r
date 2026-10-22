@@ -1759,6 +1759,19 @@ struct Engine {
                                  (double) per / (1 << 30), (double) fr0 / (1 << 30));
                     std::exit(1);
                 }
+                // one session on one card: its K / V said with the numbers instead of a cudaMalloc failure (setup wrote
+                // --max-context 131072 on a 16 GB card: 62 GiB of fp32 K / V).  256 MiB: the hybrid experts' outputs
+                // place_experts needs next, so a context refused here would not have started either
+                const size_t margin1 = (size_t) 256 << 20;
+                if (n_sess == 1 && split_dev < 0 && per + margin1 > fr0) {
+                    const size_t room = fr0 > margin1 ? fr0 - margin1 : 0;
+                    const long long most = (long long) ((double) ctx * (double) room / (double) per) / 1024 * 1024;
+                    std::fprintf(stderr, "strata-m2: not enough VRAM for a context of %d: its K / V cache needs %.2f GiB "
+                                 "(fp32), %.2f GiB free after the weights and the buffers: use a shorter --max-context "
+                                 "(at most about %lld on this card)\n", ctx, (double) per / (1 << 30),
+                                 (double) fr0 / (1 << 30), most);
+                    std::exit(1);
+                }
             }
             // The sessions' KV cache: ONCE.  alloc_session puts each layer's K / V on the card that runs it
             // (the layer split), so the second pass would only allocate a second, unused copy of the whole
