@@ -178,6 +178,7 @@ Gyro 可在 NVIDIA 和 AMD 显卡（AMD 为实验性支持）以及 Linux 上的
 - **[Swift 1.5](docs/MODELS.md#swift-15)** 是微调版本，回答前思考的时间更短，质量和内存占用大致相同。
 - **[NVFP4](docs/NVFP4.md)** 是 NVIDIA 为 NVIDIA 显卡提供的 4 位版本。要把所有专家放进内存，需要约 80 GB 内存。
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** 是另一个更小的模型，能看图片，还能同时回答多个请求。
+- **[MiniMax-M2](docs/MINIMAX_M2.md)**（230B，激活 10B，下载 54.7 GB）是另一个更大的模型，不能看图片。在 Linux 上，`./setup.sh --family minimax2` 会编译引擎并生成 `run_minimax_m2.sh`。内存低于 96 GB 时使用低内存模式（专家权重从文件读取，不复制到内存）；`--m2-low-ram on|off` 可强制选择，在脚本前加 `M2_LOW_RAM=1` 或 `M2_LOW_RAM=0` 只对这一次运行生效。96 GB 这个界限是从代码推算的，不是实测值。
 - **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** 需要手动设置。
 
 所有尺寸、下载大小，以及各种配置能跑什么：[docs/MODELS.md](docs/MODELS.md)。

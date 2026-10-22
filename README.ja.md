@@ -179,6 +179,7 @@ Gyro は NVIDIA と AMD のカード（AMD は実験的）、および Linux 上
 - **[Swift 1.5](docs/MODELS.md#swift-15)** はファインチューン版で、答える前に考える時間が短くなります。品質と RAM の必要量はほぼ同じです。
 - **[NVFP4](docs/NVFP4.md)** は NVIDIA カード向けの NVIDIA 製4ビット版です。すべてのエキスパートを RAM に置くには、約80 GBの RAM が必要です。
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** は、より小さい別のモデルです。画像を読め、複数のリクエストに同時に答えられます。
+- **[MiniMax-M2](docs/MINIMAX_M2.md)**（230B、アクティブ 10B、ダウンロード 54.7 GB）は、より大きい別のモデルです。画像は読めません。Linux では `./setup.sh --family minimax2` がエンジンをコンパイルし、`run_minimax_m2.sh` を書き出します。RAM が 96 GB 未満なら低RAMモード（エキスパートを RAM にコピーせず、ファイルから読む）を選びます。`--m2-low-ram on|off` で固定でき、スクリプトの前に `M2_LOW_RAM=1` または `M2_LOW_RAM=0` を付けると、その1回だけ切り替わります。96 GB という境目はコードから導いた値で、測定値ではありません。
 - **[OrcaRouter の Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** は手動で設定します。
 
 すべてのサイズ、ダウンロード、どの構成で何が動くかは [docs/MODELS.md](docs/MODELS.md) にあります。
