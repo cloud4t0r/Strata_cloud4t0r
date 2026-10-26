@@ -28,7 +28,8 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
-engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
+engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's, UD-IQ4_XS's or MiniMax-M2's experts
+in RAM),
 --kv-streaming on|off|auto.
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
@@ -637,10 +638,27 @@ MINIMAX2_FILES = {
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00001-of-00002.gguf": (39922661440, "84294b035551643111f15403c77d68a29e1b900fac9bf028d871c48851e9a178"),
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00002-of-00002.gguf": (14803701088, "4da31c4005c1e1f83ed403e4013cb2bb9bc1395b26b65c2fa962a8cdb645f091"),
 }
-# --m2-low-ram auto: below this much total RAM, MiniMax-M2 runs in the low-RAM mode (--low-ram, the experts read where
-# they lie in the file); from it on, in the normal mode (a host copy of its ~49 GB of experts beside the KV cache and
-# the OS).  Derived from the code, not measured: src/minimaxm2/m2_engine.cu notes that on a 64 GB box the copy did not
-# fit beside the file and the machine thrashed; 96 GB leaves the copy, the page cache's share and the OS room.
+# MiniMax-M2's routed experts (IQ2_XXS), GiB: the engine prints "49.10 GiB" and copies them all into host RAM without a
+# budget (MEASURED, docs/MINIMAX_M2.md, "A RAM budget for the experts").
+M2_EXPERTS_GIB = 49.10
+# --m2-low-ram auto / off: the host copy of those experts is capped at what the PC can hand out when setup runs
+# (MemAvailable) less this much - the OS, the desktop, the engine's buffers and the page cache the experts that are not
+# in RAM are read through.  docs/MINIMAX_M2.md advises 4 to 8 GiB below what is free; 8 is the safe end.  This is a
+# margin, not a measured speed setting.
+M2_RESIDENT_MARGIN_GIB = 8
+# Below this much of a copy, the low-RAM mode is the better answer: every expert is read from the file anyway.
+M2_RESIDENT_MIN_GIB = 4
+# The engine's smallest --resident-budget-gib (src/minimaxm2/m2_engine.cu refuses less, with this number in its message).
+M2_RESIDENT_ENGINE_MIN_GIB = 0.25
+# The rest of the machine beside the experts' copy, GiB: the OS, the desktop, the engine's buffers and the page cache
+# the experts that are not in RAM are read through.  MEASURED on this 62.7 GiB PC: a 30 GiB budget ran (29.84 GiB
+# pinned), a 34 GiB one put 6 of the 7 GiB of swap to use (docs/MINIMAX_M2.md).  So the copy is also capped at
+# total - 32 GiB: 30.5 GiB here, and no effect from 82 GiB of RAM up.
+M2_RESIDENT_OTHER_GIB = 32
+# The full copy (49.10 GiB) needs this much total RAM beside the file and the OS: what the normal mode asked for before
+# the budget, and what --m2-low-ram off uses on a PC whose free RAM setup cannot read.  Derived from the code, not
+# measured: src/minimaxm2/m2_engine.cu notes that on a 64 GB box the copy did not fit beside the file and the machine
+# thrashed; 96 GB leaves the copy, the page cache's share and the OS room.
 M2_LOW_RAM_BELOW_GB = 96
 # MiniMax-M2's VRAM beside its context, on the ONE card the engine runs on (GiB; setup's vram_gb is in GiB too).  Its
 # fp32 KV cache (62 layers, 8 KV heads x 128) is ~15.5 GiB per 32K tokens, so the context decides what fits:
@@ -652,15 +670,23 @@ M2_DENSE_GPU_GIB = 1.86        # MEASURED: IQ2_XXS's dense weights on the GPU ("
 # split-K partials and the expert scratch (8 entries x (3 x 1536 x 4 B + q8_1)) - and the fixed ones: the attention
 # scores (256 MiB fp32 + 128 MiB fp16), the GEMM workspace (32 MiB) and dequant scratch (3072 x 6144 x 2 B), the logits
 M2_PREFILL_CHUNK = 2048        # --prefill auto on a card that cannot hold every expert, >= 7.5 GiB free after the weights
-M2_CHUNK_ROW_BYTES = 713612
-M2_FIXED_BUFFER_BYTES = (64 << 20) * 6 + (32 << 20) + 3072 * 6144 * 2 + 8 * 200064 * 4
-M2_BUFFERS_GIB = (M2_PREFILL_CHUNK * M2_CHUNK_ROW_BYTES + M2_FIXED_BUFFER_BYTES) / 2 ** 30   # 1.81 GiB
+# MEASURED on this engine (RX 6800 + RX 9070, a context of 4096, an FP16 cache, the layers 31 on the second card, one
+# session, docs/MINIMAX_M2.md): the free VRAM after init was 12.33 GiB at a prompt chunk of 512, 11.45 at 2048 and 10.27
+# at 4096 - so a row of the chunk takes 617200 B and 0.36 GiB are fixed beside it.  The figures before came from the
+# Qwen3.6 path (713612 B a row, an expression for the fixed ones) and were 15% above what this engine allocates.
+M2_CHUNK_ROW_BYTES = 617200
+M2_FIXED_BUFFER_GIB = 0.36     # the attention scores, the GEMM workspace, the dequant and expert scratch
+M2_FIXED_BUFFER_BYTES = int(M2_FIXED_BUFFER_GIB * 2 ** 30)
+M2_BUFFERS_GIB = (M2_PREFILL_CHUNK * M2_CHUNK_ROW_BYTES + M2_FIXED_BUFFER_BYTES) / 2 ** 30   # 1.54 GiB
 M2_ENGINE_RESERVE_GIB = 0.75   # from the code: the 768 MiB the expert placement leaves free (m2_engine.cu reserve)
 M2_RUNTIME_GIB = 0.5           # ESTIMATE: the CUDA / HIP context and the BLAS libraries' workspaces
 M2_EXPERT_ROOM_GIB = 2.0       # ESTIMATE: room the recommendation keeps for the most-used experts' slots, so the
                                # low-RAM / hybrid mode does not run every expert on the CPU (a choice may use it)
-# from the code: what else grows with the context, per token: the FP16 K / V of one layer (k16 / v16: 8 x 128 x 2 B x
-# 2) and the prompt attention's partials (pacc / pm / pl: 48 heads x 64 rows / 128 cells x (128 + 2) x 4 B)
+# from the code, and checked against the measurements above: what else grows with the context, per token, on EACH card:
+# the FP16 K / V of one layer (k16 / v16: 8 x 128 x 2 B x 2) and the prompt attention's partials (pacc / pm / pl: 48
+# heads x 64 rows / 128 cells x (128 + 2) x 4 B).  With the cache's own term it gives what the engine prints: 64K of
+# int8 cache on the split's first card (4.29 GiB), this (1.01), 0.36 GiB of buffers, 0.29 of chunk rows and 1.86 of
+# dense weights are 7.81 GiB of a 15.98 GiB card - 8.17 GiB free, measured 7.75 (the estimate stays above it).
 M2_CTX_EXTRA_BYTES_PER_TOKEN = 8 * 128 * 2 * 2 + 48 * 64 // 128 * (128 + 2) * 4
 M2_EXE = "strata-m2.exe" if os.name == "nt" else "strata-m2"   # the MiniMax-M2 engine path on its own (CMake target)
 M2_RUN_SCRIPT = "run_minimax_m2.sh"                             # its start script (Linux), written by install_own_path
@@ -668,6 +694,14 @@ M2_LAYERS = 62                 # the GGUF's block_count: MiniMax-M2's 62 layers
 M2_LAYER_SPLIT = 31            # VALIDATED: the two-card run that matched llama.cpp's token 8261 (docs/MINIMAX_M2.md)
 M2_LAYER_SPLIT_MAX = 48        # from the code: strata-m2 checks --layer-split against its default 48 layers BEFORE it
                                # reads the GGUF (m2_engine.cu), so a split past 48 would not copy the second card's weights
+# What --m2-kv says, one line each (the measured facts: docs/MINIMAX_M2.md, "The cache's precision")
+M2_KV_LABELS = {
+    "f32": "FP32, the engine's default and its exact path: 15.5 GiB of VRAM per 32K tokens",
+    "f16": "FP16, half of FP32's VRAM; MEASURED as close to FP32's logits as INT8 is (0.25 and 0.22 on the 50 likeliest, 4K)",
+    "int8": "INT8, a quarter of FP32's VRAM - at 64K on two 16 GB cards the experts in VRAM went from 35 and 47 a layer "
+            "to 72 and 85 - but the cache's rounding shows on a long generation (measured: a 64-token run kept FP16's "
+            "tokens for 19, then wrote a full stop where FP16 wrote ', a city')",
+}
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -701,13 +735,26 @@ OWN_PATH_FAMILIES = {
                  "license": "MiniMax Community License: https://huggingface.co/MiniMaxAI/MiniMax-M2",
                  # RAM: the low-RAM mode keeps NO copy of the experts, so the engine's own memory is the KV cache
                  # and its buffers; the file's pages are the OS's page cache's business (it reads them as the
-                 # routing asks for them).  The normal mode (--m2-low-ram off) holds the copy: ram_gb_normal.
+                 # routing asks for them).  The normal mode holds the copy, capped at what is free when setup runs
+                 # (--resident-budget-gib, m2_resident_budget_gib); ram_gb_normal is the full copy's need.
                  "models": {"IQ2_XXS": {"about": "2-bit i-quant (the smallest M2 file), 54.7 GB", "ram_gb": 24,
-                                        "ram_gb_normal": M2_LOW_RAM_BELOW_GB}},
+                                        "ram_gb_normal": M2_LOW_RAM_BELOW_GB, "experts_gib": M2_EXPERTS_GIB}},
                  "sha256": MINIMAX2_FILES,
-                 # the engine's KV cache per context token: 62 layers, 8 KV heads x 128 (the GGUF's
-                 # attention.head_count_kv), K and V in fp32 (strata-m2): 15.5 GiB per 32K tokens
-                 "kv_bytes_per_token": 62 * 8 * 128 * 2 * 4,
+                 # the K / V cache's element (strata-m2 --kv f32|f16|int8): what a context token costs, 62 layers x
+                 # 8 KV heads x 128 (the GGUF's attention.head_count_kv), K and V, plus the INT8 rows' scales (one
+                 # half per cell, per KV head and per block of 32 dims, as Q8_0 keeps it: 62 x 8 x 4 x 2 x 2 B).
+                 # MEASURED, docs/MINIMAX_M2.md: the reference prompt answers 8261 in all three at 4K, and in f16
+                 # and int8 at 64K; against the exact FP32 cache both round the logits about as much (0.25 for
+                 # f16, 0.22 for int8 on the 50 likeliest tokens, 4K), and int8 halves the cache again: at 64K on
+                 # two 16 GB cards the experts in VRAM went from 35 and 47 a layer to 72 and 85, and 128K fits there
+                 # (19 and 31).  int8 is setup's choice (the same distance from FP32's logits as f16, for half the
+                 # VRAM); --m2-kv f16 keeps the engine's exact values in half precision, --m2-kv f32 restores the
+                 # engine's default byte for byte.
+                 "kv_bytes_per_token": 62 * 8 * 128 * 2 * 1 + 62 * 8 * (128 // 32) * 2 * 2,
+                 "kv_modes": {"f32": 62 * 8 * 128 * 2 * 4,
+                              "f16": 62 * 8 * 128 * 2 * 2,
+                              "int8": 62 * 8 * 128 * 2 * 1 + 62 * 8 * (128 // 32) * 2 * 2},
+                 "kv_default": "int8",
                  # the KV cache bounds the context on one card: the context is chosen against this budget
                  # (own_path_context, own_path_ctx_gib), and 16K is offered between 8K and 32K
                  "vram_budget": {"dense_gib": M2_DENSE_GPU_GIB,
@@ -719,8 +766,9 @@ OWN_PATH_FAMILIES = {
                  # Only this family has it (its engine splits across two cards); the others stay on one card
                  "n_layers": M2_LAYERS, "layer_split": M2_LAYER_SPLIT,
                  "mtp": 0,                      # the released weights carry no MTP block
-                 # the low-RAM mode is chosen by --m2-low-ram (auto: by this PC's RAM, M2_LOW_RAM_BELOW_GB); on, no
-                 # host copy of the experts: they stay in the file
+                 # the low-RAM mode is chosen by --m2-low-ram (auto: by the free RAM now - the host copy is capped at
+                 # --resident-budget-gib, and the low-RAM mode takes over when the cap leaves under
+                 # M2_RESIDENT_MIN_GIB); on, no host copy of the experts: they stay in the file
                  "low_ram": True,
                  "vision": False, "state_gb": 0.0}
 }
@@ -912,6 +960,40 @@ def ram_gb():
         with open("/proc/meminfo") as stream:
             for line in stream:
                 if line.startswith("MemTotal"):
+                    return int(line.split()[1]) * 1024 / 2**30
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def avail_ram_gb():
+    """The RAM this PC can hand out right now, GiB: Linux's MemAvailable (free plus what the kernel reclaims without
+    swapping, the page cache included), Windows' ullAvailPhys, macOS' free + inactive + speculative pages.  0.0 when it
+    cannot be read (setup then writes no MiniMax-M2 RAM budget and leaves the engine's default)."""
+    if WIN:
+        try:
+            return _memory_status().ullAvailPhys / 2**30
+        except (OSError, AttributeError, ValueError):
+            return 0.0                 # a probe, never a reason to stop setup
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3, check=True).stdout
+            head = re.search(r"page size of (\d+) bytes", out)
+            page = int(head.group(1)) if head else 4096
+            pages = {}
+            for line in out.splitlines():
+                name, _, value = line.partition(":")
+                value = value.strip().rstrip(".")
+                if value.isdigit():
+                    pages[name.strip()] = int(value)
+            return (pages.get("Pages free", 0) + pages.get("Pages inactive", 0) +
+                    pages.get("Pages speculative", 0)) * page / 2**30
+        except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return 0.0
+    try:
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable"):
                     return int(line.split()[1]) * 1024 / 2**30
     except (OSError, ValueError):
         pass
@@ -4501,12 +4583,13 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
+    moved = drop_moved_build_cache(ROOT / "build-hip")   # a moved repository: its cache names the old folder
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     cached = hip_cache_archs(ROOT / "build-hip")         # a stale CMAKE_HIP_ARCHITECTURES there: configure again
     has_archs = set(archs) <= set(meta.get("archs", [])) and (cached is None or set(archs) <= set(cached))
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
-    engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs and \
-        (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
+    engine_ok = moved is None and meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and \
+        has_archs and (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
     vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc and
                                      (vision != "gpu" or ((eng / HVEXE).exists() and set(archs) <= set(meta.get("vision_archs", [])))))
     if engine_ok and vision_ok:
@@ -5463,9 +5546,44 @@ def ensure_build_tools():
     return cmake, ninja
 
 
+def moved_build_cache(bdir) -> str | None:
+    """The source folder a build folder's CMakeCache.txt was configured in, when it is not this checkout: a moved or
+    renamed repository leaves the old absolute path in the cache, and cmake refuses it ("The current CMakeCache.txt
+    directory ... is different than the directory ... where CMakeCache.txt was created").  None when the cache names
+    this folder, or there is none."""
+    try:
+        text = (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"^CMAKE_HOME_DIRECTORY(?::[A-Z]+)?=(.+)$", text, re.M)
+    old = (m.group(1).strip() if m else "")
+    if not old:
+        return None
+    # normcase: Windows paths differ in case and in \ vs /; a moved folder differs in both
+    if os.path.normcase(os.path.abspath(old)) == os.path.normcase(os.path.abspath(ROOT)):
+        return None
+    return old
+
+
+def drop_moved_build_cache(bdir) -> str | None:
+    """Remove a build folder's CMakeCache.txt when it was made in another source folder (a moved or renamed
+    repository), saying which one, and return that folder: cmake then configures the folder again in place and reuses
+    the objects it already holds.  None (nothing removed) when the cache is this checkout's or there is none."""
+    old = moved_build_cache(bdir)
+    if not old:
+        return None
+    try:
+        (Path(bdir) / "CMakeCache.txt").unlink()
+    except OSError:
+        return None                     # say nothing: cmake reports the folder itself
+    say(f"  The build folder {Path(bdir).name} was made in {old}: configuring it again for {ROOT}")
+    return old
+
+
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
+    drop_moved_build_cache(bdir)                       # a moved or renamed repository: configure afresh
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
@@ -5576,7 +5694,9 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
-    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
+    bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else (ROOT / "build", ROOT / "build-vision")
+    moved = drop_moved_build_cache(bdir)                 # a moved repository: its cache names the old folder
+    engine_ok = moved is None and local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
         (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
@@ -5586,7 +5706,6 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         archs = sorted(built | set(archs))
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
-    bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else (ROOT / "build", ROOT / "build-vision")
     if not engine_ok:
         say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) + " (a card it had no code for; "
             "10-20 minutes, once) ..." if new_arch else
@@ -6208,9 +6327,15 @@ _SETUP_FLAGS = None
 
 
 def explicit_args(a) -> list[str]:
-    """The engine options this run's command line sets that the person keeps from now on (user_args): --vram-reserve-mib."""
-    n = getattr(a, "vram_reserve_mib", None)
-    return ["--vram-reserve-mib", str(n)] if n is not None else []
+    """The engine options this run's command line sets that the person keeps from now on (user_args):
+    --vram-reserve-mib and --vram-reserve-later-mib."""
+    out = []
+    for flag, key in (("--vram-reserve-mib", "vram_reserve_mib"),
+                      ("--vram-reserve-later-mib", "vram_reserve_later_mib")):
+        n = getattr(a, key, None)
+        if n is not None:
+            out += [flag, str(n)]
+    return out
 
 
 def carry_user_args(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[str]:
@@ -6232,6 +6357,10 @@ def carry_user_args(old: dict, cfg: dict, explicit: list[str] | None = None) -> 
         vis = isinstance(old.get("vision"), dict)
         if reserve is not None and reserve.isdigit() and not (vis and int(reserve) == VISION["gpu"]["reserve_mib"])                 and "ui_resource_baseline" not in old and "--vram-reserve-mib" not in mine:
             mine += ["--vram-reserve-mib", reserve]
+        later = flag_value(oargs, "--vram-reserve-later-mib")   # ... and the later cards' own reserve, the same way
+        if later is not None and later.isdigit() and "ui_resource_baseline" not in old and \
+                "--vram-reserve-later-mib" not in mine:
+            mine += ["--vram-reserve-later-mib", later]
     for g in user_args.groups(explicit or []):
         mine = user_args.merge(mine, g)
     if not mine:
@@ -6712,24 +6841,32 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
 def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
            layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
-    --vram-reserve-mib)."""
+    --vram-reserve-mib, --vram-reserve-later-mib)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
     keep = {k: v for k, v in (keep or {}).items() if v is not None}
-    reserve = keep.pop("vram_reserve_mib", None)       # #493: an engine argument, kept in the config's args
-    if reserve is not None:
+    # #493: the VRAM reserves are engine arguments, kept in the config's args.  The second one is a layer split's later
+    # cards' (--vram-reserve-later-mib; the second card here, and the peer's card when it sits there).
+    for flag, key in (("--vram-reserve-mib", "vram_reserve_mib"),
+                      ("--vram-reserve-later-mib", "vram_reserve_later_mib")):
+        reserve = keep.pop(key, None)
+        if reserve is None:
+            continue
         args = cfg["args"]
-        if "--vram-reserve-mib" in args[:-1]:
-            args[args.index("--vram-reserve-mib") + 1] = str(reserve)
+        if flag in args[:-1]:
+            args[args.index(flag) + 1] = str(reserve)
         else:
-            args += ["--vram-reserve-mib", str(reserve)]
-        cfg[user_args.USER_KEY] = user_args.set_flag(user_args.capture(cfg), "--vram-reserve-mib", reserve)   # the person's own value: kept by every later setup run and start
+            args += [flag, str(reserve)]
+        # the person's own value: kept by every later setup run and start
+        cfg[user_args.USER_KEY] = user_args.set_flag(user_args.capture(cfg), flag, reserve)
         if user_args.WRITTEN_KEY in cfg:
             cfg[user_args.WRITTEN_KEY] = list(cfg["args"])
         write_config(cfg_path, cfg)
-        ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+        ok(f"saved for this model: {reserve} MiB of VRAM kept free "
+           + ("for other programs (--vram-reserve-mib)" if key == "vram_reserve_mib"
+              else "on the later cards (--vram-reserve-later-mib)"))
     if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
         cfg.update(keep)
         write_config(cfg_path, cfg)
@@ -7407,6 +7544,43 @@ def own_path_contexts(fam: dict) -> list:
     return sorted({c for c in CONTEXTS if c <= 262144} | set(fam.get("extra_contexts", ())))
 
 
+def own_path_kv_modes(fam: dict) -> list:
+    """The K / V cache elements setup offers for an own-path family, the family's order (MiniMax-M2: f32 the engine's
+    default, f16, int8), or none (the other families' engines take --kv themselves)."""
+    return list(fam.get("kv_modes", ()))
+
+
+def own_path_kv_family(fam: dict, mode: str = None) -> dict:
+    """`fam` with the K / V cache of `mode`: a shallow copy whose kv_bytes_per_token is that mode's (plus "kv_used",
+    the mode it is), which every context and split estimate below reads.  None or an unknown mode: the family's
+    default.  A family without kv_modes comes back as it is."""
+    modes = fam.get("kv_modes")
+    if not modes:
+        return fam
+    if mode not in modes:
+        mode = fam.get("kv_default") if fam.get("kv_default") in modes else next(iter(modes))
+    out = dict(fam)
+    out["kv_bytes_per_token"] = modes[mode]
+    out["kv_used"] = mode
+    return out
+
+
+def own_path_kv_auto(fam: dict, rec) -> str:
+    """The mode "auto" picks on these cards: the family's default when the context it recommends reaches 32K (a usable
+    conversation), else the next smaller cache that does.  MiniMax-M2's default is int8, the smallest, so it is always
+    int8 there.  `rec(fam)` is the context this install recommends for a family dict (one card, or the split)."""
+    modes = own_path_kv_modes(fam)
+    if not modes:
+        return ""
+    kv = fam["kv_modes"]
+    default = fam.get("kv_default") if fam.get("kv_default") in modes else modes[0]
+    smaller = sorted((m for m in modes if kv[m] < kv[default]), key=lambda m: -kv[m])
+    for m in [default] + smaller:
+        if rec(own_path_kv_family(fam, m)) >= 32768:
+            return m
+    return ([default] + smaller)[-1]
+
+
 def own_path_ctx_gib(fam: dict, ctx: int) -> float:
     """GiB of VRAM the context takes for a family with a "vram_budget": its KV cache and what else grows with it."""
     b = fam["vram_budget"]
@@ -7487,22 +7661,57 @@ def own_path_files(fam: dict, model: str) -> list:
 def own_path_bytes(fam: dict, model: str) -> int:
     """The download of one size of an own-path family: every file of it, pinned sizes."""
     return sum(fam["sha256"][f][0] for f in own_path_files(fam, model))
-def own_path_ram_need(fam: dict, model: str, low_ram: bool = True) -> int:
-    """GB of RAM one size needs: "ram_gb", or in the normal mode of a family with a low-RAM choice (MiniMax-M2 with
-    --m2-low-ram off) "ram_gb_normal" (the host copy of the experts)."""
+def own_path_ram_need(fam: dict, model: str, low_ram: bool = True, avail: float = None,
+                      total: float = None, asked: float = None) -> int:
+    """GB of RAM one size needs: "ram_gb".  In the normal mode of a family with a low-RAM choice (MiniMax-M2) the host
+    copy is capped at what is free when setup runs (--resident-budget-gib), or at the N GiB asked for there, so it asks
+    for no more than the low-RAM mode plus the copy; "ram_gb_normal" is the full copy's need, what --m2-low-ram off
+    uses when the free RAM cannot be read."""
     d = fam["models"][model]
-    return d["ram_gb"] if low_ram or not fam.get("low_ram") else d.get("ram_gb_normal", d["ram_gb"])
-def m2_low_ram_mode(choice: str, ram: float) -> tuple:
-    """MiniMax-M2's low-RAM mode (--m2-low-ram): (on, why).  "on" / "off" as asked; "auto" by this PC's total RAM,
-    below M2_LOW_RAM_BELOW_GB on."""
+    if fam.get("low_ram") and not low_ram:
+        if asked is not None:
+            return d.get("ram_gb_normal", d["ram_gb"]) if asked >= d.get("experts_gib", M2_EXPERTS_GIB) \
+                else int(math.ceil(d["ram_gb"] + asked))
+        avail = avail_ram_gb() if avail is None else avail
+        total = ram_gb() if total is None else total
+        return d["ram_gb"] if m2_resident_budget_gib(avail, M2_EXPERTS_GIB, total) \
+            else d.get("ram_gb_normal", d["ram_gb"])
+    return d["ram_gb"]
+
+
+def m2_resident_budget_gib(avail: float, experts_gib: float = M2_EXPERTS_GIB, total: float = None) -> float:
+    """The GiB of MiniMax-M2's experts setup keeps in host RAM (--resident-budget-gib): what the PC can hand out when
+    setup runs (`avail`, GiB) less M2_RESIDENT_MARGIN_GIB, at most what fits beside the rest of the machine
+    (`total` - M2_RESIDENT_OTHER_GIB) and at most all of them, in quarter-GiB steps.  0.0 when that leaves less than
+    M2_RESIDENT_MIN_GIB, or when the free RAM cannot be read (no budget is worth writing then)."""
+    if avail <= 0:
+        return 0.0
+    total = ram_gb() if total is None else total
+    gib = math.floor((avail - M2_RESIDENT_MARGIN_GIB) * 4) / 4
+    if total > 0:
+        gib = min(gib, math.floor((total - M2_RESIDENT_OTHER_GIB) * 4) / 4)
+    return min(gib, experts_gib) if gib >= M2_RESIDENT_MIN_GIB else 0.0
+
+
+def m2_low_ram_mode(choice: str, ram: float, avail: float = None, asked: float = None) -> tuple:
+    """MiniMax-M2's low-RAM mode (--m2-low-ram): (on, why).  "on" as asked; "off" and a budget asked for on the command
+    line (--resident-budget-gib N) keep the normal mode; "auto" keeps a host copy of the experts capped at what is free
+    now (m2_resident_budget_gib), and turns the low-RAM mode on when that leaves less than M2_RESIDENT_MIN_GIB or the
+    free RAM cannot be read."""
     if choice == "on":
         return True, "--m2-low-ram on"
+    if asked is not None:
+        return False, (f"{asked:g} GiB of the {M2_EXPERTS_GIB:g} GiB of experts in RAM (--resident-budget-gib, as you "
+                       "asked), the rest read from the file")
     if choice == "off":
         return False, "--m2-low-ram off"
-    if ram < M2_LOW_RAM_BELOW_GB:
-        return True, (f"{ram:.0f} GB of RAM is below {M2_LOW_RAM_BELOW_GB} GB: a host copy of the ~49 GB of experts "
-                      "would not fit beside the file and the OS")
-    return False, f"{ram:.0f} GB of RAM (at least {M2_LOW_RAM_BELOW_GB} GB): the experts are copied into RAM"
+    avail = avail_ram_gb() if avail is None else avail
+    budget = m2_resident_budget_gib(avail, M2_EXPERTS_GIB, ram)
+    if budget:
+        return False, (f"{avail:.0f} GB free of {ram:.0f} GB: {budget:g} GiB of the {M2_EXPERTS_GIB:g} GiB of experts "
+                       "stay in RAM (--resident-budget-gib), the rest is read from the file")
+    return True, (f"{avail:.0f} GB free of {ram:.0f} GB: too little for a copy of the experts beside the file and the "
+                  "OS (--low-ram)")
 def m2_build_dir(hip: bool, meta: dict):
     """The build folder setup compiled this engine in (strata-m2 is built there too), or None: a ready-made engine, the
     Intel Arc (SYCL) stub, the app's engine component or Windows (no build folder setup can reuse)."""
@@ -7715,7 +7924,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     """Steps 2-7 for a family with its own engine path (OWN_PATH_FAMILIES: Qwen3.6-35B-A3B): the size, the context, the
     engine, the GGUF (pinned revision, size and SHA-256), the tokenizer from the GGUF, the config and the start
     script.  The engine places the experts itself (every one in VRAM when they fit, else the most-used ones there and
-    the rest on the CPU), so there is no pack, profile or RAM budget to choose."""
+    the rest on the CPU); MiniMax-M2's host copy is capped at the free RAM (--resident-budget-gib), so there is no
+    pack or profile to choose."""
     fam = OWN_PATH_FAMILIES[family]
     say()
     say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
@@ -7751,9 +7961,24 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     low_ram, low_why = True, ""
+    ram_free = avail_ram_gb()                          # what a host copy of the experts may take now (--resident-budget-gib)
     m2_choice = getattr(a, "m2_low_ram", None) or "auto"
-    if fam.get("low_ram"):                             # MiniMax-M2: the low-RAM mode by --m2-low-ram (auto: by the RAM)
-        low_ram, low_why = m2_low_ram_mode(m2_choice, ram)
+    asked = a.resident_budget_gib if fam.get("low_ram") else None   # --resident-budget-gib N: the copy's cap, as asked
+    if asked is not None:
+        if asked < M2_RESIDENT_ENGINE_MIN_GIB:
+            fail(f"--resident-budget-gib {asked:g} GiB is below what the MiniMax-M2 engine takes "
+                 f"({M2_RESIDENT_ENGINE_MIN_GIB:g} GiB)",
+                 f"{M2_RESIDENT_ENGINE_MIN_GIB:g} GiB or more, e.g. --resident-budget-gib 20; leave it out for what "
+                 "this PC can take now")
+        if asked > M2_EXPERTS_GIB:
+            warn(f"--resident-budget-gib {asked:g} GiB is more than the {M2_EXPERTS_GIB:g} GiB of experts MiniMax-M2 "
+                 f"has: keeping all of them ({M2_EXPERTS_GIB:g} GiB)")
+            asked = M2_EXPERTS_GIB
+        if m2_choice == "on":
+            warn(f"--m2-low-ram on keeps no host copy: --resident-budget-gib {asked:g} is ignored (the engine's "
+                 "--low-ram wins)")
+    if fam.get("low_ram"):                             # MiniMax-M2: the low-RAM mode by --m2-low-ram (auto: by the free RAM)
+        low_ram, low_why = m2_low_ram_mode(m2_choice, ram, ram_free, asked)
         ok(f"low-RAM mode: {'on (--low-ram)' if low_ram else 'off (normal mode)'} - {low_why}")
     elif m2_choice != "auto":
         warn(f"--m2-low-ram is MiniMax-M2's setting: {fam['title']} does not use it")
@@ -7761,7 +7986,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
         size = own_path_bytes(fam, m)
-        need = own_path_ram_need(fam, m, low_ram)
+        need = own_path_ram_need(fam, m, low_ram, ram_free, ram, asked)
         fit = "" if ram >= need else f"   <- needs {need} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
     rec = own_path_size(fam, ram)
@@ -7769,11 +7994,12 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
                                      str(names.index(rec) + 1), a.yes)) - 1]
-    need = own_path_ram_need(fam, model, low_ram)
+    need = own_path_ram_need(fam, model, low_ram, ram_free, ram, asked)
     if ram < need:
         confirm_risk(f"{model} needs about {need} GB of RAM" + ("" if low_ram else " in the normal mode") +
                      f"; this PC has {ram:.0f} GB: the OS may page and it may not start",
-                     bool(a.model) or bool(fam.get("low_ram") and m2_choice == "off"), a.yes,
+                     bool(a.model) or bool(fam.get("low_ram") and m2_choice == "off") or asked is not None,
+                     a.yes,
                      f"{model} needs about {need} GB of RAM",
                      f"choose a smaller size, or --model {model} --yes to install it anyway", "  Install it anyway?")
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
@@ -7781,6 +8007,12 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     tag = fam["tag"] + model
     card_vram = float(gpu.get("vram_gb", 0.0))       # the ONE card the engine runs on (the main GPU), never a sum
     bounded = "vram_budget" in fam                    # MiniMax-M2: the KV cache decides which context fits the card
+    # the K / V cache's element (--m2-kv; MiniMax-M2's engine path takes f32 the exact default, f16 and int8): the
+    # context this install recommends and writes follows the mode it picks, so the choice comes first
+    kv_choice = (getattr(a, "m2_kv", None) or "auto").lower()
+    if kv_choice != "auto" and not own_path_kv_modes(fam):
+        warn(f"--m2-kv is MiniMax-M2's setting: {fam['title']} does not use it")
+    fam = own_path_kv_family(fam, None if kv_choice == "auto" else kv_choice)
     rec_ctx = own_path_context(fam, card_vram)
     avail = []
     if two:                                           # each card on its own: its VRAM minus what is in use now
@@ -7799,6 +8031,15 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                 warn(f"the VRAM in use on GPU {c['index']} could not be read: counted as free (close the other "
                      "programs that use this card)")
         rec_ctx = own_path_split_context(fam, avail, split)
+    if kv_choice == "auto" and own_path_kv_modes(fam):
+        # auto: the family's default when it reaches a usable context here, else the next smaller cache that does
+        kv_auto = own_path_kv_auto(fam, lambda f2: own_path_split_context(f2, avail, split) if two
+                                   else own_path_context(f2, card_vram))
+        if kv_auto and kv_auto != fam.get("kv_used"):
+            fam = own_path_kv_family(fam, kv_auto)
+            rec_ctx = own_path_split_context(fam, avail, split) if two else own_path_context(fam, card_vram)
+    if fam.get("kv_used"):
+        ok(f"K / V cache: {fam['kv_used']} - " + M2_KV_LABELS.get(fam["kv_used"], ""))
     if a.context:
         ctx = a.context
     else:
@@ -7827,9 +8068,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         kv_c = ctx * fam["kv_bytes_per_token"] * n / fam["n_layers"] / 2 ** 30
         dense_c = b["dense_gib"] if miss == 0 else b["dense_gib"] * n / fam["n_layers"]
         whose = "all the dense weights" if miss == 0 else "its layers' dense weights"
+        kvw = fam.get("kv_used", "f32")
         confirm_risk(f"a {ctx // 1024}K context does not fit {fam['title']} on GPU {c['index']} "
                      f"({avail[miss]:.1f} GB free): its share of the KV cache ({n} of {fam['n_layers']} layers) is "
-                     f"{kv_c:.1f} GB (fp32), and with {whose} ({dense_c:.2f} GB) and the engine's buffers (~{b['fixed_gib']:.2f} GB) the engine needs about "
+                     f"{kv_c:.1f} GB ({kvw}), and with {whose} ({dense_c:.2f} GB) and the engine's buffers (~{b['fixed_gib']:.2f} GB) the engine needs about "
                      f"{own_path_split_need_gib(fam, ctx, n, miss == 0):.1f} GB on that card. It would stop at start "
                      "(out of memory).",
                      bool(a.context), a.yes, f"a {ctx // 1024}K context does not fit GPU {c['index']}",
@@ -7839,9 +8081,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if bounded and not two and 0 < card_vram < own_path_ctx_need_gib(fam, ctx):
         # recommend, never force: said with the numbers and asked; --yes goes on only for an explicit --context
         b = fam["vram_budget"]
+        kvw = fam.get("kv_used", "f32")
         confirm_risk(f"a {ctx // 1024}K context does not fit {fam['title']} on GPU {gpu.get('index', 0)} "
                      f"({card_vram:.1f} GB): its KV cache alone is {ctx * fam['kv_bytes_per_token'] / 2**30:.1f} GB "
-                     f"(fp32), and with the dense weights ({b['dense_gib']:.2f} GB) and the engine's "
+                     f"({kvw}), and with the dense weights ({b['dense_gib']:.2f} GB) and the engine's "
                      f"buffers (~{b['fixed_gib']:.2f} GB) the engine needs about {own_path_ctx_need_gib(fam, ctx):.1f} GB "
                      "on that one card. It would stop at start (out of memory).",
                      bool(a.context), a.yes, f"a {ctx // 1024}K context does not fit the {card_vram:.0f} GB card",
@@ -7866,9 +8109,18 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             n = int(ask("How many requests at once (1 = one at a time)?", [str(i) for i in range(1, PARALLEL_MAX + 1)],
                         "1", a.yes))
             par = n if n > 1 else None
-    if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
-        warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
-             "does not use them")
+    flash = []
+    if a.rope_scaling or a.rope_scale:
+        flash.append("--rope-scaling")
+    if a.kv:
+        flash.append("--kv")
+    if a.resident_budget_gib is not None and not fam.get("low_ram"):
+        flash.append("--resident-budget-gib")
+    if a.low_ram not in (None, "auto"):
+        flash.append("--low-ram")
+    if flash:
+        warn(f"{' / '.join(flash)} " + ("is a Flash-Next setting" if len(flash) == 1 else "are Flash-Next settings")
+             + f": {fam['title']} does not use " + ("it" if len(flash) == 1 else "them"))
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = [folder / f for f in own_path_files(fam, model)]
     gguf = shards[0]                                   # the engine opens the first shard and finds the rest beside it
@@ -7935,14 +8187,40 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if fam.get("kv_used"):                          # the K / V cache's element (--m2-kv; int8 unless asked otherwise)
+        args += ["--kv", fam["kv_used"]]
     if fam.get("low_ram") and low_ram:
         # the experts stay in the file (a copy of them does not fit beside it, and it empties the page cache)
         args += ["--low-ram"]
-    if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
-        vram = gpu.get("vram_gb", 0.0)
-        if vram > 0:
-            args += ["--expert-vram", f"{max(vram - 3.0 - a.vram_reserve_mib / 1024, 0):.1f}"]
-        ok(f"VRAM kept free for other programs: about {a.vram_reserve_mib} MiB (the experts' share is set lower)")
+    elif fam.get("low_ram"):
+        # the normal mode, capped at what the RAM can take now: the hottest experts in RAM, the rest read from the file
+        experts = fam["models"][model].get("experts_gib", M2_EXPERTS_GIB)
+        if asked is not None:                      # --resident-budget-gib N: the number you asked for
+            budget = min(asked, experts)
+            args += ["--resident-budget-gib", f"{budget:g}"]
+            ok(f"RAM budget: {budget:g} GiB of the {experts:g} GiB of experts in RAM (--resident-budget-gib, as you "
+               "asked), the rest read from the file")
+        else:
+            budget = m2_resident_budget_gib(ram_free, experts, ram)
+            if budget:
+                args += ["--resident-budget-gib", f"{budget:g}"]
+                ok(f"RAM budget: {budget:g} GiB of the {experts:g} GiB of experts in RAM (--resident-budget-gib), the "
+                   "rest read from the file")
+            else:
+                warn("the free RAM could not be read: no --resident-budget-gib, so the engine copies every expert into "
+                     "RAM (--m2-low-ram on keeps none of them there)")
+    # VRAM left free for other programs: the engines' own option, which sizes each card's expert slots on that card's
+    # free VRAM less the reserve (MiniMax-M2: m2_engine.cu's place_experts, 768 MiB by default).  What setup wrote
+    # before was MiniMax-M2's --expert-vram, the experts' total in GiB, derived from the first card's VRAM: it read no
+    # per-card value, and the Flash-Next path (the other own-path family) has no such option at all.
+    if a.vram_reserve_mib is not None:
+        args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+        ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert slots take "
+           "that much less)")
+    later = getattr(a, "vram_reserve_later_mib", None)
+    if later is not None:                          # the second card's own reserve, written as given
+        args += ["--vram-reserve-later-mib", str(later)]
+        ok(f"VRAM kept free on the second card: {later} MiB (--vram-reserve-later-mib)")
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
@@ -8371,8 +8649,17 @@ def main() -> int:
                          "code and French (French answers: 18%% more drafts accepted)")
     ap.add_argument("--m2-low-ram", choices=["auto", "on", "off"], default="auto",
                     help="MiniMax-M2 (--family minimax2): its low-RAM mode (--low-ram: the experts read where they lie in "
-                         f"the file, no copy in RAM); auto: on below {M2_LOW_RAM_BELOW_GB} GB of RAM. The start script "
+                         "the file, no copy in RAM); auto: off while the free RAM now allows a copy of them "
+                         f"(--resident-budget-gib: what is free less {M2_RESIDENT_MARGIN_GIB} GiB, and at most "
+                         f"{M2_RESIDENT_OTHER_GIB} GiB under this PC's RAM), on when it does not. The start script "
                          f"{M2_RUN_SCRIPT} keeps it as its default; M2_LOW_RAM=1|0 switches it for one run")
+    ap.add_argument("--m2-kv", choices=["auto", "f32", "f16", "int8"], default="auto",
+                    help="MiniMax-M2 (--family minimax2): the K / V cache's precision, which sets the context that fits "
+                         "your cards. int8 (setup's choice): a quarter of FP32's VRAM, as close to its logits as f16 "
+                         "is (measured), so the same cards reach twice the context; a near-tie can turn (measured: a "
+                         "64-token run kept f16's tokens for 19, then wrote three fewer). f16: half of FP32's VRAM, "
+                         "the engine's exact values in half precision. f32: the engine's default, byte for byte. "
+                         "auto: int8")
     ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
                     help="read the model's experts from one file in its folder instead of copying them all into RAM "
                          "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "
@@ -8380,10 +8667,15 @@ def main() -> int:
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
                     help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, 40 on 64 GB; "
-                         "more is kept as you choose, with a note)")
+                         "more is kept as you choose, with a note). MiniMax-M2: the GiB of its 49.10 GiB of experts kept in "
+                         "RAM (default: the free RAM less 8 GiB, at most 32 GiB under the PC's RAM); --m2-low-ram on keeps "
+                         "none")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
-                         "default: 700); the expert cache takes that much less")
+                         "default: 700, 768 for MiniMax-M2); the expert cache takes that much less")
+    ap.add_argument("--vram-reserve-later-mib", type=int, metavar="N",
+                    help="the same on a layer split's second card (MiniMax-M2, --gpus with two cards): its own reserve, "
+                         "e.g. --vram-reserve-mib 600 --vram-reserve-later-mib 2048; default: the first card's value")
     ap.add_argument("--mtp", choices=["on", "off"],
                     help="the draft layer (MTP): off starts the model without it, which frees about 1 GB of graphics memory "
                          "for the expert cache and takes less RAM, at the price of speed; it is kept in the run config "
@@ -8421,6 +8713,8 @@ def main() -> int:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
+    if a.vram_reserve_later_mib is not None and a.vram_reserve_later_mib < 0:
+        ap.error("--vram-reserve-later-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-later-mib 2048")
     if a.gpu is not None:                             # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
         if "," in a.gpu:
             a.gpus, a.gpu = a.gpus or a.gpu, None
@@ -8524,13 +8818,15 @@ def main() -> int:
                  + ("keeps" if a.no_start else "starts with") + " the default settings")
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                           "vram_reserve_mib": a.vram_reserve_mib, "vram_reserve_later_mib": a.vram_reserve_later_mib,
+                           "open_browser": a.browser})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         engine_update_note()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                           "vram_reserve_mib": a.vram_reserve_mib, "vram_reserve_later_mib": a.vram_reserve_later_mib,
+                           "open_browser": a.browser})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -8539,7 +8835,8 @@ def main() -> int:
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                      keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                           "vram_reserve_mib": a.vram_reserve_mib, "vram_reserve_later_mib": a.vram_reserve_later_mib,
+                           "open_browser": a.browser})
         data, elsewhere = data_folder_for(a)      # "install another model": now the model files are gathered
         roots = [data, *elsewhere]
         if not models_dir_given:
@@ -9373,6 +9670,13 @@ def main() -> int:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
+    later = getattr(a, "vram_reserve_later_mib", None)
+    if later is not None:                              # a layer split's later cards: their own reserve
+        if "--vram-reserve-later-mib" in args:
+            args[args.index("--vram-reserve-later-mib") + 1] = str(later)
+        else:
+            args += ["--vram-reserve-later-mib", str(later)]
+        ok(f"VRAM kept free on the later cards: {later} MiB (--vram-reserve-later-mib)")
     if not multi and family == "unsloth" and 0 < gpu.get("vram_gb", 0.0) <= UD_FIT_CARD_GB:
         # a card of about 8 GB: the config setup would write may not start (measured on an A750).  Pick the least
         # harmful one that fits and say so; what the user chose with --context / --kv / --vram-reserve-mib is kept

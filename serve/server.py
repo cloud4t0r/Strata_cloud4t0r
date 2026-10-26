@@ -4934,7 +4934,7 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                              declared_only=declared_only)
+                              declared_only=declared_only, tool_format=getattr(self.template, "tool_format", "qwen"))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -6951,7 +6951,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            force = forced_call(req.get("tool_choice"), tools,
+                                getattr(svc.template, "tool_format", "qwen"))  # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -7203,7 +7204,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            force = forced_call(req.get("tool_choice"), tools,
+                                getattr(svc.template, "tool_format", "qwen"))  # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences

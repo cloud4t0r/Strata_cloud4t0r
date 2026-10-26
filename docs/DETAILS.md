@@ -527,10 +527,16 @@ the positions of short greedy answers, 90-91% after a 16K prompt, differing most
 ### Another model: MiniMax-M2 (Linux)
 
 MiniMax-M2 (230B, 10B active) runs on its own engine path; the IQ2_XXS file is two shards, 54.7 GB. Setup compiles
-the engine from source for it, plus `strata-m2` (the same path on its own), and writes `run_minimax_m2.sh`. Below
-96 GB of RAM it picks the low-RAM mode (the experts read from the file, not copied into RAM); `--m2-low-ram on|off`
-forces it, `M2_LOW_RAM=1|0 ./run_minimax_m2.sh` switches it for one run. The 96 GB line is derived from the code,
-not measured. No pictures. Guide: **[docs/MINIMAX_M2.md](MINIMAX_M2.md)**.
+the engine from source for it, plus `strata-m2` (the same path on its own), and writes `run_minimax_m2.sh`. It keeps
+the normal mode and caps the experts' host copy at what the PC can hand out when it runs: free RAM less 8 GiB,
+and at most the PC's RAM less 32 GiB (`--resident-budget-gib`, all 49.10 GiB from 82 GiB of RAM up); the low-RAM mode (the experts read from the file, not copied into
+RAM) takes over only when that leaves under 4 GiB or the free RAM cannot be read. `--m2-low-ram on|off` forces it,
+`M2_LOW_RAM=1|0 ./run_minimax_m2.sh` switches it for one run. The 8 GiB is a safety margin, not a measurement. The
+K / V cache is FP32 by default, FP16 with `--kv f16` and INT8 with `--kv int8` (one scale per cell, per KV head and
+per block of 32 values, as Q8_0 keeps them); setup writes int8 (`--m2-kv`): a quarter of FP32's VRAM, as close to
+its logits as f16 is (0.22 and 0.25 on the 50 likeliest tokens, measured at 4K).
+The prompt chunk comes from the free VRAM: a row of it costs 617,200 B and 0.36 GiB are fixed (measured), and the
+hybrid mode takes 2048 from 7.5 GiB free. No pictures. Guide: **[docs/MINIMAX_M2.md](MINIMAX_M2.md)**.
 
 ```
 ./setup.sh --setup --family minimax2
@@ -1009,7 +1015,9 @@ print(r.choices[0].message.content)
 - **Which tool calls come back as calls.** A call counts only when it names a tool the request declared. A call for
   another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the
   text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule
-  for Codex's compaction requests). A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>`
+  for Codex's compaction requests). A template with its own call wording, such as MiniMax-M2's
+  `<minimax:tool_call><invoke name="...">`, is translated to the `<tool_call><function=...>` form first; the same
+  rule then decides. A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>`
   instead of `<function=NAME>`, is read as the call when NAME is a declared tool. A `<tool_call>` block that still
   does not read as a call is counted in the server window.
 - **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a

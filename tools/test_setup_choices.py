@@ -463,6 +463,24 @@ class VramReserve(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--vram-reserve-mib takes a number of MiB", err.getvalue())
 
+    def test_the_later_card_has_its_own(self):
+        # --vram-reserve-later-mib: a layer split's second card keeps its own reserve (the main engine's option, and
+        # MiniMax-M2's since the engine took it)
+        code, out, cfg, _ = self.install("--vram-reserve-mib", "600", "--vram-reserve-later-mib", "2048")
+        self.assertEqual(code, 0, out)
+        a = cfg["args"]
+        self.assertEqual(a[a.index("--vram-reserve-mib") + 1], "600")
+        self.assertEqual(a[a.index("--vram-reserve-later-mib") + 1], "2048")
+        self.assertIn("VRAM kept free on the later cards: 2048 MiB", out)
+        code, out, cfg, _ = self.install()
+        self.assertNotIn("--vram-reserve-later-mib", cfg["args"])     # not given: the first card's value
+
+    def test_a_negative_later_value_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code, out, cfg, _ = self.install("--vram-reserve-later-mib", "-1")
+        self.assertEqual(code, 2)
+        self.assertIn("--vram-reserve-later-mib takes a number of MiB", err.getvalue())
+
     def test_kept_from_an_earlier_install(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "strata-q2_0.json"
@@ -488,6 +506,22 @@ class VramReserve(unittest.TestCase):
                     _, out = quiet(setup.start, p, None, None, False, True, None, {"vram_reserve_mib": int(n)})
                     self.assertEqual(json.loads(p.read_text())["args"], ["--kv", "int8", "--vram-reserve-mib", n])
         self.assertIn("1024 MiB of VRAM kept free", out)
+        self.assertTrue(call.called)
+
+    def test_the_later_card_given_on_a_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "strata.exe"
+            exe.write_bytes(b"")
+            p = Path(d) / "strata-q2_0.json"
+            p.write_text(json.dumps({"exe": str(exe), "args": ["--kv", "int8"], "gpu": 0, "gpus_asked": True}))
+            call = mock.Mock(return_value=0)
+            with mock.patch.object(setup, "gpus", lambda: self.found), \
+                    mock.patch.object(setup, "is_wsl", lambda: False), \
+                    mock.patch.object(setup, "ensure_engine_for", lambda cards, path, cfg, yes: cfg), \
+                    mock.patch.object(setup.subprocess, "call", call):
+                _, out = quiet(setup.start, p, None, None, False, True, None, {"vram_reserve_later_mib": 512})
+            self.assertEqual(json.loads(p.read_text())["args"], ["--kv", "int8", "--vram-reserve-later-mib", "512"])
+        self.assertIn("512 MiB of VRAM kept free on the later cards", out)
         self.assertTrue(call.called)
 
 

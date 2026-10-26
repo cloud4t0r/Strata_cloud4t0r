@@ -6,7 +6,9 @@ Everything here is text: no model, no GPU. The engine consumes token ids and pro
   * renders the model's own Jinja chat template (pack `tokenizer/chat_template.jinja`) exactly as Hugging Face
     does (checked against the pack's `chat_golden.json`, 10 cases incl. thinking and tools),
   * parses the streamed output incrementally into reasoning (`<think>...</think>`), content and tool calls in
-    the template's XML form (`<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>`),
+    the template's XML form (`<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>`);
+    a template with its own wording (MiniMax-M2's `<minimax:tool_call><invoke name=...>`) is translated to that
+    form first, so the parser, its streaming events and the API writers stay one path,
     never emitting a partial tag to the client.
 
 Design note: plan v0.3 describes a single C++ process. The frontend is Python first because the template is Jinja
@@ -52,7 +54,33 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # A template may take the tools bare (the Qwen one: `tool.name`) or in OpenAI's wrapper (MiniMax-M2:
+        # `tool.function`).  Find out once, with a render, rather than failing on the first request that offers
+        # tools; the calls themselves follow the same template's wording (detected from its source).
+        self.tool_format = ("minimax" if MM_CALL_START in self.source and MM_INVOKE_START in self.source
+                            else "qwen")
+        self.tools_wrapped = False
+        self.tools_wrapped = self._detect_tool_shape()
         self.caps = self._detect_caps()
+
+    def _detect_tool_shape(self) -> bool:
+        """Whether this template reads the tools in OpenAI's wrapper or bare.  Probed with a render, bare first,
+        so a template that takes both renders the bytes it did before.  False when both fail: the template would
+        have failed on the request itself, and start-up must not (another probe reports the feature off)."""
+        probe = [{"name": "strata_probe", "description": "strata_probe",
+                  "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}]
+        user = [{"role": "user", "content": "strata_probe"}]
+        try:
+            self.render(user, tools=probe)
+            return False
+        except Exception as exc:                # noqa: BLE001 - a probe, never the request's own error
+            LOGGER.debug("chat template takes no bare tools: %s", exc, exc_info=True)
+        try:
+            self.render(user, tools=[{"type": "function", "function": probe[0]}])
+            return True
+        except Exception as exc:                # noqa: BLE001
+            LOGGER.debug("chat template takes no wrapped tools either: %s", exc, exc_info=True)
+            return False
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -62,6 +90,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if tools and self.tools_wrapped:
+            tools = [tool if "function" in tool else {"type": "function", "function": tool} for tool in tools]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -93,8 +123,11 @@ class ChatTemplate:
             prompt = render(messages, tools)
             # Instructions include example XML and literal tag names, which are not model output. Parse only
             # complete calls to our probe functions, using the same body parser as OutputParser.
-            bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
-                                prompt, re.S)
+            if self.tool_format == "minimax":
+                bodies = re.findall(r'<invoke name="strata_caps_call_\d+">.*?</invoke>', prompt, re.S)
+            else:
+                bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
+                                    prompt, re.S)
             try:
                 parsed = [parse_tool_call(body) for body in bodies]
             except ValueError:
@@ -104,8 +137,10 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
+        markers = ((MM_CALL_START, MM_INVOKE_START) if self.tool_format == "minimax"
+                   else (CALL_START, FUNC_START))
         return {"supports_tools": all(s in tool_prompt for s in
-                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
+                                      ("strata_caps_call_0", "strata_caps_description", *markers)),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),
@@ -679,6 +714,17 @@ CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
 
+# MiniMax-M2's template writes its tools and its calls in its own wording: the tools as OpenAI's wrapper
+# ({"type": "function", "function": {...}}, read as `tool.function`), the calls as
+# `<minimax:tool_call><invoke name="NAME"><parameter name="P">VALUE</parameter></invoke></minimax:tool_call>`.
+# ChatTemplate adapts the tools it renders; _MiniMaxToQwen turns the calls into the form above for OutputParser.
+MM_CALL_START = "<minimax:tool_call>"
+MM_CALL_END = "</minimax:tool_call>"
+MM_INVOKE_START = '<invoke name="'
+MM_INVOKE_END = "</invoke>"
+MM_PARAM_START = '<parameter name="'
+
+
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
@@ -762,22 +808,29 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, tool_format: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    "required" / Anthropic "any": any of the tools; a named function: that one.  `tool_format` is the call wording
+    of the model's template ("qwen" here, "minimax" for MiniMax-M2's <invoke name="...">).  A value it cannot
+    honour (an unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as
+    "auto", not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+
+    def opening(name: str | None) -> str:
+        if tool_format == "minimax":
+            return MM_CALL_START + "\n" + (MM_INVOKE_START + name + '">\n' if name else MM_INVOKE_START)
+        return CALL_START + "\n<function=" + (f"{name}>\n" if name else "")
+
     if kind in ("auto", "none"):
         return None
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START + "\n<function="
+        return opening(None)
     if kind == "named" and name in names:
-        return CALL_START + f"\n<function={name}>\n"
+        return opening(name)
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
           "request): the model decides, as with \"auto\"", flush=True)
     return None
@@ -843,11 +896,54 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
-def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
-    """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
-    when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
-    objects/arrays/numbers/booleans)."""
+def parse_minimax_invoke(body: str, schema: dict | None = None) -> ToolCall:
+    """MiniMax-M2's `<invoke name="NAME"><parameter name="P">VALUE</parameter>...</invoke>` -> ToolCall.
+
+    The value rules are parse_tool_call's: a parameter the schema declares as a string is the text between its
+    tags, with one leading and one trailing newline dropped (the template writes values inline; a model that puts
+    them on their own line still gives the string it meant); any other value is JSON-decoded, or kept as text."""
     body = body.strip()
+    if not body.startswith(MM_INVOKE_START) or '">' not in body:
+        raise ValueError("malformed tool call: " + body[:80])
+    end = body.index('">', len(MM_INVOKE_START))
+    name = body[len(MM_INVOKE_START):end].strip()
+    rest = body[end + 2:]
+    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    args = {}
+    while MM_PARAM_START in rest:
+        rest = rest[rest.index(MM_PARAM_START) + len(MM_PARAM_START):]
+        if '">' not in rest:
+            raise ValueError("malformed tool call: " + body[:80])
+        end = rest.index('">')
+        pname = rest[:end].strip()
+        rest = rest[end + 2:]
+        close = rest.find(PARAM_END)
+        if close < 0:
+            raise ValueError("malformed tool call: " + body[:80])
+        value = rest[:close]
+        rest = rest[close + len(PARAM_END):]
+        if value.startswith("\n"):
+            value = value[1:]
+        if value.endswith("\n"):
+            value = value[:-1]
+        declared = (props.get(pname) or {}).get("type")
+        if declared == "string":
+            args[pname] = value
+        else:
+            try:
+                args[pname] = json.loads(value)
+            except ValueError:
+                args[pname] = value
+    return ToolCall(name=name, arguments=args)
+
+
+def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+    """`<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>` (or MiniMax-M2's `<invoke name="NAME">`
+    wording) -> ToolCall. Values are JSON-decoded when the tool's schema says the parameter is not a string (or,
+    without a schema, when they parse as JSON objects/arrays/numbers/booleans)."""
+    body = body.strip()
+    if body.startswith(MM_INVOKE_START):
+        return parse_minimax_invoke(body, schema)
     if not body.startswith("<function=") or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
@@ -879,12 +975,136 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
+class _MiniMaxToQwen:
+    """MiniMax-M2's call wording -> the form OutputParser reads (the Qwen template's).
+
+    `<minimax:tool_call><invoke name="read"><parameter name="path">a.txt</parameter></invoke></minimax:tool_call>`
+    becomes `<tool_call><function=read><parameter=path>a.txt</parameter></function></tool_call>`; each invoke gets
+    its own wrapper, so the existing call parser, its streaming events, its quote/fence rules and its recovery
+    apply unchanged.  Text and parameter values pass through untouched - a value may itself contain those tags, so
+    after a `<parameter ...>` opener everything up to the matching `</parameter>` is value text.  A tag split
+    across deltas is held until the next one (finish() flushes what never completed, as text)."""
+
+    PARAM_CLOSE = PARAM_END
+    MAX_TAG = 256            # a name or key this long with no closing `">` is text, not a tag still arriving
+
+    def __init__(self):
+        self.held = ""
+        self.in_value = False
+        self.skip_newline = False   # the line break the template writes after <minimax:tool_call>
+
+    def _value_end(self, start: int) -> tuple[str, int]:
+        """("end", position of the value's `</parameter>`) or ("hold", position of a candidate whose follower has
+        not arrived) or ("none", -1).  A candidate ends the value only when `</parameter>` is followed (after
+        whitespace) by the next parameter or by `</invoke>` - the same follower rule as param_end(), so a value
+        that quotes the format - a file being written, #210 - stays a value."""
+        at = self.held.find(self.PARAM_CLOSE, start)
+        while at >= 0:
+            after = self.held[at + len(self.PARAM_CLOSE):].lstrip()
+            if after.startswith((MM_PARAM_START, MM_INVOKE_END)):
+                return "end", at
+            if not after or MM_PARAM_START.startswith(after) or MM_INVOKE_END.startswith(after):
+                return "hold", at
+            at = self.held.find(self.PARAM_CLOSE, at + len(self.PARAM_CLOSE))
+        return "none", -1
+
+    def feed(self, text: str) -> str:
+        self.held += text
+        out: list[str] = []
+        i = 0
+        while i < len(self.held):
+            if self.skip_newline:
+                if i >= len(self.held):
+                    break
+                if self.held.startswith("\r\n", i):
+                    i += 2
+                elif self.held.startswith("\n", i):
+                    i += 1
+                self.skip_newline = False
+                continue
+            if self.in_value:
+                kind, at = self._value_end(i)
+                if kind == "hold":                   # the follower is still arriving: keep the candidate
+                    out.append(self.held[i:at])
+                    i = at
+                    break
+                if kind == "none":                   # all value text so far, but a close may be half-arrived
+                    tail = self.held[i:]
+                    hold = 0
+                    for n in range(1, min(len(self.PARAM_CLOSE) - 1, len(tail)) + 1):
+                        if self.PARAM_CLOSE.startswith(tail[-n:]):
+                            hold = n
+                    if hold:
+                        out.append(tail[:-hold])
+                        i = len(self.held) - hold
+                    else:
+                        out.append(tail)
+                        i = len(self.held)
+                    break
+                out.append(self.held[i:at + len(self.PARAM_CLOSE)])
+                i = at + len(self.PARAM_CLOSE)
+                self.in_value = False
+                continue
+            lt = self.held.find("<", i)
+            if lt < 0:
+                out.append(self.held[i:])
+                i = len(self.held)
+                break
+            out.append(self.held[i:lt])
+            rest = self.held[lt:]
+            matched = False
+            for tag, replacement in ((MM_CALL_START, ""), (MM_CALL_END, ""),
+                                     (MM_INVOKE_END, FUNC_END + CALL_END)):
+                if rest.startswith(tag):
+                    out.append(replacement)
+                    i = lt + len(tag)
+                    if tag == MM_CALL_START:
+                        self.skip_newline = True
+                    matched = True
+                    break
+            if matched:
+                continue
+            start = next((tag for tag in (MM_INVOKE_START, MM_PARAM_START) if rest.startswith(tag)), None)
+            if start is not None:
+                close = rest.find('">', len(start))
+                if close < 0:
+                    if len(rest) <= self.MAX_TAG:
+                        i = lt
+                        break                        # the name or key is still arriving: held
+                    out.append("<")
+                    i = lt + 1
+                    continue
+                name = rest[len(start):close]
+                if start == MM_INVOKE_START:
+                    out.append(CALL_START + FUNC_START + name + ">")
+                else:
+                    out.append(PARAM_START + name + ">")
+                    self.in_value = True
+                i = lt + close + 2
+                continue
+            if any(tag.startswith(rest) for tag, _ in ((MM_CALL_START, ""), (MM_CALL_END, ""),
+                                                       (MM_INVOKE_END, ""))) \
+                    or MM_INVOKE_START.startswith(rest) or MM_PARAM_START.startswith(rest):
+                i = lt
+                break                                # a tag still arriving: held
+            out.append("<")
+            i = lt + 1
+        self.held = self.held[i:]
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Whatever never completed, unchanged (the parser returns an unfinished call as text)."""
+        text, self.held = self.held, ""
+        self.skip_newline = False
+        return text
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False, declared_only: bool = False):
+                 recover: bool = False, declared_only: bool = False, tool_format: str = "qwen"):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -915,6 +1135,10 @@ class OutputParser:
         self.recover = recover
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
+        self.tool_format = tool_format
+        # Only translate when tools are declared: with none, a call the model writes is text, and a client should
+        # see the model's own wording rather than the parser's (the rule the Qwen form already follows).
+        self.translator = _MiniMaxToQwen() if tool_format == "minimax" and tools else None
         self._reset_scan()
 
     def _ok_at(self, p: int) -> bool:
@@ -1224,6 +1448,10 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self.translator is not None and delta:
+            delta = self.translator.feed(delta)
+            if not delta:                # a tag still arriving in the model's wording: nothing for the parser yet
+                return []
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -1484,6 +1712,10 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.translator is not None:
+            rest = self.translator.flush()   # a tag that never completed is text, as an unfinished call is
+            if rest:
+                self.buf += rest
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:

@@ -161,10 +161,15 @@ split across two (`--gpus 1,0`, AMD on Linux). It needs ~55 GB on disk (IQ2_XXS,
 ```
 
 Setup compiles the engine from source, downloads the model and writes the start script `./run_minimax_m2.sh`.
-It also picks how the model uses your RAM: below 96 GB of RAM, the low-RAM mode (the experts are read from the
-file, not copied into RAM); from 96 GB, the normal mode. `--m2-low-ram on|off` forces one, and
-`M2_LOW_RAM=1` or `M2_LOW_RAM=0 ./run_minimax_m2.sh` switches it for one run. The 96 GB line is an estimate from
-the code, not a measurement. This model does not read pictures. Details: [docs/MINIMAX_M2.md](docs/MINIMAX_M2.md).
+It also picks how the model uses your RAM: the normal mode, with the experts' copy capped at what the PC can
+hand out when setup runs (`--resident-budget-gib`: free RAM less 8 GiB, capped at the PC's RAM less 32 GiB; or
+set the number yourself with `--resident-budget-gib N`), and the low-RAM mode (the experts are
+read from the file, not copied into RAM) only when that leaves under 4 GiB or the free RAM cannot be read.
+`--m2-low-ram on|off` forces one, and `M2_LOW_RAM=1` or `M2_LOW_RAM=0 ./run_minimax_m2.sh` switches it for one
+run. The context it recommends follows the K / V cache's precision: `--m2-kv auto` (the default) writes
+`--kv int8`, a quarter of the engine's FP32 default and as close to its logits as f16 is (measured). Two 16 GB
+cards reach 128K with int8 and 64K with f16 (measured). This model does not read pictures. Details:
+[docs/MINIMAX_M2.md](docs/MINIMAX_M2.md).
 
 ### Low on memory? Try Gyro
 

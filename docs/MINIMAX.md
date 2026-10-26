@@ -475,10 +475,10 @@ is the engine's own counter.
 
 > **Status (0.2.2, engine 0.1.47): MiniMax-M2 is operational.** Single card and two-card layer split both
 > produce the reference token **8261** (prompt `200034,517,5505,300,5969,355`), matching llama.cpp. On Linux,
-> `./setup.sh --family minimax2` compiles the engine and `strata-m2`, downloads the two shards (54.7 GB), picks the
-> low-RAM mode below 96 GB of RAM (`--m2-low-ram auto|on|off`; the line is derived, not measured) and writes
-> `run_minimax_m2.sh`. See [MINIMAX_M2.md](MINIMAX_M2.md) for the install, build and run commands. This page is
-> the study and the integration log; the tables below are the study's, from before the engine existed.
+> `./setup.sh --family minimax2` compiles the engine and `strata-m2`, downloads the two shards (54.7 GB), writes a
+> RAM budget for the experts from the free RAM at that moment (`--resident-budget-gib`; `--m2-low-ram auto|on|off`)
+> and writes `run_minimax_m2.sh`. See [MINIMAX_M2.md](MINIMAX_M2.md) for the install, build and run commands. This
+> page is the study and the integration log; the tables below are the study's, from before the engine existed.
 
 MiniMax-M2 is the predecessor (June 2026), and on this machine it is a far better proposition than M3:
 **230B total, 10.4B active** (llama.cpp's `LLM_TYPE_230B_A10B`), against M3's 428B / 24.7B.

@@ -271,14 +271,21 @@ parameters, 10 billion active per token, 256 experts, MiniMax Community License)
 engine path. It is in setup (`--family minimax2`), on Linux; setup compiles the engine from source for it. It does
 not read pictures.
 
-| Mode | RAM setup plans for | In plain words |
-| --- | ---: | --- |
-| **Low-RAM** | 24 GB | the experts are read from the file, not copied into RAM. Chosen below 96 GB of RAM |
-| **Normal** | 96 GB | the ~49 GB of experts are copied into RAM. Chosen from 96 GB of RAM |
+| Mode | In plain words |
+| --- | --- |
+| **Low-RAM** | the experts are read from the file, not copied into RAM. `--m2-low-ram on`, or `auto` when the free RAM at setup time leaves no copy |
+| **Normal** | a copy of the experts in RAM, capped by `--resident-budget-gib`: the free RAM at setup time less 8 GiB, and at most the PC's RAM less 32 GiB (32 GiB on a 64 GB PC). Chosen by `auto` when it can, and by `off` |
 
-The 96 GB line is derived from the code, not measured. `--m2-low-ram on|off` forces a mode; the start script
-`run_minimax_m2.sh` switches it for one run (`M2_LOW_RAM=1` or `M2_LOW_RAM=0`). The full guide:
-[MINIMAX_M2.md](MINIMAX_M2.md).
+`--m2-low-ram on|off` forces a mode; the start script `run_minimax_m2.sh` switches it for one run (`M2_LOW_RAM=1`
+or `M2_LOW_RAM=0`). The 8 GiB margin is a safety choice, not a measurement; setup prints the budget it wrote.
+
+The context setup recommends follows the K / V cache's precision, `--m2-kv auto|f32|f16|int8`. The default
+(`auto`) keeps the cache in INT8: a quarter of the engine's FP32 default for the same context, and as close to
+its logits as f16 is (measured: 0.25 for f16 and 0.22 for int8 on the 50 likeliest tokens). That gives 64K on a
+16 GB card and 128K on two of them (measured: 19 and 31 expert slots a layer, 23.0 tok/s). `--m2-kv f16` halves
+the cache instead: 32K on a 16 GB card and 64K on two (measured: 35 and 47 slots, 25.2 tok/s). `--m2-kv f32`
+keeps the engine's exact default.
+The full guide: [MINIMAX_M2.md](MINIMAX_M2.md).
 
 ```
 ./setup.sh --setup --family minimax2

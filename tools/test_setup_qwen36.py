@@ -30,7 +30,8 @@ REPO = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 def args(**kw):
     base = dict(family="qwen36", model=None, check=False, yes=True, vision=None, models_dir=None, gguf_dir=None,
                 context=None, rope_scaling=None, rope_scale=None, kv=None, resident_budget_gib=None, low_ram="auto",
-                vram_reserve_mib=None, host=None, api_key=None, browser=None, no_start=True, data_dir=None, gpu=None)
+                vram_reserve_mib=None, vram_reserve_later_mib=None, host=None, api_key=None, browser=None, no_start=True,
+                data_dir=None, gpu=None)
     base.update(kw)
     return argparse.Namespace(**base)
 

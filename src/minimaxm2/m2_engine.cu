@@ -85,6 +85,20 @@ constexpr int kThreads = 256;
 // 256-cell chunk with a 128-thread block would leave half the chunk's weights unwritten).
 constexpr int kChunkCells = 128;
 constexpr int kHD = 128;           // MiniMax-M2's head dim (load() refuses any other)
+constexpr int kMaxKvHeads = 32;    // an INT8 cache's shared scales per cell: --kv int8 is refused above this many KV heads
+constexpr int kKvBlock = 32;       // an INT8 scale covers this many dims of a KV head (Q8_0's block: 4 a head at kHD 128)
+constexpr int kKvBlocks = kHD / kKvBlock;
+static_assert(kKvBlock == 32, "the INT8 path reduces one block per warp");
+// The auto prompt chunk (--prefill auto) works with MiniMax-M2's own figures.  MEASURED on this build (RX 6800 + RX 9070,
+// a context of 4096, an FP16 cache, the layers 31 on the second card, one session): the free VRAM after init was 12.33
+// GiB at a prompt chunk of 512, 11.45 at 2048 and 10.27 at 4096.  A row of the chunk therefore costs 617200 B (0.59 MiB:
+// the activations, the router's logits, the expert parts and the CPU pool's copies, the q8 / FP16 operands, the split-K
+// partials and the expert scratch) and 0.36 GiB are fixed beside it (the attention scores, the GEMM workspace, the
+// dequant scratch).  The rule used to carry q36's numbers over (0.5 MiB per row, kv_one = 45056 per cell) and refused a
+// card that had the room.
+constexpr double kM2ChunkRowBytes = 617200.0;
+constexpr double kM2FixedBufferBytes = 0.36 * double(1ull << 30);
+constexpr int kM2ReserveMib = 768;   // the VRAM kept free on a card by default (--vram-reserve-mib overrides it)
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
 
 // ------------------------------------------------------------------------------------------------ small kernels
@@ -243,6 +257,16 @@ __global__ void k_gate_rows(float* sh, const float* gate, int n, int T) {
     sh[i] *= sigm(gate[i / n]);
 }
 
+/// The K / V cache's element: FP32 by default, FP16 or INT8 with --kv (half and a quarter of the VRAM for the same
+/// context).  The kernels below are templates on it; these helpers are the only places that convert.  INT8's values are
+/// what they are: the block's scale (one per cell, per KV head and per kKvBlock dims, `ksc` below) is applied by the
+/// caller.
+__device__ __forceinline__ float kv_ld(float v) { return v; }
+__device__ __forceinline__ float kv_ld(__half v) { return __half2float(v); }
+__device__ __forceinline__ float kv_ld(int8_t v) { return (float) v; }
+__device__ __forceinline__ void kv_st(float* p, float v) { *p = v; }
+__device__ __forceinline__ void kv_st(__half* p, float v) { *p = __float2half(v); }
+
 /// Batch rows (several sessions decoded in one window, one token each): row t reads and writes the cache of session
 /// slot[t] at cell[t]; its rotary position is cell[t] + delta[t].  Every field null: one session, the rows are its
 /// consecutive cells *pos0 + t (the prompt, a verify window, a decode step).
@@ -250,8 +274,10 @@ struct RowSel {
     const int32_t* cell = nullptr;   // device [T]
     const int32_t* slot = nullptr;   // device [T]
     const int32_t* delta = nullptr;  // device [T]
-    float* const* kc = nullptr;      // device [n_sessions]: this layer's K / V base of each session
-    float* const* vc = nullptr;
+    const void* const* kc = nullptr; // device [n_sessions]: this layer's K / V base of each session (float, __half, int8)
+    const void* const* vc = nullptr;
+    const __half* const* ks = nullptr;   // device [n_sessions]: their scales (--kv int8), the same indices
+    const __half* const* vs = nullptr;
 };
 
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
@@ -270,8 +296,8 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     const int pos = rs.cell ? rs.cell[t] : *pos0 + t;
     const int dl = rs.delta ? rs.delta[t] : (rdelta ? *rdelta : 0);
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = (float*) rs.kc[rs.slot[t]];
+        vc = (float*) rs.vc[rs.slot[t]];
     }
     const bool isq = head < H;
     const float* src = isq ? qg + ((size_t) t * H + head) * 2 * HD : kx + ((size_t) t * HKV + head - H) * HD;
@@ -318,19 +344,28 @@ int dev_of(const void* p) {
     return at.device;
 }
 
+template <class KV>
 __global__ void k_attn_prep_m2(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
-                                float* q, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
+                                float* q, KV* kc, KV* vc, __half* ksc, __half* vsc, int H, int HKV, int HD, int n_rot,
                                 const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
                                 const int32_t* mtab, RowSel rs) {
     __shared__ float sh[kThreads];
+    __shared__ float sks[kMaxKvHeads * kKvBlocks], svs[kMaxKvHeads * kKvBlocks];   // INT8: this cell's scales (32 heads at most)
+    extern __shared__ float stage[];   // INT8 only, the host sizes it [2 * HK]: the k and the v row before their scale is known
     const int t = blockIdx.x;
     const int pos = rs.cell ? rs.cell[t] : *pos0 + t;
     const int dl = rs.delta ? rs.delta[t] : (rdelta ? *rdelta : 0);
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = (KV*) rs.kc[rs.slot[t]];
+        vc = (KV*) rs.vc[rs.slot[t]];
+        if (rs.ks) {
+            ksc = (__half*) rs.ks[rs.slot[t]];
+            vsc = (__half*) rs.vs[rs.slot[t]];
+        }
     }
     const int HQ = H * HD, HK = HKV * HD;
+    float* sk8 = stage;              // --kv int8: the rows while the block reduces them (nothing is read from these
+    float* sv8 = stage + HK;         // shared arrays when KV is float or __half: the stores go straight to the cache)
     float sq = 0.f, sk = 0.f;
     for (int i = threadIdx.x; i < HQ; i += kThreads) {
         const float v = qg[(size_t) t * HQ + i];
@@ -371,28 +406,71 @@ __global__ void k_attn_prep_m2(const float* qg, const float* kx, const float* vx
             const float other = kx[(size_t) t * HK + j] * rk * kw[j];
             v = d < half ? v * cs - other * sn : other * sn + v * cs;
         }
-        kc[((size_t) h * ctx + pos) * HD + d] = v;
+        if constexpr (std::is_same_v<KV, int8_t>) sk8[i] = v;   // --kv int8: staged, its scale is known only after the row
+        else kv_st(kc + ((size_t) h * ctx + pos) * HD + d, v);
     }
     for (int i = threadIdx.x; i < HK; i += kThreads) {
         const int h = i / HD, d = i - h * HD;
-        vc[((size_t) h * ctx + pos) * HD + d] = vx[(size_t) t * HK + i];
+        const float v = vx[(size_t) t * HK + i];
+        if constexpr (std::is_same_v<KV, int8_t>) sv8[i] = v;
+        else kv_st(vc + ((size_t) h * ctx + pos) * HD + d, v);
+    }
+    if constexpr (std::is_same_v<KV, int8_t>) {
+        __syncthreads();   // the staged rows are read across the block below
+        // One scale per cell, per KV head and per block of kKvBlock dims: the block's largest magnitude / 127 (the
+        // Q8_0 rule; 4 blocks a head here).  The score and the value sums carry each block's scale as one more factor,
+        // so the values are rounded but every sum stays in FP32.  A warp holds one block of 32, so its reduction is a
+        // shuffle: `kKvBlock` is the warp's width.
+        const int lane = threadIdx.x & 31, wrp = threadIdx.x / 32;
+        for (int r = wrp; r < HKV * kKvBlocks; r += kThreads / 32) {
+            const int h = r / kKvBlocks, b = r - h * kKvBlocks;
+            float mk = 0.f, mv = 0.f;
+            for (int i = b * kKvBlock + lane; i < (b + 1) * kKvBlock; i += 32) {
+                mk = fmaxf(mk, fabsf(sk8[h * HD + i]));
+                mv = fmaxf(mv, fabsf(sv8[h * HD + i]));
+            }
+            for (int m = 16; m > 0; m >>= 1) {
+                mk = fmaxf(mk, __shfl_xor_sync(0xffffffffu, mk, m));
+                mv = fmaxf(mv, __shfl_xor_sync(0xffffffffu, mv, m));
+            }
+            if (lane == 0) {
+                // the scale as a half, as Q8_0 keeps it (2 bytes for 32 values): the values are quantized with the
+                // half's own value, so what is stored and what is read back agree
+                sks[r] = __half2float(__float2half(mk > 0.f ? mk / 127.f : 1.f));
+                svs[r] = __half2float(__float2half(mv > 0.f ? mv / 127.f : 1.f));
+                ksc[((size_t) h * ctx + pos) * kKvBlocks + b] = __float2half(sks[r]);
+                vsc[((size_t) h * ctx + pos) * kKvBlocks + b] = __float2half(svs[r]);
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < HK; i += kThreads) {
+            const int h = i / HD, d = i - h * HD, r = h * kKvBlocks + d / kKvBlock;
+            const int qk = __float2int_rn(sk8[i] / sks[r]);
+            const int qv = __float2int_rn(sv8[i] / svs[r]);
+            kc[((size_t) h * ctx + pos) * HD + d] = (KV) (qk > 127 ? 127 : (qk < -127 ? -127 : qk));
+            vc[((size_t) h * ctx + pos) * HD + d] = (KV) (qv > 127 ? 127 : (qv < -127 ? -127 : qv));
+        }
     }
 }
 
 /// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
 /// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-template <int HD>
-__global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
-                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl, RowSel rs) {
+template <int HD, class KV>
+__global__ void k_attn_part(const float* q, const KV* kc, const KV* vc, const __half* ksc, const __half* vsc,
+                            const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
+                            float* pacc, float* pm, float* pl, RowSel rs) {
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
     const int c = blockIdx.x, row = blockIdx.y;
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     if (rs.kc) {
-        kc = rs.kc[rs.slot[t]];
-        vc = rs.vc[rs.slot[t]];
+        kc = (const KV*) rs.kc[rs.slot[t]];
+        vc = (const KV*) rs.vc[rs.slot[t]];
+        ksc = rs.ks ? rs.ks[rs.slot[t]] : nullptr;
+        vsc = rs.vs ? rs.vs[rs.slot[t]] : nullptr;
     }
+    const bool i8 = ksc != nullptr;   // --kv int8: each block's scale is one more factor of the score and of the sum
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
     const int j = threadIdx.x;
@@ -401,9 +479,19 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const int p = p0 + j;
     float s = -INFINITY;
     if (p < npos) {
-        const float* kp = kc + ((size_t) kvh * ctx + p) * HD;
+        const KV* kp = kc + ((size_t) kvh * ctx + p) * HD;
         float a = 0.f;
-        for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
+        if (i8) {   // the dot product per block, its own scale applied to its own sum
+            const __half* ks = ksc + ((size_t) kvh * ctx + p) * kKvBlocks;
+            for (int b = 0; b < kKvBlocks; ++b) {
+                const int i0 = b * kKvBlock;
+                float part = 0.f;
+                for (int i = i0; i < i0 + kKvBlock; ++i) part += qs[i] * kv_ld(kp[i]);
+                a += part * __half2float(ks[b]);
+            }
+        } else {
+            for (int i = 0; i < HD; ++i) a += qs[i] * kv_ld(kp[i]);
+        }
         s = a * scale;
     }
     const float m = block_max(s, sh);
@@ -412,8 +500,11 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-    for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
+    const KV* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    const __half* vs = vsc ? vsc + ((size_t) kvh * ctx + p0) * kKvBlocks : nullptr;
+    const int vb = j / kKvBlock;   // this dim's block
+    for (int k = 0; k < n; ++k)
+        acc += sc[k] * (i8 ? __half2float(vs[k * kKvBlocks + vb]) : 1.f) * kv_ld(vp[(size_t) k * HD]);
     const size_t o = (size_t) row * n_chunk + c;
     pacc[o * HD + j] = acc;
     if (j == 0) {
@@ -502,6 +593,38 @@ __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, 
         }
     }
 }
+/// The routing grouped per expert when the experts' blobs sit in TWO places: the ones with a VRAM slot in `blobs`
+/// (at slot * blob) and the others in `pool` (at x * blob), the pinned host buffer the GPU reads over PCIe.  The
+/// prompt path uses it: the slots keep their VRAM (the decode's speed) and only the pool's experts are streamed.
+__global__ void k_group_pool(const int32_t* ids, int n_ent, int K_, int n_expert, const int32_t* slot_of,
+                             const uint8_t* blobs, unsigned long long blob, const uint8_t* pool,
+                             unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
+                             int32_t* ent_tok) {
+    __shared__ int cnt[512], off[512];
+    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int g = 0, pos = 0;
+        for (int x = 0; x < n_expert; ++x) {
+            off[x] = pos;
+            if (cnt[x] == 0) continue;
+            const int s = slot_of[x];
+            grp_ptr[g] = (unsigned long long) (s >= 0 ? blobs + (size_t) s * blob : pool + (size_t) x * blob);
+            grp_start[g] = pos;
+            pos += cnt[x];
+            ++g;
+        }
+        grp_start[g] = pos;
+        *n_groups = g;
+        for (int e = 0; e < n_ent; ++e) {
+            const int p = off[ids[e]]++;
+            ent_dst[p] = e;
+            ent_tok[p] = e / K_;
+        }
+    }
+}
 /// The peer's rows into the host rows: the entries it computed.  `peer_row[e]` is the entry's row in the peer's
 /// OWN output (-1: the peer did not compute it).  The rows go where the CPU pool's rows go, so the merge that
 /// follows takes them like the CPU's.  grid (n_ent), block 256.
@@ -514,14 +637,22 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
 }
 /// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
 /// [kvh][P][HD] halves.  grid1(HKV * P * HD).
-__global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
+template <class KV>
+__global__ void k_kv_f16(const KV* kc, const KV* vc, const __half* ksc, const __half* vsc, __half* k16, __half* v16,
+                         int ctx, int P, int HD, int HKV) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) HKV * P * HD) return;
     const int64_t per = (int64_t) P * HD;
     const int64_t kvh = i / per, rest = i % per;
     const size_t src = (size_t) kvh * ctx * HD + rest;
-    k16[i] = __float2half(kc[src]);
-    v16[i] = __float2half(vc[src]);
+    if (ksc) {   // --kv int8: the FP16 GEMM operands are the cache's rows back in their own block's scale (they are rounded)
+        const size_t sc_ = ((size_t) kvh * ctx + (size_t) (rest / HD)) * kKvBlocks + (size_t) (rest % HD) / kKvBlock;
+        k16[i] = __float2half((float) kc[src] * __half2float(ksc[sc_]));
+        v16[i] = __float2half((float) vc[src] * __half2float(vsc[sc_]));
+        return;
+    }
+    k16[i] = __float2half(kv_ld(kc[src]));
+    v16[i] = __float2half(kv_ld(vc[src]));
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -950,7 +1081,14 @@ struct Layer {
     // the GGUF's expert tensors (the mapped file stays open): place_experts builds the blobs from them
     const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
     size_t src_gsz = 0, src_dsz = 0;
-    uint8_t* hblobs = nullptr;  // hybrid mode: every expert's blob in host memory, `stride` apart
+    uint8_t* hblobs = nullptr;  // hybrid mode: the host copy of the experts [h_first, h_first + h_resident), `stride` apart
+    int h_first = 0;            // the first of them: the experts WITHOUT a VRAM slot (the pooled ones), not the slots'
+    int h_resident = 0;         // how many of them are in it (--resident-budget-gib; the others are read in place)
+    /// Is this expert of the host copy?  (The pinned arena holds the pooled experts: the ones the GPU does not
+    /// hold, so a slot's fill never reads it and the prompt's stream takes the pool from RAM, not from the file.)
+    bool host_has(int64_t e) const { return hblobs && e >= h_first && e < (int64_t) h_first + h_resident; }
+    const uint8_t* host_blob(int64_t e) const { return hblobs + (size_t) (e - h_first) * stride; }
+    uint8_t* host_blob(int64_t e) { return hblobs + (size_t) (e - h_first) * stride; }
     uint8_t* peer_blobs = nullptr;   // the peer's slots (the experts the primary does not hold), on its card
     int n_slots = 0;            // hybrid mode: the experts resident in VRAM
 };
@@ -1339,6 +1477,11 @@ struct Engine {
             return m->layers2[(size_t) (l - split_layer)];
         return m->layers[l];
     }
+    Layer& layer_of(size_t l) {
+        if (split_dev >= 0 && (int) l >= split_layer && (size_t) (l - split_layer) < m->layers2.size())
+            return const_cast<Layer&>(m->layers2[(size_t) (l - split_layer)]);
+        return const_cast<Layer&>(m->layers[l]);
+    }
     /// The head (the output matrix) on the card that reads it.
     const Mat& head_mat() const {
         if (split_dev >= 0 && split_layer < (int) m->layers.size() && m->head2.d) return m->head2;
@@ -1375,7 +1518,9 @@ struct Engine {
         load_set(k);
     }
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
-    std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
+    std::vector<float*> conv, S;   // per layer; the MTP block's at index n_layers: the CURRENT session's (select)
+    std::vector<void*> kc, vc;     // the same indices: the K / V cache (float, __half or int8: --kv)
+    std::vector<__half*> ksc, vsc;  // the same indices: their scales, one per cell, KV head and block (--kv int8 only, else null)
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1418,7 +1563,9 @@ struct Engine {
     // recurrent state and KV cache, so N requests run at once: their rows share one decode window (forward_rows).  The
     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
     struct Sess {
-        std::vector<float*> conv, S, kc, vc;
+        std::vector<float*> conv, S;
+        std::vector<void*> kc, vc;
+        std::vector<__half*> ksc, vsc;
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -1431,7 +1578,9 @@ struct Engine {
     int n_sess = 1, cur = 0;
     uint64_t use_clock = 0;
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
-    float **d_conv_tab = nullptr, **d_S_tab = nullptr, **d_kc_tab = nullptr, **d_vc_tab = nullptr;
+    float **d_conv_tab = nullptr, **d_S_tab = nullptr;
+    void **d_kc_tab = nullptr, **d_vc_tab = nullptr;
+    __half **d_ksc_tab = nullptr, **d_vsc_tab = nullptr;
     int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
     // the GDN layers run a slot's rows in sequence: per group (a slot) its session, its first row and its row count
     int32_t *d_gslot = nullptr, *d_grow0 = nullptr, *d_gcnt = nullptr;
@@ -1447,6 +1596,15 @@ struct Engine {
     // byte distances to the up and down tensors).  On a 64 GB box the copy of a 49 GB model does not fit
     // beside the file: the placement then ran at 39-52 MB/s and the box thrashed (3.5 GB of swap).
     bool low_ram = false;
+    // --kv: the K / V cache's element.  FP32 by default (byte-identical to the engine before the flag), FP16 at half the
+    // VRAM, INT8 at a quarter of it (one float scale per cell, per KV head and per block of kKvBlock dims, written with
+    // the row: 8 MiB a layer at 64K).  A rounded cache: the values are O(1 .. 50) and every sum stays in FP32 (the
+    // split-K kernel and the FP16 GEMMs both accumulate there).
+    enum KvMode { KV_F32 = 0, KV_F16 = 1, KV_I8 = 2 };
+    KvMode kv_mode = KV_F32;
+    /// The cache's element size in bytes (a session's K or V, one cell, one head).
+    size_t kv_esz() const { return kv_mode == KV_I8 ? 1 : (kv_mode == KV_F16 ? 2 : 4); }
+    const char* kv_word() const { return kv_mode == KV_I8 ? "INT8" : (kv_mode == KV_F16 ? "FP16" : "FP32"); }
     FILE* dump_layers = nullptr;      // the layer outputs, like q36ref's: [pos][layer][n_embd] f32
     std::vector<float> dump_row;
     // The repack buffers: one expert's blob, for the GPU's copy out of the mapping.  ONE PER STREAM: the copy
@@ -1508,6 +1666,7 @@ struct Engine {
     long long hy_peer = 0;
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
+    bool stream_native = false;   // native (IQ1_M) prompt path streams the pool's experts to the GPU (opt-in kill switch STRATA_M2_NO_STREAM_NATIVE when !use_mmq)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
     bool lhy(size_t li) const {
@@ -1525,9 +1684,27 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     // the activations are ready: recorded after the quantization, so the peer copies them whole
     cudaEvent_t ev_xq = nullptr;
+    // The streaming buffers come in one pair PER CARD (the layer split): the kernels that read a layer's streamed
+    // experts run on that layer's own card, and a kernel cannot read the other card's memory -- it faults with
+    // "page not present" at the first row it touches.  Card 0's pair is stage / ev_copy / ev_used, card 1's stage2...
+    // In the DEFAULT mode the pair is PINNED HOST memory (stream_vram == false): the pool's experts are repacked
+    // there and the GPU reads them over PCIe, so the streaming costs no VRAM and the slots keep theirs (the decode's
+    // speed).  STRATA_M2_STREAM_VRAM=1 brings back the VRAM pair (one per card, 2 x the layer per card).
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
+    uint8_t* stage2[2] = {};
+    cudaStream_t cst2 = nullptr;
+    cudaEvent_t ev_copy2[2] = {}, ev_used2[2] = {};
+    bool stream_vram = false;
+    /// The card a layer's kernels run on (the layer split).
+    int card_of(int li) const { return split_dev >= 0 && li >= split_layer ? split_dev : 0; }
+    bool on_card2(int d) const { return split_dev > 0 && d == split_dev; }
+    bool vram_stage(int d) const { return stream_vram && on_card2(d); }
+    cudaStream_t cst_of(int d) const { return vram_stage(d) ? cst2 : cst; }
+    uint8_t* stage_of(int d, int b) const { return vram_stage(d) ? stage2[b] : stage[b]; }
+    cudaEvent_t ev_copy_of(int d, int b) const { return vram_stage(d) ? ev_copy2[b] : ev_copy[b]; }
+    cudaEvent_t ev_used_of(int d, int b) const { return on_card2(d) ? ev_used2[b] : ev_used[b]; }
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
@@ -1553,9 +1730,23 @@ struct Engine {
         }
     }
 
+    /// A session's K or V cache for this context, zeroed: FP32, FP16 (--kv f16) or INT8 (--kv int8).  INT8 needs one
+    /// float scale per cell, per KV head and per block of kKvBlock dims, written with the row (8 MiB a layer at 64K):
+    /// `scales` takes it, and is left null for the other two.
+    void* kv_alloc(__half** scales) const {
+        const size_t n = (size_t) m->g.n_head_kv * ctx * m->g.head_dim;
+        *scales = nullptr;
+        if (kv_mode == KV_I8) {
+            *scales = dalloc_t<__half>((size_t) m->g.n_head_kv * ctx * kKvBlocks);
+            return (void*) dalloc_t<int8_t>(n);
+        }
+        return kv_mode == KV_F16 ? (void*) dalloc_t<__half>(n) : (void*) dalloc(n);
+    }
+
     void alloc_session(Sess& ss) const {
         const auto& g = m->g;
         const size_t C = (size_t) g.ssm_conv_channels;
+        __half *sk = nullptr, *sv = nullptr;
         int sess_dev = 0;   // the card the layer's K / V are on (the layer split)
         for (size_t li = 0; li < m->layers.size(); ++li) {
             const Layer& L = m->layers[li];
@@ -1571,20 +1762,26 @@ struct Engine {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                ss.kc.push_back(kv_alloc(&sk));
+                ss.vc.push_back(kv_alloc(&sv));
+                ss.ksc.push_back(sk);
+                ss.vsc.push_back(sv);
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
                 ss.kc.push_back(nullptr);
                 ss.vc.push_back(nullptr);
+                ss.ksc.push_back(nullptr);
+                ss.vsc.push_back(nullptr);
             }
         }
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            ss.kc.push_back(kv_alloc(&sk));
+            ss.vc.push_back(kv_alloc(&sv));
+            ss.ksc.push_back(sk);
+            ss.vsc.push_back(sv);
         }
         if (split_dev >= 0) {   // the session's hlast is on the first card (the layer split)
             CK(cudaSetDevice(0));
@@ -1602,7 +1799,7 @@ struct Engine {
     }
     void load_cur() {
         Sess& ss = sess[(size_t) cur];
-        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
+        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc; ksc = ss.ksc; vsc = ss.vsc;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -1617,6 +1814,15 @@ struct Engine {
         CK(cudaStreamSynchronize(st));   // (the pinned word is reused)
     }
 
+    /// The K / V cache's element type, for a call site: the attention kernels are templates on it.  `f` receives an
+    /// element pointer (whose pointee is only read as a type: the three are float, __half and int8_t).
+    template <class F>
+    void kv_visit(F&& f) const {
+        if (kv_mode == KV_I8) f((int8_t*) nullptr);
+        else if (kv_mode == KV_F16) f((__half*) nullptr);
+        else f((float*) nullptr);
+    }
+
     void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
         ctx = ctx_;
@@ -1624,6 +1830,40 @@ struct Engine {
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
+        // The layer split: each card holds the K / V cache of the layers it runs, so a context that two 16 GB cards
+        // cannot hold (a 64K one: 31 layers x 512 MiB = 15.5 GiB per card, beside 2.5 GiB of weights) is said here with
+        // the numbers, before anything is allocated - the split had no such check and died in a bare cudaMalloc.
+        if (split_dev >= 0) {
+            const size_t esz = kv_esz();
+            const size_t kv_layer = (size_t) g.n_head_kv * (size_t) (g.head_dim * 2 * esz +
+                                     (kv_mode == KV_I8 ? kKvBlocks * 2 * 4 : 0)) * (size_t) ctx;   // K and V, per layer
+            const size_t on0 = (size_t) std::min<int64_t>((int64_t) split_layer, (int64_t) g.n_layers);
+            const size_t n_kv[2] = {on0, (size_t) g.n_layers - on0 + (m->has_mtp ? 1 : 0)};
+            for (int d = 0; d < 2; ++d) {
+                CK(cudaSetDevice(d));
+                CK(cudaGetLastError());
+                size_t f = 0, t = 0;
+                CK(cudaMemGetInfo(&f, &t));
+                CK(cudaGetLastError());
+                const size_t margin = (size_t) 1536 << 20;   // the engine's buffers (chunk 512 .. 4096, the scores)
+                const size_t need = n_kv[d] * kv_layer;
+                if (need + margin > f) {
+                    const size_t room = f > margin ? f - margin : 0;
+                    const long long most = n_kv[d] ? (long long) ((double) room / (double) (n_kv[d] * kv_layer) *
+                                                                   (double) ctx) / 1024 * 1024
+                                                   : 0;
+                    std::fprintf(stderr, "strata-m2: not enough VRAM on card %d for a context of %d: the K / V cache of "
+                                 "its %zu layers needs %.2f GiB (%s) and %.2f GiB are free after the weights, less "
+                                 "%.2f GiB for the engine's buffers: use a shorter --max-context (at most about %lld on "
+                                 "this card), --kv f16 (half of it) or --kv int8 (a quarter)\n", d, ctx, n_kv[d],
+                                 (double) need / (1 << 30), kv_word(), (double) f / (1 << 30),
+                                 (double) margin / (1 << 30), most);
+                    std::exit(1);
+                }
+            }
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
+        }
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         // The cards' buffers: the same set, once per card (the layer split).  The stream and the events go
@@ -1699,6 +1939,8 @@ struct Engine {
             };
             for (const Layer& L : m->layers) use_mmq = use_mmq && mmq_ok(L);
             if (m->has_mtp) use_mmq = use_mmq && mmq_ok(m->mtp);
+            stream_native = !use_mmq && std::getenv("STRATA_M2_NO_STREAM_NATIVE") == nullptr;
+            stream_vram = std::getenv("STRATA_M2_STREAM_VRAM") != nullptr;
             if (use_mmq) {
                 const int64_t ne = (int64_t) T * Kp;
                 mctx = std::make_unique<MMQ::Context>();
@@ -1775,7 +2017,9 @@ struct Engine {
                 // the MTP block, and its recurrent state)
                 size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
                 for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-                const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
+                const size_t esz = kv_esz();   // --kv f16 / int8: the sessions' K / V in half / a quarter of the bytes
+                const size_t scale1 = kv_mode == KV_I8 ? (size_t) g.n_head_kv * ctx * kKvBlocks * 4 * 2 : 0;   // their scales (K and V)
+                const size_t per = ((size_t) (g.n_head_kv * g.head_dim * 2 * esz) * (size_t) ctx + scale1) * n_attn +
                                    (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
                 size_t fr0 = 0, tot0 = 0;
                 CK(cudaMemGetInfo(&fr0, &tot0));
@@ -1797,9 +2041,9 @@ struct Engine {
                     const size_t room = fr0 > margin1 ? fr0 - margin1 : 0;
                     const long long most = (long long) ((double) ctx * (double) room / (double) per) / 1024 * 1024;
                     std::fprintf(stderr, "strata-m2: not enough VRAM for a context of %d: its K / V cache needs %.2f GiB "
-                                 "(fp32), %.2f GiB free after the weights and the buffers: use a shorter --max-context "
+                                 "(%s), %.2f GiB free after the weights and the buffers: use a shorter --max-context "
                                  "(at most about %lld on this card)\n", ctx, (double) per / (1 << 30),
-                                 (double) fr0 / (1 << 30), most);
+                                 kv_word(), (double) fr0 / (1 << 30), most);
                     std::exit(1);
                 }
             }
@@ -1809,7 +2053,8 @@ struct Engine {
             if (card == 0) for (Sess& ss : sess) alloc_session(ss);
             if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
                 const size_t ns = sess[0].conv.size();
-                std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
+                std::vector<float*> hc(ns * (size_t) n_sess), hs(hc);
+                std::vector<void*> hk(ns * (size_t) n_sess), hv(ns * (size_t) n_sess);
                 for (size_t li = 0; li < ns; ++li)
                     for (int s_ = 0; s_ < n_sess; ++s_) {
                         hc[li * n_sess + s_] = sess[(size_t) s_].conv[li];
@@ -1817,9 +2062,26 @@ struct Engine {
                         hk[li * n_sess + s_] = sess[(size_t) s_].kc[li];
                         hv[li * n_sess + s_] = sess[(size_t) s_].vc[li];
                     }
-                const std::pair<float***, std::vector<float*>*> tabs[4] = {{&d_conv_tab, &hc}, {&d_S_tab, &hs},
-                                                                              {&d_kc_tab, &hk}, {&d_vc_tab, &hv}};
+                const std::pair<float***, std::vector<float*>*> tabs[2] = {{&d_conv_tab, &hc}, {&d_S_tab, &hs}};
                 for (const auto& tb : tabs) {
+                    CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(float*)));
+                    CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
+                                  cudaMemcpyHostToDevice));
+                }
+                const std::pair<void***, std::vector<void*>*> tabs_kv[2] = {{&d_kc_tab, &hk}, {&d_vc_tab, &hv}};
+                for (const auto& tb : tabs_kv) {
+                    CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(void*)));
+                    CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(void*),
+                                  cudaMemcpyHostToDevice));
+                }
+                std::vector<__half*> hks(ns * (size_t) n_sess, nullptr), hvs(hks);
+                for (size_t li = 0; li < ns; ++li)
+                    for (int s_ = 0; s_ < n_sess; ++s_) {
+                        hks[li * n_sess + s_] = sess[(size_t) s_].ksc[li];
+                        hvs[li * n_sess + s_] = sess[(size_t) s_].vsc[li];
+                    }
+                const std::pair<__half***, std::vector<__half*>*> tabs_ks[2] = {{&d_ksc_tab, &hks}, {&d_vsc_tab, &hvs}};
+                for (const auto& tb : tabs_ks) {   // --kv int8: the rows' scales, one array per layer and session
                     CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(float*)));
                     CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
                                   cudaMemcpyHostToDevice));
@@ -1853,8 +2115,8 @@ struct Engine {
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-m2: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
-                     m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+        std::fprintf(stderr, "strata-m2: context %d cells, prompt chunk %d%s, K / V in %s, %.2f GiB of VRAM free\n", ctx, tmax,
+                     m->has_mtp ? ", MTP block loaded" : "", kv_word(), (double) fr / (1 << 30));
     }
 
     /// The recurrent state and the cache to a fresh sequence.
@@ -1883,8 +2145,9 @@ struct Engine {
                 CK(cudaGetLastError());
             }
             cudaStream_t ks = on2 ? set[1].st : st;
-            if (kc[l]) CK(cudaMemsetAsync(kc[l], 0, (size_t) g.n_head_kv * ctx * g.head_dim * 4, ks));
-            if (vc[l]) CK(cudaMemsetAsync(vc[l], 0, (size_t) g.n_head_kv * ctx * g.head_dim * 4, ks));
+            const size_t kvb = (size_t) g.n_head_kv * ctx * g.head_dim * kv_esz();
+            if (kc[l]) CK(cudaMemsetAsync(kc[l], 0, kvb, ks));   // an INT8 cell's stale scale is harmless beside a zeroed row
+            if (vc[l]) CK(cudaMemsetAsync(vc[l], 0, kvb, ks));
             if (on2) {
                 CK(cudaSetDevice(0));
                 CK(cudaGetLastError());
@@ -2264,7 +2527,7 @@ struct Engine {
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
-    void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
+    void layer(Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
                const float* wn, float* hout) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
@@ -2324,6 +2587,10 @@ struct Engine {
                 rs.delta = d_rdelta;
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
+                if (kv_mode == KV_I8) {   // the rows' scales (INT8 only: the tables are never built otherwise)
+                    rs.ks = d_ksc_tab + li * n_sess;
+                    rs.vs = d_vsc_tab + li * n_sess;
+                }
             }
             if (split_dev >= 0 && (int) li >= split_layer && getenv("STRATA_M2_PEER_DEBUG")) {
                 static bool once = false;
@@ -2340,9 +2607,13 @@ struct Engine {
                                  dev_of(vx), (const void*) q, dev_of(q));
                 }
             }
-            k_attn_prep_m2<<<T, kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, rows_mode ? nullptr : kc[li],
-                                                     rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                                                     m->rope_base, m->eps, d_delta, mtab_now, rs);
+            kv_visit([&](auto pkv) {
+                using KV = std::remove_pointer_t<decltype(pkv)>;
+                k_attn_prep_m2<KV><<<T, kThreads, kv_mode == KV_I8 ? 2 * HKV * HD * 4 : 0, st>>>(
+                    qg, kx, vx, L.q_norm, L.k_norm, q, rows_mode ? nullptr : (KV*) kc[li],
+                    rows_mode ? nullptr : (KV*) vc[li], rows_mode ? nullptr : ksc[li], rows_mode ? nullptr : vsc[li],
+                    H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps, d_delta, mtab_now, rs);
+            });
             if (T > kGemmT && att_gemm[cur_set]) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2352,7 +2623,11 @@ struct Engine {
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                kv_visit([&](auto pkv) {
+                    using KV = std::remove_pointer_t<decltype(pkv)>;
+                    k_kv_f16<KV><<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(
+                        (const KV*) kc[li], (const KV*) vc[li], ksc[li], vsc[li], k16, v16, ctx, P, HD, HKV);
+                });
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
@@ -2392,9 +2667,13 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<kHD><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
-                                                                    rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                    kv_visit([&](auto pkv) {
+                        using KV = std::remove_pointer_t<decltype(pkv)>;
+                        k_attn_part<kHD, KV><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(
+                            q, rows_mode ? nullptr : (const KV*) kc[li], rows_mode ? nullptr : (const KV*) vc[li],
+                            rows_mode ? nullptr : ksc[li], rows_mode ? nullptr : vsc[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                    });
                     k_attn_merge<kHD><<<nt * H, HD, 0, st>>>(pacc, pm, pl, dpos, t0, H, n_chunk, att, rs);
                 }
             }
@@ -2412,6 +2691,9 @@ struct Engine {
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
+        const bool native_stream_rows = !hy_rows && T > kGemmT && stream_native;
+        // Native streaming: handled in the else branch below (k_group uses the streamed buffer directly).
+        (void) native_stream_rows;
         // The routing: MiniMax-M2's SIGMOID gate with its per-expert selection bias.  The fast path (the
         // decode's eight tokens at a time) groups the picks as it goes; a prompt of any length goes through
         // the generic kernel, which does the same arithmetic.  The softmax router would pick OTHER experts.
@@ -2496,13 +2778,28 @@ struct Engine {
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
-            if (lhy(li)) stream_done();
+            if (lhy(li)) stream_done((int) li);
             prow = rinv;
         } else {
-            group_entries(L, nullptr, T);
-            if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
-            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                                     std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+            if (native_stream_rows) {
+                const int ne = (int) g.n_expert;
+                const uint8_t* wb = stream_take((int) li);
+                if (stream_vram)   // every expert of the layer sits in the streamed buffer
+                    k_group<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, ne, wb, L.stride, grp_ptr, grp_start, n_groups,
+                                                    ent_dst, ent_tok);
+                else   // the slots from their VRAM blob, the pool's experts from the pinned host buffer
+                    k_group_pool<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, ne, hy[li].slot_of_d, L.blobs, L.stride, wb,
+                                                         grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+                if (!xq_post) quant(h, N, T, xq);
+                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                         std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                if (lhy(li)) stream_done((int) li);
+            } else {
+                group_entries(L, nullptr, T);
+                if (!xq_post) quant(h, N, T, xq);
+                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                         std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+            }
         }
         // MiniMax-M2 has NO shared expert: nothing beside the routed experts' parts.
         if (hy_rows) {
@@ -2559,7 +2856,7 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_mmq) {
+        if (main_hybrid && T > hybrid_t && (use_mmq || stream_native)) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
@@ -2623,7 +2920,7 @@ struct Engine {
             }
             const bool last = l + 1 == m->layers.size();
             const bool on2 = split_dev >= 0 && (int) l >= split_layer;   // the second card's layers
-            const Layer& L = layer_of(l);
+            Layer& L = layer_of(l);
             // the next layer's norm: the primary's copy for its own layers (the boundary one is copied there),
             // the second card's copy for the second card's layers
             const float* wn = last ? (on2 ? m->out_norm2 : m->out_norm)
@@ -2709,14 +3006,14 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && (use_mmq || stream_native)) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
         k_rms_ld<<<T, kThreads, 0, st>>>(seeds, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);      // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
-        layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
+        layer(const_cast<Layer&>(m->mtp), m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
         if (draft) head_draft(hmtp + (size_t) (T - 1) * N);
     }
 
@@ -2745,55 +3042,73 @@ struct Engine {
     }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
         const int b = i % 2;
-        const Layer& L = layer_of((size_t) stream_seq[(size_t) i]);   // the layer's own card (the layer split)
-        CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
+        const int li = stream_seq[(size_t) i];
+        const Layer& L = layer_of((size_t) li);   // the layer's own card (the layer split)
+        const int ne = (int) m->g.n_expert;
+        const Hy& H = hy[(size_t) li];
+        if (!stream_vram) {
+            // The pool's experts into the pinned host buffer: the CPU repacks them (the mapping, straight from the
+            // file) and the GPU reads them over PCIe.  The experts with a slot are NOT copied -- the grouping points
+            // at their VRAM blob -- so the traffic is the pool's share of a layer, not the whole layer.
+            CK(cudaEventSynchronize(ev_used[b]));   // the buffer's last reader on card 0 is done
+            if (split_dev > 0) CK(cudaEventSynchronize(ev_used2[b]));   // ... and on card 1 (the pair is shared)
+            uint8_t* dst = stage[b];
+            for (int x = 0; x < ne; ++x) {
+                if (H.slot_of[(size_t) x] >= 0) continue;   // read from its VRAM slot: nothing to stream
+                if (L.host_has(x))   // --resident-budget-gib: it is already pinned, take it there
+                    std::memcpy(dst + (size_t) x * L.stride, L.host_blob(x), (size_t) L.L.bytes);
+                else
+                    expert_blob(L, x, dst + (size_t) x * L.stride);
+            }
+            return;
+        }
+        // The copies go to the LAYER's card, on its own copy stream: a kernel of card 1 reading card 0's staging
+        // faults (page not present).  The caller's current device is restored on the way out.
+        const int d = card_of(li);
+        int prev = 0;
+        CK(cudaGetDevice(&prev));
+        if (prev != d) { CK(cudaSetDevice(d)); CK(cudaGetLastError()); }
+        cudaStream_t cs = cst_of(d);
+        uint8_t* dst = stage_of(d, b);
+        CK(cudaStreamWaitEvent(cs, ev_used_of(d, b), 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
         // of consecutive experts from the same source in one copy each.  STRATA_Q36_STREAM_ALL=1: the whole layer from
         // host memory (the first version: PCIe-bound)
         static const bool all = std::getenv("STRATA_Q36_STREAM_ALL") != nullptr;
-        const int ne = (int) m->g.n_expert;
-        const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
-        if (!L.hblobs) {
-            // the low-RAM mode: the experts are read where they lie, so each one is repacked out of the
-            // mapping into the host buffer and copied on its own (the staging buffer wants the native
-            // [gate | up | down] layout, which the mapping does not have).
-            for (int x = 0; x < ne; ++x) {
-                const bool dev = H.slot_of[(size_t) x] >= 0;
-                if (dev) {
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
-                                       L.L.bytes, cudaMemcpyDeviceToDevice, cst));
-                } else {
-                    // the host buffer stays in use until the copy has taken it: wait for the stream before
-                    // filling it again
-                    CK(cudaStreamSynchronize(cst));
-                    expert_blob(L, x, repack_pf.data());
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, repack_pf.data(), L.L.bytes, cudaMemcpyHostToDevice,
-                                       cst));
-                }
-            }
-        } else if (all || 2 * L.n_slots < ne) {
-            CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+        if (L.hblobs && L.h_first == 0 && L.h_resident >= ne && (all || 2 * L.n_slots < ne)) {
+            CK(cudaMemcpyAsync(dst, L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cs));
         } else {
+            // the expert's source: its VRAM slot, the host copy (--resident-budget-gib), or the mapping - which needs
+            // each expert repacked on its own (the staging buffer wants the native [gate | up | down] layout)
             for (int x = 0; x < ne;) {
                 const bool dev = H.slot_of[(size_t) x] >= 0;
+                const bool res = !dev && L.host_has(x);
                 int y = x + 1;
                 if (dev)   // consecutive slots holding consecutive experts
                     while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
-                else
-                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
-                const size_t n = (size_t) (y - x) * L.stride;
-                if (dev)
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
-                                       n, cudaMemcpyDeviceToDevice, cst));
-                else
-                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.hblobs + (size_t) x * L.stride, n,
-                                       cudaMemcpyHostToDevice, cst));
+                else if (res)   // consecutive resident experts: one run of the arena
+                    while (y < ne && H.slot_of[(size_t) y] < 0 && L.host_has(y)) ++y;
+                if (dev) {
+                    CK(cudaMemcpyAsync(dst + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
+                                       (size_t) (y - x) * L.stride, cudaMemcpyDeviceToDevice, cs));
+                } else if (res) {
+                    CK(cudaMemcpyAsync(dst + (size_t) x * L.stride, L.host_blob(x),
+                                       (size_t) (y - x) * L.stride, cudaMemcpyHostToDevice, cs));
+                } else {
+                    // the host buffer stays in use until the copy has taken it: wait for the stream before
+                    // filling it again
+                    CK(cudaStreamSynchronize(cs));
+                    expert_blob(L, x, repack_pf.data());
+                    CK(cudaMemcpyAsync(dst + (size_t) x * L.stride, repack_pf.data(), L.L.bytes, cudaMemcpyHostToDevice,
+                                       cs));
+                }
                 x = y;
             }
         }
-        CK(cudaEventRecord(ev_copy[b], cst));
+        CK(cudaEventRecord(ev_copy_of(d, b), cs));
+        if (prev != d) { CK(cudaSetDevice(prev)); CK(cudaGetLastError()); }
     }
     const uint8_t* stream_take(int li) {
         if (stream_pos >= (int) stream_seq.size() || stream_seq[(size_t) stream_pos] != li) {
@@ -2801,12 +3116,13 @@ struct Engine {
             std::exit(1);
         }
         const int b = stream_pos % 2;
-        CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
-        return stage[b];
+        const int d = card_of(li);
+        if (stream_vram) CK(cudaStreamWaitEvent(st, ev_copy_of(d, b), 0));   // host mode: the fill is the CPU's
+        return stage_of(d, b);
     }
-    void stream_done() {
+    void stream_done(int li) {
         const int b = stream_pos % 2;
-        CK(cudaEventRecord(ev_used[b], st));
+        CK(cudaEventRecord(ev_used_of(card_of(li), b), st));
         if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
         ++stream_pos;
     }
@@ -2829,21 +3145,32 @@ struct Engine {
     /// The peer groups them with its own slot table, computes their rows with the same kernels as the primary
     /// (so the rows are bit-identical), and writes them into the same pinned host rows the CPU pool writes.
     void moe_hybrid_peer(size_t li, int T) {
-        if (peer_device < 0 || peer_hy.empty()) return;
+        if (peer_device < 0 || li >= peer_hy.size()) return;
+        // a layer the peer had no room for: it holds none of it (the table was never built, its experts are on the
+        // CPU pool), so there is nothing to group, compute or wait for on that card
+        if (peer_hy[li].slot_of_d == nullptr) return;
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int n_ent = T * Kp;
         const Layer& L = layer_of((size_t) li);   // the layer's own copy (the layer split)
         PeerHy& P = peer_hy[li];
+        // The card the layer's buffers (ids, xq) are on: 0, or the split's card.  With the peer on that same card
+        // (--layer-split N --peer-device <split card>) the two copies below are a plain copy on its own stream.
+        const int src_dev = card_of((int) li);
         // The peer's stream waits for the routing (the ids) and for the activations.  EVERY call on the peer's
         // stream needs the PEER's device current: HIP refuses a launch on a stream that belongs to another device.
         // The ids and the activations, copied to the peer's card.  The copy is issued with the SOURCE's device
         // current and on the source's stream: a peer copy reads the source in the SOURCE's address space, and
         // with the peer's device current it would read the peer's memory at that address (garbage).
-        CK(cudaSetDevice(0));
+        CK(cudaSetDevice(src_dev));
         CK(cudaGetLastError());
-        CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, 0, (size_t) n_ent * 4, st));
-        CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, 0, K::native_q8_1_bytes(N, 1) * (size_t) T, st));
+        if (src_dev == peer_device) {
+            CK(cudaMemcpyAsync(peer_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(peer_xq, xq, K::native_q8_1_bytes(N, 1) * (size_t) T, cudaMemcpyDeviceToDevice, st));
+        } else {
+            CK(cudaMemcpyPeerAsync(peer_ids, peer_device, ids, src_dev, (size_t) n_ent * 4, st));
+            CK(cudaMemcpyPeerAsync(peer_xq, peer_device, xq, src_dev, K::native_q8_1_bytes(N, 1) * (size_t) T, st));
+        }
         CK(cudaEventRecord(ev_xq, st));   // the copies are done (and the quantization was before them)
         if (getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the activations, byte for byte
             std::vector<uint8_t> a((size_t) K::native_q8_1_bytes(N, 1) * (size_t) T), b(a.size());
@@ -2900,11 +3227,12 @@ struct Engine {
             std::fflush(stderr);
         }
         CK(cudaEventRecord(peer_done, peer_st));
-        CK(cudaSetDevice(0));
+        // back to the card the layer runs on: the merge and the rest of the layer launch on ITS stream, and a
+        // kernel launched on another device's stream fails with "invalid resource handle"
+        CK(cudaSetDevice(src_dev));
         CK(cudaGetLastError());
         // the primary waits for the peer's rows before the merge reads them
         CK(cudaStreamWaitEvent(st, peer_done, 0));
-        hy_peer += n_ent;
     }
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
@@ -2926,8 +3254,13 @@ struct Engine {
         // would move the vector and leave the jobs already created pointing at freed memory.
         if (zc_fmt.size() < (size_t) n_ent) zc_fmt.resize((size_t) n_ent);
         std::vector<char> quantized((size_t) T, 0);
-        int n_miss = 0;
+        int n_miss = 0;   // the entries the primary's GPU does not compute (the CPU pool's and the peer's)
+        int n_pool = 0;   // ... and of those, the ones this pool computes
+        int n_peer = 0;   // ... and the ones the second card computes
         std::map<int, size_t> open;   // expert -> its job with room
+        // The second card's table: the entries it computes are not this pool's.  Its kernels write their rows into
+        // the same pinned host buffer (cpu_out is the peer's output too), and the merge below takes them because
+        // h_miss says the primary's GPU did not compute the entry.
         const std::vector<int32_t>* peer_slots =
             (peer_device >= 0 && li < peer_hy.size()) ? &peer_hy[li].slot_of : nullptr;
         const bool defer = rows_deferred && li < m->layers.size();
@@ -2940,10 +3273,13 @@ struct Engine {
             if (!defer) H.score[(size_t) x] += 1.0;
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
-            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
-            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
-            // the peer computes this entry (its rows are in the same host rows, and the merge takes them)
             ++n_miss;
+            // the second card computes this entry: a job here would compute it a second time, into the same row
+            if (peer_slots && (size_t) x < peer_slots->size() && (*peer_slots)[(size_t) x] >= 0) {
+                ++n_peer;
+                continue;
+            }
+            ++n_pool;
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
@@ -2952,8 +3288,8 @@ struct Engine {
             auto it = open.find(x);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
-                if (L.hblobs) {
-                    j.blob = L.hblobs + (size_t) x * L.stride;
+                if (L.host_has(x)) {
+                    j.blob = L.host_blob(x);
                     j.fmt = nullptr;
                 } else {
                     // the GGUF read in place: the blob is the expert's gate rows, and its up and down rows
@@ -2978,11 +3314,14 @@ struct Engine {
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }
-        hy_cpu += n_miss;
+        hy_cpu += n_pool;
+        hy_peer += n_peer;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
-        pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
-        hy_cpu_ms += ms_since(t0);
+        if (n_pool > 0) {
+            pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+            hy_cpu_ms += ms_since(t0);
+        }
         {   // DIAG: the host rows (the CPU pool's and the peer's), before they are merged
             const char* lay = std::getenv("STRATA_M2_DUMP_ROWS");
             if (lay && (int) li == std::atoi(lay)) {
@@ -3068,8 +3407,8 @@ struct Engine {
                     H.slot_of[(size_t) y] = -1;
                     H.slot_of[(size_t) x] = s;
                     H.exp_in_slot[(size_t) s] = x;
-                    if (L.hblobs) {
-                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
+                    if (L.host_has(x)) {
+                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.host_blob(x), L.L.bytes,
                                            cudaMemcpyHostToDevice, st));
                     } else {
                         // the low-RAM mode: the expert is repacked out of the mapping first
@@ -3376,7 +3715,7 @@ struct Engine {
             k_rms_ld<<<T, kThreads, 0, st>>>(mtp_seed(), N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);   // [... | h]
             mm(m->eh_proj, mtp_cat, x, T);
             k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
-            layer(m->mtp, m->layers.size(), T, pmax, pos0_m, use_graph, false, m->mtp_shnorm, hmtp);
+            layer(const_cast<Layer&>(m->mtp), m->layers.size(), T, pmax, pos0_m, use_graph, false, m->mtp_shnorm, hmtp);
             mm(m->head, hmtp, logits_mr, T);
             k_argmax<<<dim3(kArgBlocks, T), kThreads, 0, st>>>(logits_mr, (int) g.n_vocab, pick_mr, amv, ami, false);
             k_argmax<<<dim3(1, T), kThreads, 0, st>>>(logits_mr, kArgBlocks, pick_mr, amv, ami, true);
@@ -3403,7 +3742,10 @@ struct Engine {
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * 4;
+        const size_t esz = kv_esz();
+        const size_t row = (size_t) ctx * g.head_dim * esz;
+        const size_t srow = (size_t) ctx * 4 * kKvBlocks;   // --kv int8: one float per cell, per head and per block, the
+                                                            // same row layout
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
@@ -3411,10 +3753,16 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
-                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * 4, (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * esz,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * esz,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                if (a.ksc[l]) {   // INT8: the rows' scales, one per cell, head and block
+                    CK(cudaMemcpy2DAsync(b.ksc[l], srow, a.ksc[l], srow, (size_t) a.pos * 4 * kKvBlocks,
+                                         (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                    CK(cudaMemcpy2DAsync(b.vsc[l], srow, a.vsc[l], srow, (size_t) a.pos * 4 * kKvBlocks,
+                                         (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                }
             }
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
@@ -3519,6 +3867,7 @@ struct Engine {
         warming = false;
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
+        hy_peer = 0;
         hy_cpu_ms = 0;
         reset();
         std::fprintf(stderr, "strata-m2: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
@@ -3539,9 +3888,11 @@ struct Engine {
 
 // ------------------------------------------------------------------------------------------------ expert placement
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
-/// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
-/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, std::string& err) {
+/// reserve), else the hybrid mode - the experts in host memory (all of them, or the first ones up to `host_gib`, see
+/// --resident-budget-gib; the others are read where they lie in the file), the same number of VRAM slots per layer, a
+/// decode batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, double host_gib,
+                   size_t reserve, size_t reserve_later, bool reserve_given, std::string& err) {
     const auto t0 = Clock::now();
     const auto& g = m.g;
     const int64_t ne = g.n_expert;
@@ -3555,28 +3906,29 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         all.push_back(L);
     }
     if (m.has_mtp) all.push_back(&m.mtp);
-    size_t total = 0, per_slot = 0, max_layer = 0;
-    for (Layer* L : all) {
+    size_t total = 0, per_slot = 0, per_slot0 = 0, per_slot1 = 0, max_layer = 0;
+    for (size_t li = 0; li < all.size(); ++li) {
+        Layer* L = all[li];
         total += L->stride * (size_t) ne + kMmqTail;
         per_slot += L->stride;
+        // The layer split: each card's slots come out of ITS free VRAM, so the slots per layer follow the layers that
+        // card runs.  The sum over all of them was divided between the cards by nothing: the RX 6800 and the RX 9070
+        // got 19 slots per layer where 38 fit each (the second card's half of the strides was charged to the first's
+        // budget too), and the whole model's experts stayed a decode's CPU share away from the card that holds them.
+        if (E.split_dev >= 0 && (int) li >= E.split_layer) per_slot1 += L->stride;
+        else per_slot0 += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
-    // The layer split: a card's KV cache and its buffers are allocated AFTER the expert slots, so the budget
-    // must keep room for them.  On a 16 GB card the slots alone left 0.8 GiB short, the driver then served the
-    // VRAM from the host memory, and the GPU hung (this machine, 2026-10-21).  The reserve is the KV of the
-    // card's layers plus the buffers (the attention scores, the expert parts, the scratch, the partials).
-    const size_t kv_one = (size_t) g.n_head_kv * g.head_dim * 2 * 4 * (size_t) E.ctx;
-    const size_t buf_reserve = (size_t) 1536 << 20;
-    const size_t n_layers0 = (size_t) (E.split_dev >= 0 ? std::min<int64_t>((int64_t) E.split_layer, (int64_t) g.n_layers)
-                                                        : (int64_t) g.n_layers);
-    const size_t n_layers1 = (size_t) g.n_layers - n_layers0;
-    const size_t card_reserve0 = n_layers0 * kv_one + buf_reserve;
-    const size_t card_reserve1 = n_layers1 * kv_one + buf_reserve;
+    // `reserve` is the first card's, `reserve_later` the split's / the peer's card (--vram-reserve-mib and
+    // --vram-reserve-later-mib; the caller has already defaulted the second to the first).
+    // The K / V cache of the card's layers and the engine's buffers are allocated by init(), BEFORE this call: `fr`
+    // already leaves them out, so the reserve covers only what the hybrid mode allocates next (the staging pair, the
+    // CPU part's outputs, the slots - checked with the numbers just below).  It used to subtract the card's K / V a
+    // second time (8.3 GiB at 32K on two 16 GB cards), which left 0 expert slot per layer.
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
-                                        : (fr > reserve + card_reserve0 ? fr - reserve - card_reserve0 : 0);
+                                        : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
     // room, UD-Q6_K_XL on 32 GB): drop them - the decode reads the GGUF layout then, bitwise the same outputs, a little
     // slower - rather than run the hybrid mode with its CPU share and streamed prompt layers.  STRATA_Q36_KEEP_PACKED=1
@@ -3611,7 +3963,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     size_t total_main = 0;
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
-    if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
+    if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr &&
+        !reserve_given) {
         const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
@@ -3657,30 +4010,62 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
-    if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
-    size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
+    if (!E.use_mmq && !E.stream_native) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
+    // one pair per card: each card's layers stream into ITS staging (a kernel cannot read the other card's).
+    // In the default (pinned host) mode the pair costs no VRAM at all: the slots keep their share, and the decode
+    // does not pay for the prompt's streaming.
+    const size_t stream_bytes = (E.use_mmq || E.stream_native) && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    const size_t staging_card = E.stream_vram ? stream_bytes / 2 : 0;   // VRAM per card (0: pinned host)
+    size_t slot_bytes = budget2 > staging_card ? budget2 - staging_card : 0;
+    if (slot_bytes + staging_card + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging_card + ((size_t) 512 << 20) ? fr - staging_card - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block).
     // A NEGATIVE count means NO slot at all: every expert goes to the CPU pool.  It is what takes the slots
     // out of the picture when the answer has to be compared with a reference (the placement reads 0 as "the
     // VRAM budget", so 0 could not do it).
     int S = slots < 0 ? 0 : (slots > 0 ? (int) std::min<int64_t>(ne, slots)
-                                          : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot));
+                                          : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot0));
     // The peer's own budget: the slots it takes are on ITS card, with its own free VRAM.  It holds the experts
     // the primary does not, so the two tiers together hold S + S_peer of the layer's experts.
     int S_peer = 0;
+    int S_split = -1;   // the split card's slots per layer, when the peer shares that card
     if (E.peer_device >= 0) {
         size_t pfr = 0, ptot = 0, pslot = 0;
         CK(cudaSetDevice(E.peer_device));
         CK(cudaMemGetInfo(&pfr, &ptot));
         CK(cudaGetLastError());
-        pslot = pfr > (reserve + (size_t) (1ull << 30)) ? pfr - reserve - (size_t) (1ull << 30) : 0;
+        // The reserve on the peer's card: the first card's rule when the peer sits on the first card, the later
+        // card's when it is the second one (--vram-reserve-later-mib).
+        const size_t prsv = E.peer_device == 0 ? reserve : reserve_later;
+        // The peer's card can also hold expert slots: the layer split's layers (their own slots) or, with the peer on
+        // the primary, the primary's.  They come out of the same VRAM, and the free room is measured HERE, before
+        // either tier is placed.  Charging the peer alone overcommitted the card (14.00 GiB of peer beside 2.30 GiB
+        // of the split's slots on a 16 GB card here), the driver then served the VRAM from host memory, and a kernel
+        // read a page that was not there (HSA_STATUS_ERROR_MEMORY_FAULT in k_route_group_m2, GPU 1, 2026-10-26).
+        size_t slots_here = 0;
+        if (E.split_dev >= 0 && E.peer_device == E.split_dev) {
+            const size_t room = pfr > prsv ? pfr - prsv : 0;
+            if (slots < 0) S_split = 0;
+            else if (slots > 0) S_split = (int) std::min<int64_t>((int64_t) ne - (int64_t) S, slots);
+            else   // no --expert-slots: the same count on both tiers, so their bytes add up to the room
+                S_split = (int) std::min<int64_t>((int64_t) ne - (int64_t) S,
+                                                  (int64_t) (room / (per_slot1 + per_slot)));
+            slots_here = (size_t) S_split * per_slot1;
+        } else if (E.peer_device == 0) {
+            slots_here = (size_t) S * per_slot0;
+        }
+        pslot = pfr > (prsv + slots_here + (size_t) (1ull << 30))
+                    ? pfr - prsv - slots_here - (size_t) (1ull << 30)
+                    : 0;
         CK(cudaSetDevice(0));
         CK(cudaGetLastError());
-        S_peer = (int) std::min<size_t>((size_t) std::max<int64_t>(0, ne - S), pslot / per_slot);
-        std::fprintf(stderr, "strata-m2: the peer (device %d) takes %d of %d experts per layer (%.2f GiB)\n",
-                     E.peer_device, S_peer, ne, (double) (S_peer * per_slot) / (1 << 30));
+        // The peer holds the experts after the slots on its OWN card: the first card's S, plus the split card's
+        // S_split when the peer shares that card.  Starting at S alone gave the peer the same first 24 experts the
+        // split card's slots hold: loaded twice, computed twice (the merge keeps the layer's rows, so the peer's work
+        // there was wasted).
+        const int peer_first = (E.split_dev >= 0 && E.peer_device == E.split_dev) ? (int) (S + S_split) : (int) S;
+        S_peer = (int) std::min<size_t>((size_t) std::max<int64_t>(0, ne - peer_first), pslot / per_slot);
+        std::fprintf(stderr, "strata-m2: the peer (device %d) takes %d of %d experts per layer (%.2f GiB), from expert "
+                     "%d\n", E.peer_device, S_peer, ne, (double) (S_peer * per_slot) / (1 << 30), peer_first);
     }
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
@@ -3689,8 +4074,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
-        for (Layer* L : all) {
+        size_t need = staging_card + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+        for (size_t li = 0; li < all.size(); ++li) {
+            Layer* L = all[li];
+            // the layer split: the second card's slots are on ITS card, checked where it computes them
+            if (E.split_dev >= 0 && (int) li >= E.split_layer) continue;
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
         }
@@ -3702,24 +4090,22 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies).
-    // The low-RAM mode keeps NO copy: the experts stay in the mapping and are read where they lie.
-    size_t host = 0;
-    for (Layer* L : all)
-        if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
-    uint8_t* arena = nullptr;
-    bool pinned = false;
-    if (!E.low_ram) {
-        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-        if (!pinned) {
-            (void) cudaGetLastError();
-            arena = (uint8_t*) std::malloc(host);
-            if (!arena) {
-                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-                return false;
-            }
-        }
+    // host memory: the POOL's experts -- the ones without a VRAM slot -- pinned where the driver allows it, up to
+    // --resident-budget-gib.  The low-RAM mode keeps NO copy: the experts stay in the mapping and are read where they
+    // lie.  The slots are placed in the loop below and the pool is what follows them, so each layer's arena is
+    // allocated THERE, sized on that layer's pool.  A per-layer share of the budget (cap / layers / stride) sized the
+    // arena on the LAYER instead: it came to 158 of card 0's 166 pooled experts, so 8 a layer were still read out of
+    // the file at every step, and the 8.4 GiB that no expert used were allocated and pinned all the same.
+    if (std::getenv("STRATA_M2_PLACE_TRACE")) {
+        std::fprintf(stderr, "PLACE S0=%zu slot_bytes=%.2f GiB per_slot0=%.2f MiB per_slot1=%.2f MiB\n",
+                     (size_t) S, (double) slot_bytes / (1 << 30), (double) per_slot0 / 1048576.0,
+                     (double) per_slot1 / 1048576.0);
+        std::fflush(stderr);
     }
+    const size_t host_cap = E.low_ram ? 0
+                                     : host_gib > 0 ? (size_t) (host_gib * (double) (1ull << 30)) : (size_t) -1;
+    size_t host = 0;      // the bytes pinned so far (the budget's running total)
+    bool pinned = true;   // every arena so far came from cudaHostAlloc
     {   // the low-RAM mode's repack buffers: one expert's blob, out of the mapping (before the slots' copy,
         // which uses it)
         size_t max_bytes = 0;
@@ -3727,13 +4113,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         E.repack.assign(max_bytes, 0);
         E.repack_pf.assign(max_bytes, 0);
     }
-    size_t off = 0;
     E.hy.resize(all.size());
     if (E.peer_device >= 0) E.peer_hy.resize(all.size());
     int place_dev = 0;   // the card the layer's resources are on (the layer split)
     int slot_off = 0;    // the first expert this card holds: the primary takes [0, S), the second card the rest
+    const int S_first = S;   // the primary's slots (the layer loop replaces S with the second card's, below)
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
+        if (std::getenv("STRATA_M2_PLACE_TRACE")) {   // DIAG: where the placement is, its slots and the layer's expert
+            std::fprintf(stderr, "PLACE li=%zu S=%d slot_off=%d stride=%.2f MiB bytes=%zu\n", li, S, slot_off,
+                         (double) L.stride / 1048576.0, (size_t) L.L.bytes);
+            std::fflush(stderr);
+        }
         // the layer split: the layer's resources (its expert slots) live on its card, with ITS free VRAM
         if (E.split_dev >= 0) {
             const int ldev = (int) li >= E.split_layer ? E.split_dev : 0;
@@ -3744,14 +4135,23 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 size_t f = 0, t = 0;
                 CK(cudaMemGetInfo(&f, &t));
                 CK(cudaGetLastError());
-                // the second card's own room: its KV and its buffers come out of it too
-                size_t sb = vram_gib >= 0 ? budget
-                                          : (f > reserve + card_reserve1 ? f - reserve - card_reserve1 : 0);
-                if (sb + staging + ((size_t) 256 << 20) > f)
-                    sb = f > staging + ((size_t) 512 << 20) ? f - staging - ((size_t) 512 << 20) : 0;
+                // the second card's own room: its K / V and its buffers are already allocated too (see above)
+                const size_t srsv = ldev == 0 ? reserve : reserve_later;
+                size_t sb = vram_gib >= 0 ? budget : (f > srsv ? f - srsv : 0);
+                if (sb + staging_card + ((size_t) 256 << 20) > f)
+                    sb = f > staging_card + ((size_t) 512 << 20) ? f - staging_card - ((size_t) 512 << 20) : 0;
                 slot_off = S;   // the second card takes the experts the primary does not hold
-                S = slots < 0 ? 0 : (slots > 0 ? (int) std::min<int64_t>(ne, slots)
-                                              : (int) std::min<size_t>((size_t) ne, sb / per_slot));
+                // ...and only those: its own slots per layer can be MORE than the primary's (its VRAM is free while the
+                // primary's holds its share of the sessions), and S + slot_off used to be able to pass the count of a
+                // layer's experts - H.slot_of / exp_in_slot are ne entries long, and writing past them corrupted the
+                // heap the placement allocates from.
+                const int64_t left = (int64_t) ne - (int64_t) slot_off;
+                if (S_split >= 0)   // the peer shares this card: its budget above already kept room for these slots
+                    S = (int) std::min<int64_t>(left, S_split);
+                else
+                    S = slots < 0 ? 0
+                                 : (slots > 0 ? (int) std::min<int64_t>(left, slots)
+                                              : (int) std::min<int64_t>(left, (int64_t) (sb / per_slot1)));
                 std::fprintf(stderr, "strata-m2: the second card takes %d of %d experts per layer (%.2f GiB free)\n",
                              S, ne, (double) f / (double) (1ull << 30));
             }
@@ -3767,35 +4167,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        if (E.low_ram) {
-            // no host copy: the expert e of this layer is the gate rows at src_g + e * src_gsz, and its up
-            // and down rows are at their distance in the mapping (the GGUF stores the expert as the SLOWEST
-            // dimension, so each expert is contiguous).
-            L.hblobs = nullptr;
-        } else {
-            L.hblobs = arena + off;
-            off += L.stride * (size_t) ne + kMmqTail;
-            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
-        }
+        L.hblobs = nullptr;   // the pool's copy, allocated below once this layer's slots are known
+        L.h_first = 0;
+        L.h_resident = 0;
         L.n_slots = S;
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            // ONE EXPERT AT A TIME.  A copy of a whole layer's slots (48 experts, ~200 MB) out of the 49 GB
-            // pinned arena is staged through the driver's bounce buffer instead of being a DMA, and it ran at
-            // 5 MB/s on this box (a 256 MB copy from a 256 MB pinned buffer: 10 GB/s).  One expert is 4 MB, and
-            // that is a DMA.
+            // ONE EXPERT AT A TIME: the slot's content is repacked out of the mapping into the host buffer, then
+            // copied.  One expert (4 MB) is a DMA; a whole layer's run (48 experts, ~200 MB) out of a big pinned
+            // arena went through the driver's bounce buffer at 5 MB/s on this box.
             for (int s = 0; s < S; ++s) {
                 const int e = slot_off + s;   // the expert this slot holds (the second card's are the ones the first does not)
-                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) e * L.stride : nullptr;
-                if (src) {
-                    CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
-                } else {
-                    // read in place: repack the expert out of the mapping into the host buffer, then copy it
-                    expert_blob(L, e, E.repack.data());
-                    CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
-                }
+                expert_blob(L, e, E.repack.data());
+                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
             }
         }
         Engine::Hy& H = E.hy[li];
@@ -3809,6 +4194,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (S_peer > 0) {
             Engine::PeerHy& P = E.peer_hy[li];
             P.slot_of.assign((size_t) ne, -1);
+            P.slot_of_d = nullptr;   // until this layer's slots are placed: moe_hybrid_peer skips a layer without one
             CK(cudaSetDevice(E.peer_device));
             // The card's real free VRAM, which can be less than the budget said (another program, the display):
             // the layer takes as many slots as fit, and the ones that do not fit go to the CPU pool.
@@ -3822,50 +4208,90 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                              fit, ne, (double) pfr / (double) (1ull << 30));
                 S_peer = fit;
             }
-            if (S_peer <= 0) {
-                CK(cudaSetDevice(0));
-                CK(cudaGetLastError());
-                continue;   // no room on the peer for this layer: its experts go to the CPU pool
-            }
-            CK(cudaMalloc(&L.peer_blobs, L.stride * (size_t) S_peer + kMmqTail));
-            CK(cudaMemset(L.peer_blobs, 0, L.stride * (size_t) S_peer + kMmqTail));
-            for (int s = 0; s < S_peer; ++s) {
-                const int e = S + s;
-                const uint8_t* src = L.hblobs ? L.hblobs + (size_t) e * L.stride : nullptr;
-                if (src) {
-                    CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
-                } else {
+            // A layer the peer has no room for keeps NO expert of it -- the table stays all -1, slot_of_d stays null
+            // and moe_hybrid_peer skips the layer -- and its experts go to the CPU pool.  This used to `continue`,
+            // which also skipped everything the layer needs for itself: H.score stayed empty (the CPU pool's
+            // `H.score[x] += 1.0` then wrote past it), H.slot_of_d stayed null (k_group_pool / group_entries read
+            // it) and H.fmt stayed zeroed (native_fmt below builds it; the CPU pool and the stream's offsets use it).
+            if (S_peer > 0) {
+                CK(cudaMalloc(&L.peer_blobs, L.stride * (size_t) S_peer + kMmqTail));
+                CK(cudaMemset(L.peer_blobs, 0, L.stride * (size_t) S_peer + kMmqTail));
+                for (int s = 0; s < S_peer; ++s) {
+                    // after the slots on the PEER's own card: the split card's when the peer shares it, the first
+                    // card's otherwise (see peer_first above)
+                    const int e = ((E.peer_device == place_dev) ? slot_off + S : S_first) + s;
+                    // out of the mapping (the host copy below is the POOL's, and this expert is on a card)
                     expert_blob(L, e, E.repack.data());
                     CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
-                }
-                P.slot_of[(size_t) e] = s;
-                if (li == 0 && getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the peer's slot content
-                    static std::vector<uint8_t> want, got;
-                    want.resize(L.L.bytes);
-                    got.resize(L.L.bytes);
-                    for (int s2 = 0; s2 < S_peer && s2 < 4; ++s2) {
-                        const int e2 = S + s2;
-                        expert_blob(L, e2, want.data());
-                        CK(cudaMemcpy(got.data(), L.peer_blobs + (size_t) s2 * L.stride, L.L.bytes, cudaMemcpyDeviceToHost));
-                        long nd = 0, fi = -1;
-                        for (size_t z = 0; z < want.size(); ++z)
-                            if (want[z] != got[z]) { if (fi < 0) fi = (long) z; ++nd; }
-                        std::fprintf(stderr, "SLOT %d (expert %d) : %ld differing bytes (first at %ld of %zu)\n", s2, e2, nd, fi, want.size());
+                    P.slot_of[(size_t) e] = s;
+                    if (li == 0 && getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the peer's slot content
+                        static std::vector<uint8_t> want, got;
+                        want.resize(L.L.bytes);
+                        got.resize(L.L.bytes);
+                        for (int s2 = 0; s2 < S_peer && s2 < 4; ++s2) {
+                            const int e2 = e + (s2 - s);
+                            expert_blob(L, e2, want.data());
+                            CK(cudaMemcpy(got.data(), L.peer_blobs + (size_t) s2 * L.stride, L.L.bytes, cudaMemcpyDeviceToHost));
+                            long nd = 0, fi = -1;
+                            for (size_t z = 0; z < want.size(); ++z)
+                                if (want[z] != got[z]) { if (fi < 0) fi = (long) z; ++nd; }
+                            std::fprintf(stderr, "SLOT %d (expert %d) : %ld differing bytes (first at %ld of %zu)\n", s2, e2, nd, fi, want.size());
+                        }
+                        std::fflush(stderr);
                     }
-                    std::fflush(stderr);
                 }
+                CK(cudaMalloc(&P.slot_of_d, (size_t) ne * 4));
+                CK(cudaMemcpy(P.slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+                CK(cudaSetDevice(0));
+                CK(cudaGetLastError());
+                // the primary's kernels read the peer's table too (to tell the peer's entries from the CPU's)
+                if (!E.peer_slot_of_d) CK(cudaMalloc(&E.peer_slot_of_d, (size_t) ne * 4));
+                CK(cudaMemcpy(E.peer_slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
             }
-            CK(cudaMalloc(&P.slot_of_d, (size_t) ne * 4));
-            CK(cudaMemcpy(P.slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
-            CK(cudaSetDevice(0));
+            // The rest of the layer is the layer's OWN card: 0, or the split card for the layers it runs.  This used to
+            // set 0: a split layer's slot table (and the next split layers' blobs) was then allocated on the OTHER
+            // card, and the layer's routing kernel read it on its own card (HSA_STATUS_ERROR_MEMORY_FAULT in
+            // k_route_group_m2 on GPU 1, 2026-10-26).
+            CK(cudaSetDevice(place_dev));
             CK(cudaGetLastError());
-            // the primary's kernels read the peer's table too (to tell the peer's entries from the CPU's)
-            if (!E.peer_slot_of_d) CK(cudaMalloc(&E.peer_slot_of_d, (size_t) ne * 4));
-            CK(cudaMemcpy(E.peer_slot_of_d, P.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         }
         H.score.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+        // The pinned arena holds the POOL's experts -- the ones neither card holds -- and it is allocated here, once
+        // the slots are placed: the pool's range is known only now.  It follows the slots ([0, S) on card 0,
+        // [S, S + S_peer) on card 1), so the arena costs the pool's bytes, not the whole layer's: a per-layer share of
+        // the budget used to be the size of the LAYER, which pinned fewer experts than the pool on some layers and
+        // experts the second card already held on others.  What the budget leaves covers the pool's first experts; the
+        // others are read out of the mapping, as before.
+        int pool_first = 0;
+        for (int x = 0; x < ne; ++x)
+            if (H.slot_of[(size_t) x] >= 0) pool_first = x + 1;
+        if (E.peer_device >= 0 && li < E.peer_hy.size() && !E.peer_hy[li].slot_of.empty())
+            for (int x = 0; x < ne; ++x)
+                if (E.peer_hy[li].slot_of[(size_t) x] >= 0) pool_first = x + 1;
+        const size_t left = host_cap == (size_t) -1 ? (size_t) -1 : host_cap > host ? host_cap - host : 0;
+        const int pool = (int) ne - pool_first;
+        const int take = (pool > 0 && left > kMmqTail)
+                             ? (int) std::min<size_t>((size_t) pool, (left - kMmqTail) / L.stride)
+                             : 0;
+        if (take > 0) {
+            const size_t bytes = (size_t) take * L.stride + kMmqTail;
+            if (cudaHostAlloc((void**) &L.hblobs, bytes, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                pinned = false;
+                L.hblobs = (uint8_t*) std::malloc(bytes);
+                if (!L.hblobs) {
+                    err = "no host memory for the experts (" + std::to_string(bytes >> 20) + " MiB)";
+                    return false;
+                }
+            }
+            L.h_first = pool_first;
+            L.h_resident = take;
+            host += bytes;
+            std::memset(L.hblobs, 0, bytes);
+            for (int64_t e = L.h_first; e < (int64_t) L.h_first + take; ++e) expert_blob(L, e, L.host_blob(e));
+        }
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
@@ -3922,7 +4348,22 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaGetLastError());
         CK(cudaEventCreateWithFlags(&E.ev_cross, cudaEventDisableTiming));
     }
-    if (staging) {
+    if (stream_bytes) {
+        if (!E.stream_vram) {   // pinned host: the GPU reads the pool's experts over PCIe, no VRAM, no copy stream
+            for (int b = 0; b < 2; ++b) {
+                CK(cudaHostAlloc((void**) &E.stage[b], max_layer + kMmqTail, cudaHostAllocPortable));
+                std::memset(E.stage[b], 0, max_layer + kMmqTail);
+                CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
+            }
+            if (E.split_dev > 0) {   // the second card's "done reading" events (the buffers are shared, the events
+                CK(cudaSetDevice(E.split_dev));   // are not: an event belongs to the card that creates it)
+                CK(cudaGetLastError());
+                for (int b = 0; b < 2; ++b) CK(cudaEventCreateWithFlags(&E.ev_used2[b], cudaEventDisableTiming));
+                CK(cudaSetDevice(0));
+                CK(cudaGetLastError());
+            }
+        } else {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
             CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
@@ -3931,6 +4372,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
         }
+        if (E.split_dev > 0) {   // the second card's own pair: its layers' kernels run on ITS device
+            CK(cudaSetDevice(E.split_dev));
+            CK(cudaGetLastError());
+            cudaStream_t tmp = nullptr;
+            CK(cudaStreamCreateWithFlags(&tmp, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&E.cst2, cudaStreamNonBlocking));
+            for (int b = 0; b < 2; ++b) {
+                CK(cudaMalloc(&E.stage2[b], max_layer + kMmqTail));
+                CK(cudaMemset(E.stage2[b], 0, max_layer + kMmqTail));
+                CK(cudaEventCreateWithFlags(&E.ev_copy2[b], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&E.ev_used2[b], cudaEventDisableTiming));
+                CK(cudaEventRecord(E.ev_used2[b], tmp));   // nothing to wait for, yet
+            }
+            CK(cudaDeviceSynchronize());
+            CK(cudaStreamDestroy(tmp));
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
+        }
+        }
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
@@ -3938,12 +4398,44 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::fprintf(stderr, "strata-m2: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
                      "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
                      (long long) ne);
-    else
-    std::fprintf(stderr, "strata-m2: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
-                 "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
-                 pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
-                 (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+    else {
+        size_t host_all = 0;
+        for (Layer* L : all)
+            if (!mtp_only || L == &m.mtp) host_all += L->stride * (size_t) ne + kMmqTail;
+        char hb[192];
+        int hmin = 0, hmax = 0, hfirst = 0;
+        for (size_t li = 0; li < all.size(); ++li) {
+            if (!all[li]->hblobs || all[li]->h_resident <= 0) continue;
+            if (!hmin || all[li]->h_resident < hmin) hmin = all[li]->h_resident;
+            if (all[li]->h_resident > hmax) { hmax = all[li]->h_resident; hfirst = all[li]->h_first; }
+        }
+        if (host == 0)
+            std::snprintf(hb, sizeof hb, "none in host memory (every expert is read from the file)");
+        else if (host >= host_all)
+            std::snprintf(hb, sizeof hb, "all %.2f GiB in %s host memory", (double) host / (1 << 30),
+                          pinned ? "pinned" : "pageable");
+        else if (hmin == hmax)
+            std::snprintf(hb, sizeof hb, "%.2f of %.2f GiB in %s host memory (%d of %lld per layer, the experts %d-%d: "
+                          "the pool's)", (double) host / (1 << 30), (double) host_all / (1 << 30),
+                          pinned ? "pinned" : "pageable", hmin, (long long) ne, hfirst, hfirst + hmax - 1);
+        else
+            std::snprintf(hb, sizeof hb, "%.2f of %.2f GiB in %s host memory (%d-%d of %lld per layer, the experts %d-%d: "
+                          "the pool's)", (double) host / (1 << 30), (double) host_all / (1 << 30),
+                          pinned ? "pinned" : "pageable", hmin, hmax, (long long) ne, hfirst, hfirst + hmax - 1);
+        if (E.split_dev >= 0)
+            std::fprintf(stderr, "strata-m2: hybrid experts: %d of %lld per layer on card 0 (%.2f GiB) and %d on card 1 "
+                         "(%.2f GiB), %s, a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f "
+                         "GiB staging, %s); %.1f s\n", S_first, (long long) ne, (double) S_first * per_slot0 / (1 << 30), S,
+                         (double) S * per_slot1 / (1 << 30), hb, E.hybrid_t,
+                         E.pool->workers() + (E.pool->host_works() ? 1 : 0), (double) stream_bytes / (1 << 30),
+                         E.stream_vram ? "VRAM" : "pinned host", ms_since(t0) / 1000.0);
+        else
+            std::fprintf(stderr, "strata-m2: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), %s, a batch of <= %d "
+                         "rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB staging, %s); %.1f s\n", S,
+                         (long long) ne, (double) S * per_slot / (1 << 30), hb, E.hybrid_t,
+                         E.pool->workers() + (E.pool->host_works() ? 1 : 0), (double) stream_bytes / (1 << 30),
+                         E.stream_vram ? "VRAM" : "pinned host", ms_since(t0) / 1000.0);
+    }
     return true;
 #endif
 }
@@ -4343,16 +4835,29 @@ struct Serve {
         std::fflush(stdout);
     }
 
-    /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
+    /// The number of tokens at the start of `ids` that session ss already holds (with the same pictures).  The
+    /// session's state is rewound to that point before the rest is read, so a prompt that re-renders its history a
+    /// little differently (an agent client re-sends the whole conversation every turn, and the reply it shows may not
+    /// be the tokens this engine generated) still skips the part it shares.  The last token is always read again:
+    /// its logits are this request's first pick, and a stale one would belong to another prompt.
     size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
-        const size_t L = ss.live.size();
-        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
-        std::vector<ImgKey> in_live;
-        for (const ImgKey& k : imgs) {
-            if (k.cell + k.n <= (int64_t) L) in_live.push_back(k);
-            else if (k.cell < (int64_t) L) return 0;   // the held tokens end inside a picture
-        }
-        return in_live == ss.imgs ? L : 0;
+        const size_t L = ss.live.size(), M = ids.size();
+        if (L == 0 || M == 0) return 0;
+        size_t k = 0;
+        const size_t n = std::min(L, M);
+        while (k < n && ss.live[k] == ids[k]) ++k;
+        // a picture must not be cut in half: the held state stops before it, on either side
+        for (const ImgKey& im : ss.imgs)
+            if ((size_t) im.cell < k && k < (size_t) (im.cell + im.n)) k = (size_t) im.cell;
+        for (const ImgKey& im : imgs)
+            if ((size_t) im.cell < k && k < (size_t) (im.cell + im.n)) k = (size_t) im.cell;
+        // the pictures wholly inside the shared start must be the request's too
+        std::vector<ImgKey> held, asked;
+        for (const ImgKey& im : ss.imgs) if (im.cell + im.n <= (int64_t) k) held.push_back(im);
+        for (const ImgKey& im : imgs) if (im.cell + im.n <= (int64_t) k) asked.push_back(im);
+        if (held != asked) return 0;
+        if (k >= M) k = M - 1;   // the last token is read (its logits are wanted)
+        return k;
     }
 
     /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
@@ -4481,6 +4986,16 @@ struct Serve {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
+        } else {
+            // Rewind to the shared start: the held tail (a differently rendered reply, a shorter prompt) is dropped,
+            // and the K / V cells past `reuse` are never read (the attention stops at the cell it writes).  No cache
+            // is zeroed: that is what makes a warm turn cheap.
+            ss.live.resize(reuse);
+            ss.imgs.erase(std::remove_if(ss.imgs.begin(), ss.imgs.end(),
+                                         [&](const ImgKey& im) { return im.cell + im.n > (int64_t) reuse; }),
+                          ss.imgs.end());
+            E.pos = (int64_t) reuse;
+            ss.pos = E.pos;
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
@@ -4678,12 +5193,17 @@ int serve(Engine& E) {
 int strata::minimaxm2::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file, dump_layers_path;
     bool low_ram = false;
+    Engine::KvMode kv = Engine::KV_F32;   // --kv: the K / V cache's element (FP32, FP16 or INT8)
     int peer_device = -1;
     int layer_split = -1;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
+    double resident_gib = -1.0;   // --resident-budget-gib: GiB of the routed experts kept in host RAM (< 0: all)
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
+    int vram_reserve_mib = kM2ReserveMib;   // --vram-reserve-mib: VRAM kept free on the first card
+    bool vram_reserve_given = false;
+    int vram_reserve_later_mib = -1;        // --vram-reserve-later-mib: ... on the split's / the peer's card (< 0: same)
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4722,7 +5242,19 @@ int strata::minimaxm2::run(int argc, char** argv) {
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--resident-budget-gib") resident_gib = std::atof(next().c_str());   // GiB of experts kept in host RAM
+        else if (a == "--vram-reserve-mib") { vram_reserve_mib = std::atoi(next().c_str()); vram_reserve_given = true; }
+        else if (a == "--vram-reserve-later-mib") vram_reserve_later_mib = std::atoi(next().c_str());
         else if (a == "--low-ram") low_ram = true;   // no host copy of the experts: they stay in the mapping
+        else if (a == "--kv") {   // the K / V cache's element (FP32 by default: the byte-identical path)
+            const std::string v = next();
+            if (v == "f16" || v == "fp16" || v == "half") kv = Engine::KV_F16;
+            else if (v == "int8" || v == "i8" || v == "q8") kv = Engine::KV_I8;
+            else if (v == "f32" || v == "fp32" || v == "float") kv = Engine::KV_F32;
+            else   // the Terminal's other modes (q4_0, k8v4) belong to the other families: said, not fatal
+                std::fprintf(stderr, "strata-m2: --kv %s is not a mode of this engine (f32, f16, int8): the K / V cache "
+                             "keeps its mode\n", v.c_str());
+        }
         else if (a == "--peer-device") peer_device = std::atoi(next().c_str());   // the second card's expert tier
         else if (a == "--layer-split") layer_split = std::atoi(next().c_str());  // the layers from there on the 2nd card
         else if (a == "--dump-layers") dump_layers_path = next();
@@ -4762,6 +5294,11 @@ int strata::minimaxm2::run(int argc, char** argv) {
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-m2: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-m2: bad --chunk / --max-context\n"); return 2; }
+    if (resident_gib == 0.0 || (resident_gib > 0 && resident_gib < 0.25)) {
+        std::fprintf(stderr, "strata-m2: --resident-budget-gib takes a number of GiB (0.25 or more), e.g. "
+                             "--resident-budget-gib 38; leave it out for every expert in RAM, or use --low-ram for none\n");
+        return 2;
+    }
     Model m;
     // The layer split: the second card gets its own copy of the weights of the layers it runs (the cards do
     // not share their memory), so the loader must know about it BEFORE it uploads the weights.
@@ -4792,6 +5329,21 @@ int strata::minimaxm2::run(int argc, char** argv) {
     // them where they lie).  On a 64 GB box the copy of a 49 GB model does not fit beside the file: the
     // placement ran at 39-52 MB/s and the machine thrashed (3.5 GB of swap in and out).
     E.low_ram = low_ram || std::getenv("STRATA_M2_LOW_RAM") != nullptr;
+    E.kv_mode = kv;
+    if (E.kv_mode != Engine::KV_F32)
+        std::fprintf(stderr, "strata-m2: the K / V cache in %s: %s the VRAM for the same context\n", E.kv_word(),
+                     E.kv_mode == Engine::KV_I8 ? "a quarter of" : "half");
+    if (E.kv_mode == Engine::KV_I8 && m.g.n_head_kv > kMaxKvHeads) {
+        // the scales of a cell live in shared memory, one per KV head and per block (32 heads: 1 KiB for K and V)
+        std::fprintf(stderr, "strata-m2: --kv int8 holds up to %d KV heads (this model has %d): the K / V cache stays "
+                     "FP16\n", kMaxKvHeads, (int) m.g.n_head_kv);
+        E.kv_mode = Engine::KV_F16;
+    }
+    if (E.low_ram && resident_gib > 0) {
+        // both say what to do with the experts in host RAM: --low-ram says none
+        std::fprintf(stderr, "strata-m2: --low-ram keeps no host copy: --resident-budget-gib %g ignored\n", resident_gib);
+        resident_gib = -1;
+    }
     // the second card's expert tier (--peer-device N).  It must be a device the engine can use: the engine
     // runs on device 0, so the peer is any other visible device.
     if (peer_device >= 0) {
@@ -4827,14 +5379,17 @@ int strata::minimaxm2::run(int argc, char** argv) {
         E.split_dev = 1;
         E.split_layer = layer_split;
         std::fprintf(stderr, "strata-m2: the layers from %d on the second card (device 1)\n", layer_split);
-        std::fprintf(stderr, "strata-m2: the second card (device %d) takes part of the expert tier (experimental)\n",
-                     peer_device);
     }
     if (!dump_layers_path.empty()) {
         E.dump_layers = std::fopen(dump_layers_path.c_str(), "wb");
         if (!E.dump_layers) { std::fprintf(stderr, "strata-m2: cannot write %s\n", dump_layers_path.c_str()); return 2; }
     }
     if (E.low_ram) std::fprintf(stderr, "strata-m2: low-RAM mode: the experts stay in the file, no host copy\n");
+    // --vram-reserve-mib / --vram-reserve-later-mib: the VRAM kept free, on the first card and on the split's / the
+    // peer's card.  A negative count is read as 0; the later card follows the first unless it is given.
+    const size_t reserve_bytes = (size_t) std::max(0, vram_reserve_mib) << 20;
+    const size_t reserve_later_bytes =
+        (size_t) std::max(0, vram_reserve_later_mib >= 0 ? vram_reserve_later_mib : vram_reserve_mib) << 20;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -4846,25 +5401,35 @@ int strata::minimaxm2::run(int argc, char** argv) {
         size_t packed = 0;
         for (const auto& pk : m.packed) packed += std::get<2>(pk);
         fr += packed;
-        // the engine's buffers at 512 (~1.1 GiB on gfx1201 at 8K, less the scores buffer's shrink) + the small reserve
-        const double want = (double) experts + 1.1 * (1ull << 30);
+        // What has to fit beside the experts: the engine's buffers (kM2ChunkRowBytes a row, kM2FixedBufferBytes fixed),
+        // the reserve, the sessions' K / V and the FP16 copies the prompt attention keeps (k16 / v16: 2 x heads x dim x 2
+        // B per cell on each card, whatever the cache's own element).  The K / V term counts the layers THIS card runs
+        // (--layer-split: the second card's half is on ITS card).
+        const size_t n_kv_lay = m.layers.size() + (m.has_mtp ? 1 : 0);
+        const size_t on0 = E.split_dev >= 0 ? std::min((size_t) E.split_layer, m.layers.size()) : n_kv_lay;
+        const int ns = std::max(1, batch);
+        const double kv_cell = (double) on0 * ((double) m.g.n_head_kv * (double) m.g.head_dim * 2.0 * (double) E.kv_esz() +
+                                               (E.kv_mode == Engine::KV_I8 ? (double) m.g.n_head_kv * kKvBlocks * 2.0 * 4.0 : 0.0));
+        const double kv_prompt = 2.0 * (double) m.g.n_head_kv * (double) m.g.head_dim * 2.0;
+        const double base = kM2FixedBufferBytes + (double) reserve_bytes + kM2ChunkRowBytes * 512.0 +
+                            kv_cell * (double) ctx * (double) ns + kv_prompt * (double) ctx;
+        // the engine's buffers at 512 + the reserve + the caches: the least a chunk of 512 with all the experts costs
+        const double want = (double) experts + base;
         const bool fits = expert_slots <= 0 && (expert_vram < 0 ? want <= (double) fr
                                                                : (double) experts <= expert_vram * (double) (1ull << 30));
         chunk = fits ? 512 : 2048;
         const double GiB = (double) (1ull << 30);
         if (fits && expert_vram < 0) {
             // a bigger prompt chunk feeds the MMQ expert kernels more rows per expert (R9700, UD-Q4_K_XL, pp4096: 512 3390, 1024
-            // 4495, 2048 5353, 4096 5750 tok/s): the largest that fits beside the experts.  Its buffers grow by about 0.5 MiB per
-            // token (measured 0.47: 1.66 GiB more at 4096 than at 512), the sessions' K / V caches by 50 KB per cell and session.
+            // 4495, 2048 5353, 4096 5750 tok/s): the largest that fits beside the experts, whose buffers grow by 617200 B a
+            // row on this path (measured, see kM2ChunkRowBytes) and whose caches are the kv_cell / kv_prompt above.
             // With several slots a long prompt would hold the other slots' windows for a whole chunk: 1024 at most there.
-            // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
-            // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
-            const int ns = std::max(1, batch);
-            const double kv_one = 45056.0, kv_shared = 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps
-            const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
+            // (the free room is read before init, after the weights: the engine's buffers and the sessions' caches are not
+            // allocated yet, so `base` and the row term are what is still to come; no give-back of the packed decode
+            // copies for a bigger chunk either - that is place_experts' call)
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
-                if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
+                if (c <= cap && (double) experts + base + kM2ChunkRowBytes * (double) (c - 512) <= (double) fr_raw) {
                     chunk = c;
                     break;
                 }
@@ -4880,7 +5445,8 @@ int strata::minimaxm2::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision);
-    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
+    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, resident_gib, reserve_bytes,
+                       reserve_later_bytes, vram_reserve_given, err)) {
         std::fprintf(stderr, "strata-m2: %s\n", err.c_str());
         return 1;
     }
@@ -4892,10 +5458,13 @@ int strata::minimaxm2::run(int argc, char** argv) {
                 for (const auto& kv : E.v_by)
                     std::fprintf(stderr, "strata-m2 VERIFY   %s: %lld mismatches\n", kv.first.c_str(), kv.second);
             if (!E.m->hybrid) return;
-            const long long n = E.hy_cpu + E.hy_gpu;
+            const long long n = E.hy_cpu + E.hy_gpu + E.hy_peer;
+            char peer_txt[64] = "";
+            if (E.hy_peer > 0) std::snprintf(peer_txt, sizeof peer_txt, ", %lld on the peer", E.hy_peer);
             std::fprintf(stderr, "strata-m2: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
-                         "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
-                         E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+                         "CPU pool%s in %.0f ms, %lld slot replacements\n", E.hy_gpu, n,
+                         n ? 100.0 * (double) E.hy_gpu / (double) n : 0.0,
+                         E.hy_cpu, peer_txt, E.hy_cpu_ms, E.hy_swaps);
         }
     } report{E};
     E.reset();
