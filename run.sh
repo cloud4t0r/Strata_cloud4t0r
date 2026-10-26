@@ -1,1 +1,1 @@
-run_minimax_m2.sh
+run-deepseek-v4.1-flash-ist-das-2.25bpw.sh

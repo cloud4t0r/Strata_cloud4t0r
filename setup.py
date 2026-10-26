@@ -8806,6 +8806,51 @@ def dsv41_cards(gpu: dict, all_cards: list | None, asked: bool) -> list:
     return list(all_cards)
 
 
+def build_dsv41_local(cards, hip: bool = False) -> tuple:
+    """Build strata-dsv41 locally for the given cards' architectures.  Used when a card other than the Radeon AI PRO R9700
+    (gfx1200/gfx1201) is selected, because the official package only ships gfx1200/gfx1201.  Returns (exe_path, lib_dirs)."""
+    archs = sorted({str(c.get("arch")) for c in (cards or []) if c.get("arch")})
+    if not archs:
+        fail("could not determine the GPUs' architectures", "use --gpu / --gpus to name the cards")
+    if not hip:
+        fail("a local DeepSeek build needs an AMD (HIP) backend", "run setup with --backend hip")
+    root, dirs = rocm_root(archs)
+    libs = [str(Path(d).parent) for d in dirs[1:]]
+    bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode",
+                                root / "amdgcn" / "bitcode", root / "llvm" / "amdgcn" / "bitcode") if p.is_dir()),
+                   root / "amdgcn" / "bitcode")
+    os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr",
+                       "ROCM_PATH": str(root), "HIP_PATH": str(root)})
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    llama = ROOT / "third_party" / "llama.cpp"
+    if not llama.is_dir():
+        fail("the llama.cpp source tree is missing", "this fork builds the DeepSeek engine from source; the third_party/llama.cpp "
+             "folder must be present")
+    bdir = ROOT / "build-dsv41-hip-local"
+    cmake, ninja = ensure_build_tools()
+    conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(ROOT), "-B", str(bdir),
+            "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF",
+            "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_BUILD_DSV41=ON", "-DSTRATA_NATIVE_EXPERTS=ON",
+            "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+            f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+            f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+            "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+            f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
+            f"-DSTRATA_GGML_DIR={llama}"]
+    build = [cmake, "--build", str(bdir), "--target", "strata-dsv41", "-j", str(max(2, (os.cpu_count() or 4) // 2))]
+    drop_moved_build_cache(bdir)
+    run(conf)
+    r = run(build, check=False)
+    if r.returncode != 0:
+        say("  (the build stopped - trying it once more)")
+        run(build)
+    exe = bdir / ("strata-dsv41.exe" if WIN else "strata-dsv41")
+    if not exe.is_file():
+        fail("the DeepSeek engine did not build", "see the messages above")
+    ok(f"DeepSeek engine built locally for {', '.join(archs)}: {exe}")
+    return exe, [str(root / "lib")] + [str(Path(d).parent) for d in dirs[1:]]
+
 def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, all_cards=None):
     """Steps 2-7 for DeepSeek-V4.1-Flash (MULTI_FILE_FAMILIES): where it fits (strata_control/dsv41_fit.py, said plainly: a 508 GB
     download and a model larger than most computers' memory are warnings, never a refusal), the engine (strata-dsv41), the nine
@@ -8900,25 +8945,36 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # them is downloaded or test-started here (they were ~700 MB, and a stop on every one of them when GitHub could not be reached).
     step(4, "the DeepSeek engine")
     eng, meta, lib_dirs = ROOT / "engine", {"version": None}, []
-    exe = dsv41_exe(eng)
-    if (exe is None and not getattr(a, "dsv41_package", None) and not dsv41_engine_pending(eng) and not local_feed(getattr(a, "feed", None))
-        and not github_reachable()):
-        fail("Strata can't reach GitHub to download the DeepSeek engine.",
-             "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
-    if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
+    # A card other than the Radeon AI PRO R9700 (gfx1200/gfx1201) is not covered by the official package: build the
+    # engine locally for every selected card's architecture, so the JSON config below can run on both of them.
+    card_archs = sorted({str(c.get("arch")) for c in (cards or []) if isinstance(c, dict) and c.get("arch")})
+    if not card_archs:
+        card_archs = sorted({str(c.get("arch")) for c in (gpu.get("cards") or [gpu]) if isinstance(c, dict) and c.get("arch")})
+    non_9070 = hip and any(a_ not in ("gfx1200", "gfx1201") for a_ in card_archs)
+    if non_9070:
+        say(f"  A card other than the Radeon AI PRO R9700 is selected ({', '.join(card_archs)}): "
+            "building the DeepSeek engine locally for all selected cards")
+        exe, lib_dirs = build_dsv41_local(gpu.get("cards") or [gpu], hip)
+    else:
         exe = dsv41_exe(eng)
-    if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
-            and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
-        exe = upgrade_dsv41_engine(eng, exe)               # an installed package older than the signed feed's: updated next to it, switched after it starts
-    if exe is not None and exe.parent != Path(eng):
-        lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
-    if exe is None:
-        if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
-            say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
-        fail("DeepSeek's engine is not available for this computer yet",
-             "Supported graphics cards: NVIDIA RTX 30, 40 and 50 series, and the Radeon AI PRO R9700. " + dsv41_manual_steps(eng)
-             + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
+        if (exe is None and not getattr(a, "dsv41_package", None) and not dsv41_engine_pending(eng) and not local_feed(getattr(a, "feed", None))
+            and not github_reachable()):
+            fail("Strata can't reach GitHub to download the DeepSeek engine.",
+                 "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
+        if exe is None and not getattr(a, "build", False):
+            get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
+            exe = dsv41_exe(eng)
+        if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
+                and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
+            exe = upgrade_dsv41_engine(eng, exe)               # an installed package older than the signed feed's: updated next to it, switched after it starts
+        if exe is not None and exe.parent != Path(eng):
+            lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
+        if exe is None:
+            if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
+                say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
+            fail("DeepSeek's engine is not available for this computer yet",
+                 "Supported graphics cards: NVIDIA RTX 30, 40 and 50 series, and the Radeon AI PRO R9700. " + dsv41_manual_steps(eng)
+                 + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
     ok(f"engine: {exe}")
 
     step(5, f"downloading {fam['title']} {model}")
