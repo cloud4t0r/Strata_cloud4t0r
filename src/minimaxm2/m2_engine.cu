@@ -3854,9 +3854,18 @@ struct Engine {
         const auto t0 = Clock::now();
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
-        std::vector<int32_t> toks((size_t) tmax, filler);
+        // Every phase starts from a reset position: the K / V cache holds `ctx` cells exactly, so a phase that runs
+        // past it (a chunk of `tmax` = 2048 plus a decode, on a 2048-cell cache) wrote past the cache and faulted in
+        // k_attn_prep_m2.  The prompt chunk is clamped to `ctx - 1` for the same reason.
+        const int64_t room = std::max<int64_t>(1, (int64_t) ctx - 1);
+        const int64_t n_chunk = std::min<int64_t>((int64_t) tmax, room);
+        std::vector<int32_t> toks((size_t) n_chunk, filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
-        if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+        reset();
+        if (n_chunk > kGemmT + 1) {
+            process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+            reset();
+        }
         process(&filler, 1, [](int64_t) {});
         if (mtp_d > 0) {
             std::vector<int32_t> fix, drafts;
