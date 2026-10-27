@@ -101,6 +101,7 @@ HF_REVISIONS = {
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
     "bartowski/MiniMaxAI_MiniMax-M2-GGUF": "c11372ee543a87426c86ac275e8062c660b247f8",               # 2026-10-20
+    "unsloth/MiniMax-M2.5-GGUF": "7c50dca0e5592483ad308ecffc876aecac725660",                       # 2026-02-14
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",             # 2026-10-20 (the port's reference)
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
 }
@@ -643,6 +644,12 @@ MINIMAX2_FILES = {
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00001-of-00002.gguf": (39922661440, "84294b035551643111f15403c77d68a29e1b900fac9bf028d871c48851e9a178"),
     "MiniMaxAI_MiniMax-M2-IQ2_XXS-00002-of-00002.gguf": (14803701088, "4da31c4005c1e1f83ed403e4013cb2bb9bc1395b26b65c2fa962a8cdb645f091"),
 }
+
+MINIMAX25_FILES = {
+    "MiniMax-M2.5-UD-IQ2_XXS-00001-of-00003.gguf": (8238112, "9d8e998d91a2a0e0c23f201a217fb549b8cb3b9dd80e9fbbcdac7fae4bcb1b8a"),
+    "MiniMax-M2.5-UD-IQ2_XXS-00002-of-00003.gguf": (49812799872, "09793a816b57eb67b68311e1013d06a6ea09f6fe3911dff611459fa1107ac51b"),
+    "MiniMax-M2.5-UD-IQ2_XXS-00003-of-00003.gguf": (24302047296, "7aaf809d8a1c40307bb55976237e2cccd37472955de27244d0270f89bc150689"),
+}
 # MiniMax-M2's routed experts (IQ2_XXS), GiB: the engine prints "49.10 GiB" and copies them all into host RAM without a
 # budget (MEASURED, docs/MINIMAX_M2.md, "A RAM budget for the experts").
 M2_EXPERTS_GIB = 49.10
@@ -774,6 +781,30 @@ OWN_PATH_FAMILIES = {
                  # the low-RAM mode is chosen by --m2-low-ram (auto: by the free RAM now - the host copy is capped at
                  # --resident-budget-gib, and the low-RAM mode takes over when the cap leaves under
                  # M2_RESIDENT_MIN_GIB); on, no host copy of the experts: they stay in the file
+                 "low_ram": True,
+                 "vision": False, "state_gb": 0.0},
+    "minimax25": {"title": "MiniMax-M2.5", "by": "MiniMax; GGUFs by unsloth", "arch": "minimax-m2",
+                 "about": "230B mixture of experts with 10B active (256 experts, top-8), full attention on every "
+                          "layer; M2.5 reuses MiniMax-M2's engine path (same architecture), so the same engine runs it",
+                 "hf": hf("unsloth/MiniMax-M2.5-GGUF") + "{q}/",
+                 "file": "MiniMax-M2.5-{q}-0000{i}-of-00003.gguf", "shards": 3, "tag": "minimax25-",
+                 "name": "minimax-m2",
+                 "license": "MiniMax Community License: https://huggingface.co/MiniMaxAI/MiniMax-M2.5",
+                 "models": {"UD-IQ2_XXS": {"about": "2-bit i-quant (smallest M2.5 file, ~74 GB)", "ram_gb": 24,
+                                           "ram_gb_normal": M2_LOW_RAM_BELOW_GB, "experts_gib": 78.0}},
+                 "sha256": MINIMAX25_FILES,
+                 "kv_bytes_per_token": 62 * 8 * 128 * 2 * 1 + 62 * 8 * (128 // 32) * 2 * 2,
+                 "kv_modes": {"f32": 62 * 8 * 128 * 2 * 4,
+                              "f16": 62 * 8 * 128 * 2 * 2,
+                              "int8": 62 * 8 * 128 * 2 * 1 + 62 * 8 * (128 // 32) * 2 * 2},
+                 "kv_default": "int8",
+                 "vram_budget": {"dense_gib": M2_DENSE_GPU_GIB,
+                                 "fixed_gib": M2_BUFFERS_GIB + M2_ENGINE_RESERVE_GIB + M2_RUNTIME_GIB,
+                                 "experts_gib": M2_EXPERT_ROOM_GIB,
+                                 "extra_bytes_per_token": M2_CTX_EXTRA_BYTES_PER_TOKEN},
+                 "extra_contexts": [16384],
+                 "n_layers": M2_LAYERS, "layer_split": M2_LAYER_SPLIT,
+                 "mtp": 0,
                  "low_ram": True,
                  "vision": False, "state_gb": 0.0}
 }
@@ -910,6 +941,7 @@ REPO_PINS = {
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": QWEN36_FILES,
     "bartowski/MiniMaxAI_MiniMax-M2-GGUF": MINIMAX2_FILES,
+    "unsloth/MiniMax-M2.5-GGUF": MINIMAX25_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
@@ -8429,11 +8461,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil, textual (the screens)")
 
     step(4, "the Strata engine")
-    if family == "minimax2" and not WIN and not CONTROL and not getattr(a, "prebuilt", None):
+    if family in ("minimax2", "minimax25") and not WIN and not CONTROL and not getattr(a, "prebuilt", None):
         # MiniMax-M2: the engine is compiled here (its engine path, then strata-m2 below), not taken ready-made
         a.build = True
     llama, eng, meta, lib_dirs, gpu, vision = engine_step(a, gpu, hip, amd, cuda_tk, vision)
-    if family == "minimax2":
+    if family in ("minimax2", "minimax25"):
         build_m2_engine(eng, hip, meta)
     reader = None
     if hip and vision != "none":
@@ -8560,7 +8592,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
-    if family == "minimax2" and not WIN:               # its own start script, with the low-RAM switch (M2_LOW_RAM)
+    if family in ("minimax2", "minimax25") and not WIN:               # its own start script, with the low-RAM switch (M2_LOW_RAM)
         script = write_m2_run_script(cfg_path, port, cfg.get("open_browser") is not False, low_ram, low_why)
     else:
         script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -8570,7 +8602,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
     say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
     say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
-    if family == "minimax2" and not WIN:
+    if family in ("minimax2", "minimax25") and not WIN:
         say(f"  Low-RAM mode:     M2_LOW_RAM=1 or M2_LOW_RAM=0 ./{script.name} switches it for one run")
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
