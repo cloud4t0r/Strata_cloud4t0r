@@ -38,6 +38,7 @@ td.log
 /.run_minimax_m2.override.json
 /strata-*.json
 /strata-*.log
+/ds4-slots/
 /build-strata.bat
 /build-strata-cuda12.bat
 /build-cuda12/
