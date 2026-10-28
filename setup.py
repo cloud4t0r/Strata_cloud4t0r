@@ -776,8 +776,9 @@ OWN_PATH_FAMILIES = {
                                  "experts_gib": M2_EXPERT_ROOM_GIB,
                                  "extra_bytes_per_token": M2_CTX_EXTRA_BYTES_PER_TOKEN},
                  "extra_contexts": [16384],
-                 # the two-card layer split (--gpus with two AMD cards, Linux): the first layer of the second card.
-                 # Only this family has it (its engine splits across two cards); the others stay on one card
+                 # the two-card layer split (--gpus with two cards, Linux; AMD measured, NVIDIA the same engine
+                 # split through CUDA): the first layer of the second card.  Only this family has it (its engine
+                 # splits across two cards); the others stay on one card
                  "n_layers": M2_LAYERS, "layer_split": M2_LAYER_SPLIT,
                  "mtp": 0,                      # the released weights carry no MTP block
                  # the low-RAM mode is chosen by --m2-low-ram (auto: by the free RAM now - the host copy is capped at
@@ -1697,6 +1698,20 @@ def gpus():
         except ValueError:
             continue
     return found
+
+
+def nvidia_vram_used_gib() -> dict:
+    """{index: GiB of VRAM in use now} for the NVIDIA cards, numbered as nvidia-smi numbers them (the same
+    numbering gpus() and CUDA_VISIBLE_DEVICES use).  Empty when nvidia-smi does not answer."""
+    s = out(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"])
+    used = {}
+    for line in s.strip().splitlines():
+        try:
+            idx, mem = [x.strip() for x in line.split(",")]
+            used[int(idx)] = float(mem) / 1024.0
+        except ValueError:
+            continue
+    return used
 
 
 def gpu_drives_display(g) -> bool:
@@ -8366,9 +8381,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
-    # the two-card layer split: a family whose engine has one (MiniMax-M2), two AMD cards named with --gpus, Linux
-    # (the only setup validated).  The others keep the one card, as before
-    two = bool(multi) and bool(fam.get("layer_split")) and hip and not WIN
+    # the two-card layer split: a family whose engine has one (MiniMax-M2), two cards named with --gpus, Linux (the
+    # only setup validated: AMD measured, NVIDIA the same engine code with CUDA's own peer/host copies).  Windows
+    # and the other families keep the one card, as before
+    two = bool(multi) and bool(fam.get("layer_split")) and not WIN
     if multi and not two:
         warn(f"{fam['title']} runs on one GPU so far: using GPU {gpu.get('index', 0)} ({gpu_name(gpu)}) only")
     cards, split = [], None
@@ -8378,7 +8394,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             warn(f"the {fam['title']} engine splits its layers across two cards: using GPU {multi[0]} and GPU "
                  f"{multi[1]} (the first two of --gpus)")
             multi = multi[:2]
-        byid = {g["index"]: g for g in amd}
+        all_cards = amd if hip else gpus()
+        byid = {g["index"]: g for g in all_cards}
         cards = [gpu if i == gpu.get("index") else byid.get(i, {"index": i, "vram_gb": 0.0, "name": "?"})
                  for i in multi]
         ls = getattr(a, "layer_split", None)
@@ -8450,7 +8467,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     rec_ctx = own_path_context(fam, card_vram)
     avail = []
     if two:                                           # each card on its own: its VRAM minus what is in use now
-        used = amd_vram_used_gib()
+        used = amd_vram_used_gib() if hip else nvidia_vram_used_gib()
         nl = fam["n_layers"]
         for i, c in enumerate(cards):
             total = float(c.get("vram_gb", 0.0))

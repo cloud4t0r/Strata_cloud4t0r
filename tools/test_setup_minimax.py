@@ -310,10 +310,12 @@ class Install(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def install(self, family="minimax2", ram=64.0, gpu=None, multi=None, hip=True, amd=None, used=None, avail=48.0,
-                **kw):
+                nvidia=None, nvidia_used=None, **kw):
         gpu = gpu or {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}
         with mock.patch.object(setup, "avail_ram_gb", lambda: avail), \
-                mock.patch.object(setup, "amd_vram_used_gib", lambda *a, **k: dict(used or {})):
+                mock.patch.object(setup, "amd_vram_used_gib", lambda *a, **k: dict(used or {})), \
+                mock.patch.object(setup, "nvidia_vram_used_gib", lambda *a, **k: dict(nvidia_used or {})), \
+                mock.patch.object(setup, "gpus", lambda: list(nvidia or [])):
             return run(setup.install_own_path, args(models_dir=str(self.root / "models"), family=family, **kw), family,
                        gpu, hip, amd or [], None, multi or [], 8080, ram, None)
 
@@ -365,7 +367,7 @@ class Install(unittest.TestCase):
         src = (ROOT / "setup.py").read_text(encoding="utf-8")
         self.assertIn('"--m2-kv", choices=["auto", "f32", "f16", "int8"], default="auto"', src)
 
-    # ---- the two-card layer split (--gpus with two AMD cards, opt-in)
+    # ---- the two-card layer split (--gpus with two cards, opt-in; AMD measured, NVIDIA the same setup path)
     def split(self, main=None, multi=(1, 0), used=None, **kw):
         main = main or R9070
         amd = kw.pop("amd", [R6800, R9070])
@@ -455,14 +457,19 @@ class Install(unittest.TestCase):
         self.assertEqual(self.cfg["gpu"], 1)
         self.assertNotIn("layer_split", self.cfg)
 
-    def test_nvidia_minimax_with_gpus_stays_on_one_card(self):
-        rc, out = self.install(gpu={"index": 0, "count": 2, "vram_gb": 16.0, "name": "Test GPU"}, multi=[0, 1],
-                               hip=False)
+    def test_nvidia_minimax_with_gpus_writes_a_layer_split(self):
+        # Linux NVIDIA: the same engine split, with nvidia-smi's numbering and used VRAM (--gpus 0,1)
+        cards = [{"index": 0, "name": "NVIDIA GeForce RTX 4090", "vram_gb": 16.0, "arch": "89"},
+                 {"index": 1, "name": "NVIDIA GeForce RTX 4090", "vram_gb": 16.0, "arch": "89"}]
+        rc, out = self.install(gpu={"index": 0, "count": 2, "vram_gb": 16.0, "name": "NVIDIA GeForce RTX 4090"},
+                               multi=[0, 1], hip=False, nvidia=cards, nvidia_used={0: 0.016, 1: 0.767})
         self.assertEqual(rc, 0, out)
-        self.assertIn("runs on one GPU so far", out)
-        self.assertEqual(self.cfg["gpu"], 0)
-        self.assertNotIn("layer_split", self.cfg)
-        self.assertEqual(self.ctx(), "65536")
+        self.assertNotIn("runs on one GPU so far", out)
+        self.assertEqual(self.cfg["gpu"], [0, 1])
+        self.assertEqual(self.cfg["layer_split"], "31")
+        self.assertIs(self.cfg["gpus_asked"], True)
+        self.assertIn("layers 0-30 on GPU 0, 31-61 on GPU 1", out)
+        self.assertEqual(self.ctx(), "131072")
 
     def test_vram_reserves_go_through(self):
         # --vram-reserve-mib is the engine's own per-card option (each card's slots less that reserve), not the derived

@@ -46,9 +46,9 @@ What setup does for this model:
 - **One card by default.** Without `--gpus`, setup uses one card. The engine is still compiled for every AMD
   card's architecture (RX 9070 + RX 6800: gfx1201 and gfx1030), so `"gpu": 1` in the config does not stop on
   `device kernel image is invalid`.
-- **Two cards when you ask** (AMD, Linux): `./setup.sh --setup --family minimax2 --gpus 1,0`. See
-  [Two cards with setup](#two-cards-with-setup). NVIDIA cards and Windows stay on one card. Qwen3.6 also stays
-  on one card.
+- **Two cards when you ask** (Linux; AMD or NVIDIA): `./setup.sh --setup --family minimax2 --gpus 1,0`. See
+  [Two cards with setup](#two-cards-with-setup). The AMD order is the measured one; NVIDIA runs the same engine
+  split through CUDA, but has not been measured here. Windows stays on one card. Qwen3.6 also stays on one card.
 - **It picks the context from the VRAM**, with the K / V cache in INT8 (`--m2-kv`, below).
   - One card: the cache must fit on that one card beside the dense weights (1.86 GiB, measured) and the
     engine's buffers (about 1.54 GiB at the prompt chunk setup lets the engine choose, measured). With int8
@@ -384,6 +384,8 @@ STRATA_M2_DEVICES=1 tools/run_m2_test.sh mono
   does not record why that order was chosen. The first card carries a bit more (the embedding, the output head
   and the dense weights). `--gpus 0,1` also works; it is not measured. Setup sizes the context on the VRAM free
   at the time, so stop a running model before you run setup.
+- On NVIDIA (Linux), `--gpus 0,1` writes the same `"gpu": [0, 1]` and `"layer_split": "31"`; the engine runs the
+  split through CUDA. This path has not been measured here.
 - `--layer-split N` moves the split (2 to 48; 31 by default, the measured one). Above 48 the engine would not
   copy the second card's weights, so setup refuses it.
 - With three or more cards in `--gpus`, setup uses the first two and says so.
