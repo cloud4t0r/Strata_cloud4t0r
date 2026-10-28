@@ -336,12 +336,24 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
 /// grid (T), block 256.
 // The device a pointer lives on (-1: unknown): the layer split's diagnostic.
 int dev_of(const void* p) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     hipPointerAttribute_t at{};
     if (hipPointerGetAttributes(&at, p) != hipSuccess) {
         (void) hipGetLastError();
         return -1;
     }
     return at.device;
+#elif defined(__CUDACC__)
+    cudaPointerAttributes at{};
+    if (cudaPointerGetAttributes(&at, p) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return -1;
+    }
+    return at.device;
+#else
+    (void) p;
+    return -1;
+#endif
 }
 
 template <class KV>
