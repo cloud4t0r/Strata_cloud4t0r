@@ -3606,12 +3606,29 @@ struct Engine {
         if (!m->hybrid || off || warming) return;
         const int64_t ne = m->g.n_expert;
         int left = max_swaps;
+        // The two cards hold their own layers, and a layer's blobs live on ITS card: the copies below go to the
+        // layer's card with that card current, and a SYNCHRONOUS copy keeps them ordered with the kernels that read
+        // the same blobs (`st` belongs to whichever set ran last, so it cannot be used for both).  The count of
+        // replacements went from 8 to 256 a call, which walks far enough down the layers to reach the second card.
+        int cur_dev = 0;
+        CK(cudaGetDevice(&cur_dev));
+        const int last_dev = split_dev > 0 ? split_dev : 0;
+        for (int d = 0; d <= last_dev; ++d) {
+            CK(cudaSetDevice(d));
+            CK(cudaDeviceSynchronize());   // nothing is reading a blob while it is replaced
+        }
         for (size_t li = 0; li < hy.size() && left > 0; ++li) {
             Hy& H = hy[li];
             // the layer's OWN copy: the second card's slots are on its card (layer_at would give the first card's)
             const Layer& L = layer_of((size_t) li);
             const int S = L.n_slots;
             if (S <= 0 || S >= ne) continue;
+            const int d = card_of((int) li);
+            if (cur_dev != d) {
+                CK(cudaSetDevice(d));
+                CK(cudaGetLastError());
+                cur_dev = d;
+            }
             std::vector<int> order((size_t) ne);
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
             std::sort(order.begin(), order.end(), [&](int a, int b) { return H.score[(size_t) a] > H.score[(size_t) b]; });
@@ -3636,14 +3653,12 @@ struct Engine {
                     H.slot_of[(size_t) x] = s;
                     H.exp_in_slot[(size_t) s] = x;
                     if (L.host_has(x)) {
-                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.host_blob(x), L.L.bytes,
-                                           cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.host_blob(x), L.L.bytes,
+                                      cudaMemcpyHostToDevice));
                     } else {
                         // the low-RAM mode: the expert is repacked out of the mapping first
-                        CK(cudaStreamSynchronize(st));
                         expert_blob(L, x, repack);
-                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, repack, L.L.bytes,
-                                           cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, repack, L.L.bytes, cudaMemcpyHostToDevice));
                     }
                     --left;
                     ++hy_swaps;
@@ -3654,11 +3669,14 @@ struct Engine {
             }
             if (changed) {
                 std::memcpy(htoks, H.slot_of.data(), (size_t) ne * 4);
-                CK(cudaMemcpyAsync(H.slot_of_d, htoks, (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpy(H.slot_of_d, htoks, (size_t) ne * 4, cudaMemcpyHostToDevice));
             }
             for (double& v : H.score) v *= 0.5;
         }
-        CK(cudaStreamSynchronize(st));   // the upload is done before the host table changes
+        if (cur_dev != 0) {   // the caller's next launches expect the first card, where forward() leaves it
+            CK(cudaSetDevice(0));
+            CK(cudaGetLastError());
+        }
     }
 
     void shrink_att(size_t floats) {
