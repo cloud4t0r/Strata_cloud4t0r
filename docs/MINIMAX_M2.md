@@ -215,6 +215,13 @@ sets the count (0 puts the fill back on one thread); the default is 16, at most 
 The same bytes land in the same places, so the answer does not move: a 512-token prompt gave byte-identical full
 logits with one thread and with 16, and the reference prompt still answers `8261`.
 
+The fill used to copy each expert out of the mapping, and the kernel serves a mapping's page faults one window at a
+time: that way the fill read 1.5 GB/s on this machine, where four plain parallel readers get 4.6 GB/s. The fill now
+reads the three runs of each expert with `pread` from the shard files, sixteen threads asking at once, and keeps the
+mapping for everything else (the placement, the slot replacements, a short read). Measured with the file cache
+dropped before every run, a 512-token prompt: 29.3 s (17.5 tok/s) out of the mapping against 22.2 s (23.1 tok/s)
+with pread, +32%, and the same token out. `STRATA_M2_NO_PREAD=1` puts the fill back on the mapping.
+
 ### Which prompt path a layer takes
 
 Two prompt paths exist. `stream_native` repacks a layer's pooled experts into the staging buffer and runs them with
@@ -484,6 +491,7 @@ through host memory (host-staged, not peer-to-peer) because the two cards are di
 | `STRATA_M2_FILL_THREADS` | Threads that fill the prompt's staging buffer (default 16, one less than the machine's cores at most); `0` puts the fill back on one thread |
 | `STRATA_M2_SWAPS_AFTER_PROMPT` | Slot replacements allowed right after a prompt (default 256) |
 | `STRATA_M2_SWAPS_PERIODIC` | Slot replacements the decode may make every 32 positions (default 256) |
+| `STRATA_M2_NO_PREAD` | Set to any value to copy the prompt's experts out of the mapping instead of reading them with `pread` |
 
 ## Peer tier (experimental)
 

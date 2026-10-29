@@ -45,6 +45,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1094,6 +1098,11 @@ struct Layer {
     // the GGUF's expert tensors (the mapped file stays open): place_experts builds the blobs from them
     const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
     size_t src_gsz = 0, src_dsz = 0;
+    // Where those three sit in the file, and in which shard: the prompt's fill reads them with pread instead of
+    // copying them out of the mapping, whose page faults are served one window at a time (measured: the fill read
+    // 1.5 GB/s out of the mapping against 4.6 GB/s from four parallel readers).
+    uint64_t off_g = 0, off_u = 0, off_d = 0;
+    int sh_g = -1, sh_u = -1, sh_d = -1;
     uint8_t* hblobs = nullptr;  // hybrid mode: the host copy of the experts [h_first, h_first + h_resident), `stride` apart
     int h_first = 0;            // the first of them: the experts WITHOUT a VRAM slot (the pooled ones), not the slots'
     int h_resident = 0;         // how many of them are in it (--resident-budget-gib; the others are read in place)
@@ -1333,6 +1342,13 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         y.src_g = gm.shard(sg).tensor_data(*tg);
         y.src_u = gm.shard(su).tensor_data(*tu);
         y.src_d = gm.shard(sd).tensor_data(*td);
+        // Where the same three sit in their files: the prompt's fill reads them with pread (see expert_blob_fd)
+        y.off_g = gm.shard(sg).data_start() + tg->offset;
+        y.off_u = gm.shard(su).data_start() + tu->offset;
+        y.off_d = gm.shard(sd).data_start() + td->offset;
+        y.sh_g = (int) sg;
+        y.sh_u = (int) su;
+        y.sh_d = (int) sd;
         // The experts are read from the mapping, one expert at a time, when they are placed in VRAM.  Without a
         // read-ahead the kernel serves those pages one by one: the placement of a 48 GB model then runs at the
         // mmap's page-fault rate (measured: 52 MB/s) instead of the drive's (4.3 GB/s).  Asking for the whole
@@ -1418,6 +1434,39 @@ void expert_blob(const Layer& L, int64_t e, uint8_t* dst) {
     std::memcpy(dst, L.src_g + (size_t) e * L.src_gsz, L.src_gsz);
     std::memcpy(dst + L.L.up_off, L.src_u + (size_t) e * L.src_gsz, L.src_gsz);
     std::memcpy(dst + L.L.down_off, L.src_d + (size_t) e * L.src_dsz, L.src_dsz);
+}
+
+#if !defined(_WIN32)
+/// pread until `n` bytes are in, or false.
+bool pread_full(int fd, void* dst, size_t n, uint64_t off) {
+    uint8_t* p = (uint8_t*) dst;
+    while (n > 0) {
+        const ssize_t r = pread(fd, p, n, (off_t) off);
+        if (r <= 0) return false;
+        p += (size_t) r;
+        off += (uint64_t) r;
+        n -= (size_t) r;
+    }
+    return true;
+}
+#endif
+
+/// The same blob, read out of the shard files instead of copied out of the mapping.  The prompt's fill runs on 16
+/// threads, and sixteen preads keep the drive busy where the mapping's page faults are served one window at a time
+/// (measured on this machine: 1.5 GB/s out of the mapping, 4.6 GB/s from four plain parallel readers).
+void expert_blob_fd(const Layer& L, int64_t e, uint8_t* dst, const std::vector<int>& fds) {
+#if defined(_WIN32)
+    (void) fds;
+    expert_blob(L, e, dst);
+#else
+    const int fd_g = L.sh_g >= 0 && (size_t) L.sh_g < fds.size() ? fds[(size_t) L.sh_g] : -1;
+    const int fd_u = L.sh_u >= 0 && (size_t) L.sh_u < fds.size() ? fds[(size_t) L.sh_u] : -1;
+    const int fd_d = L.sh_d >= 0 && (size_t) L.sh_d < fds.size() ? fds[(size_t) L.sh_d] : -1;
+    if (fd_g < 0 || fd_u < 0 || fd_d < 0 || !pread_full(fd_g, dst, L.src_gsz, L.off_g + (uint64_t) e * L.src_gsz) ||
+        !pread_full(fd_u, dst + L.L.up_off, L.src_gsz, L.off_u + (uint64_t) e * L.src_gsz) ||
+        !pread_full(fd_d, dst + L.L.down_off, L.src_dsz, L.off_d + (uint64_t) e * L.src_dsz))
+        expert_blob(L, e, dst);   // no descriptor, or a short read: the mapping still has it
+#endif
 }
 
 // ------------------------------------------------------------------------------------------------ the engine
@@ -1633,6 +1682,7 @@ struct Engine {
     // host address, the second card, 2026-10-29).
     uint8_t* repack = nullptr;      // the decode path's (the slot replacement)
     uint8_t* repack_pf = nullptr;   // the prompt path's (the staged copy)
+    std::vector<int> shard_fd;      // the shards' read-only descriptors, for the fill's pread (expert_blob_fd)
     std::vector<strata::kernels::cpu::NativeFmt> zc_fmt;   // the per-job layouts of the experts read in place
     int32_t* d_mtab = nullptr;          // [ctx][3] t, h, w of the current request's prompt cells (vision)
     const int32_t* mtab_now = nullptr;  // set for a forward over prompt cells that need it, else null
@@ -3197,7 +3247,7 @@ struct Engine {
                         if (L.host_has(x))   // --resident-budget-gib: it is already pinned, take it there
                             std::memcpy(dst + (size_t) x * L.stride, L.host_blob(x), (size_t) L.L.bytes);
                         else
-                            expert_blob(L, x, dst + (size_t) x * L.stride);
+                            expert_blob_fd(L, x, dst + (size_t) x * L.stride, shard_fd);
                     }
                 },
                 ne);
@@ -4191,6 +4241,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     return false;
 #else
     namespace C = strata::kernels::cpu;
+#if !defined(_WIN32)
+    {   // the shards' read-only descriptors: the prompt's fill reads the pool's experts with pread (expert_blob_fd)
+        E.shard_fd.assign(m.file ? m.file->size() : 0, -1);
+        if (std::getenv("STRATA_M2_NO_PREAD") == nullptr)   // the A/B arm: -1 makes the fill read the mapping
+            for (size_t i = 0; i < E.shard_fd.size(); ++i)
+                E.shard_fd[i] = ::open(m.file->shard(i).path().c_str(), O_RDONLY);
+    }
+#endif
     m.hybrid = true;
     E.main_hybrid = !mtp_only;
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
