@@ -704,6 +704,9 @@ M2_EXPERT_ROOM_GIB = 2.0       # ESTIMATE: room the recommendation keeps for the
 M2_CTX_EXTRA_BYTES_PER_TOKEN = 8 * 128 * 2 * 2 + 48 * 64 // 128 * (128 + 2) * 4
 M2_EXE = "strata-m2.exe" if os.name == "nt" else "strata-m2"   # the MiniMax-M2 engine path on its own (CMake target)
 M2_RUN_SCRIPT = "run_minimax_m2.sh"                             # its start script (Linux), written by install_own_path
+# One name per family: MiniMax-M2 and MiniMax-M2.5 share one engine path, and setup used to write both their start
+# scripts under M2_RUN_SCRIPT - so installing one model overwrote the other's script.
+M2_RUN_SCRIPTS = {"minimax2": M2_RUN_SCRIPT, "minimax25": "run_minimax_m25.sh"}
 M2_LAYERS = 62                 # the GGUF's block_count: MiniMax-M2's 62 layers
 M2_LAYER_SPLIT = 31            # VALIDATED: the two-card run that matched llama.cpp's token 8261 (docs/MINIMAX_M2.md)
 M2_LAYER_SPLIT_MAX = 48        # from the code: strata-m2 checks --layer-split against its default 48 layers BEFORE it
@@ -8196,9 +8199,9 @@ def build_m2_engine(eng: Path, hip: bool, meta: dict):
     shutil.copy2(bdir / M2_EXE, eng / M2_EXE)
     ok(f"MiniMax-M2 engine compiled: {eng / M2_EXE}")
     return eng / M2_EXE
-def write_m2_run_script(cfg_path, port, open_browser=True, low_ram=True, why=""):
-    """run_minimax_m2.sh (Linux/macOS shells): the server with MiniMax-M2's config, as write_run_script writes it, plus
-    the low-RAM mode setup chose as the default, overridable for one run without reinstalling: M2_LOW_RAM=1|0 or the
+def write_m2_run_script(cfg_path, port, open_browser=True, low_ram=True, why="", name=M2_RUN_SCRIPT):
+    """run_minimax_m2.sh / run_minimax_m25.sh (Linux/macOS shells): the server with the model's config, as
+    write_run_script writes it, plus the low-RAM mode setup chose as the default, overridable for one run without reinstalling: M2_LOW_RAM=1|0 or the
     script's own --low-ram / --no-low-ram.  The config carries setup's choice; another mode runs a copy of it with
     --low-ram added or left out.  STRATA_M2_LOW_RAM is always unset: the engine turns the mode on when that variable
     merely exists (any value, even 0), so the flag alone decides.  M2_DRY_RUN=1 prints the command instead."""
@@ -8208,12 +8211,12 @@ def write_m2_run_script(cfg_path, port, open_browser=True, low_ram=True, why="")
     cmd = " ".join('"$CONFIG"' if x == "$CONFIG" else q(x) for x in serve)
     default = "1" if low_ram else "0"
     text = f"""#!/bin/sh
-# {M2_RUN_SCRIPT} - written by setup.py: MiniMax-M2 through the Strata server (serve/server.py, sampling from the
+# {name} - written by setup.py: MiniMax-M2 through the Strata server (serve/server.py, sampling from the
 # model card: temperature 1.0, top_p 0.95).
 # The low-RAM mode (--low-ram: the experts are read where they lie in the file, no copy of them in RAM) is
 # {"on" if low_ram else "off"} by default, as setup chose it ({why or "--m2-low-ram"}).  For one run, without reinstalling:
-#   M2_LOW_RAM=1 ./{M2_RUN_SCRIPT}    or  ./{M2_RUN_SCRIPT} --low-ram       (low-RAM mode on)
-#   M2_LOW_RAM=0 ./{M2_RUN_SCRIPT}    or  ./{M2_RUN_SCRIPT} --no-low-ram    (normal mode: the experts copied into RAM)
+#   M2_LOW_RAM=1 ./{name}    or  ./{name} --low-ram       (low-RAM mode on)
+#   M2_LOW_RAM=0 ./{name}    or  ./{name} --no-low-ram    (normal mode: the experts copied into RAM)
 # M2_DRY_RUN=1 prints the command instead of starting it.
 cd {q(str(ROOT))} || exit 1
 CONFIG={q(str(cfg_path))}
@@ -8223,13 +8226,13 @@ for arg in "$@"; do
   case "$arg" in
     --low-ram) LOW_RAM=1 ;;
     --no-low-ram) LOW_RAM=0 ;;
-    *) echo "{M2_RUN_SCRIPT}: unknown argument $arg (--low-ram or --no-low-ram)" >&2; exit 2 ;;
+    *) echo "{name}: unknown argument $arg (--low-ram or --no-low-ram)" >&2; exit 2 ;;
   esac
 done
 case "$LOW_RAM" in
   1|on|yes|true) LOW_RAM=1 ;;
   0|off|no|false) LOW_RAM=0 ;;
-  *) echo "{M2_RUN_SCRIPT}: M2_LOW_RAM must be 1 or 0, not $LOW_RAM" >&2; exit 2 ;;
+  *) echo "{name}: M2_LOW_RAM must be 1 or 0, not $LOW_RAM" >&2; exit 2 ;;
 esac
 # the engine turns the low-RAM mode on when STRATA_M2_LOW_RAM merely exists (even =0): the --low-ram flag decides
 unset STRATA_M2_LOW_RAM
@@ -8251,7 +8254,7 @@ if [ -n "$M2_DRY_RUN" ]; then
 fi
 exec {cmd}
 """
-    script = home() / M2_RUN_SCRIPT
+    script = home() / name
     script.write_text(text, encoding="utf-8")
     script.chmod(0o755)
     return script
@@ -8724,7 +8727,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             ok("parallel requests: one at a time (--parallel 1)")
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
     if family in ("minimax2", "minimax25") and not WIN:               # its own start script, with the low-RAM switch (M2_LOW_RAM)
-        script = write_m2_run_script(cfg_path, port, cfg.get("open_browser") is not False, low_ram, low_why)
+        script = write_m2_run_script(cfg_path, port, cfg.get("open_browser") is not False, low_ram, low_why,
+                                     M2_RUN_SCRIPTS.get(family, M2_RUN_SCRIPT))
     else:
         script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")

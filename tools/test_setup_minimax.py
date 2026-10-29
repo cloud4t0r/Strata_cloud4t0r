@@ -734,6 +734,22 @@ class ScriptSyntax(unittest.TestCase):
             s = setup.write_m2_run_script(Path(t) / "strata-minimax2-iq2_xxs.json", 8080, True, True, "test")
             self.assertEqual(subprocess.run(["sh", "-n", str(s)], timeout=30).returncode, 0)
 
+    def test_each_family_writes_its_own_start_script(self):
+        """minimax2 and minimax25 share one engine path: setup used to write both their start scripts under
+        run_minimax_m2.sh, so installing the second model overwrote the first one's script."""
+        self.assertEqual(setup.M2_RUN_SCRIPTS["minimax2"], setup.M2_RUN_SCRIPT)
+        self.assertNotEqual(setup.M2_RUN_SCRIPTS["minimax25"], setup.M2_RUN_SCRIPT)
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(setup, "ROOT", Path(t)), \
+                mock.patch.object(setup, "CONTROL", None):
+            a = setup.write_m2_run_script(Path(t) / "a.json", 8080, True, True, "test",
+                                          setup.M2_RUN_SCRIPTS["minimax2"])
+            b = setup.write_m2_run_script(Path(t) / "b.json", 8080, True, True, "test",
+                                          setup.M2_RUN_SCRIPTS["minimax25"])
+            self.assertNotEqual(a, b)
+            self.assertTrue(a.is_file() and b.is_file())
+            self.assertIn(a.name, a.read_text(encoding="utf-8"))   # the script names itself, not the other family's
+            self.assertIn(b.name, b.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

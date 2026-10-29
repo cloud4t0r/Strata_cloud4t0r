@@ -344,7 +344,10 @@ not have its own reserve, and the Flash-Next path got the same flag although its
 config that still carries `--expert-vram` works: the engine reads it as the experts' budget, which the reserve
 does not apply to.
 
-### The start script: `run_minimax_m2.sh`
+### The start script: `run_minimax_m2.sh` (M2.5: `run_minimax_m25.sh`)
+
+Each family writes its own: `--family minimax2` writes `run_minimax_m2.sh`, `--family minimax25` writes
+`run_minimax_m25.sh`. They used to share one name, so installing the second model overwrote the first one's script.
 
 ```sh
 ./run_minimax_m2.sh                    # the mode setup chose
