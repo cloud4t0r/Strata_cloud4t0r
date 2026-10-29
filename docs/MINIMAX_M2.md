@@ -200,6 +200,21 @@ faulted with `Memory access fault ... Page not present` on the card 1 layers exa
 stream and its events were all card 0's). The staging is one pair of host buffers, read by both cards; the
 "buffer is free" events are one pair per card, since an event belongs to the card that creates it.
 
+The fill of that buffer was one thread's work: a staging buffer holds all 256 experts of a layer (1.32 GiB, so
+~5.3 MiB an expert) and `stream_kick` copied the pool's share of it — 194 experts, ~1 GiB — before the layer could
+start, 1.6 s per layer. It now goes to a pool of 16 threads, each taking its own stretch of the layer's experts: the
+experts are disjoint slices of the buffer and a copy writes nothing else, so no lock and no ordering is needed. The
+launches stay on the calling thread, so the card is queued while the copies run.
+
+Measured on this machine (RX 9070 + RX 6800, 16-core Ryzen 9 5950X, 32K, `--low-ram`, `--layer-split 31`), a
+512-token prompt on the native streamed path, one thread against the pool of 16: 96.6 s (5.3 tok/s) against 19.7 s
+(26.0 tok/s) with the file in the page cache, and 91.7 s (5.6 tok/s) against 30.4 s (16.8 tok/s) with the cache
+dropped. The curve bends at 16 threads: 6 gave 28.9 s, 12 gave 23.9 s, 24 gave 20.6 s. `STRATA_M2_FILL_THREADS=N`
+sets the count (0 puts the fill back on one thread); the default is 16, at most one less than the machine has cores.
+
+The same bytes land in the same places, so the answer does not move: a 512-token prompt gave byte-identical full
+logits with one thread and with 16, and the reference prompt still answers `8261`.
+
 ### A RAM budget for the experts
 
 Without `--low-ram` the engine copies the pooled experts of every layer into pinned host RAM: 49.10 GiB for M2
@@ -440,6 +455,7 @@ through host memory (host-staged, not peer-to-peer) because the two cards are di
 | `STRATA_M2_DUMP_LAYERS` | Path to write per-layer residual dumps |
 | `STRATA_M2_NO_STREAM_NATIVE` | Set to any value to keep the prompt on the CPU pool (no streaming) |
 | `STRATA_M2_STREAM_VRAM` | Set to any value to stage the streamed experts in VRAM instead of pinned host RAM |
+| `STRATA_M2_FILL_THREADS` | Threads that fill the prompt's staging buffer (default 16, one less than the machine's cores at most); `0` puts the fill back on one thread |
 
 ## Peer tier (experimental)
 

@@ -25,6 +25,7 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/thread_name.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/minimaxm2/engine.hpp"
@@ -1702,6 +1703,76 @@ struct Engine {
     // In the DEFAULT mode the pair is PINNED HOST memory (stream_vram == false): the pool's experts are repacked
     // there and the GPU reads them over PCIe, so the streaming costs no VRAM and the slots keep theirs (the decode's
     // speed).  STRATA_M2_STREAM_VRAM=1 brings back the VRAM pair (one per card, 2 x the layer per card).
+    // The fill pool: the threads that copy a prompt layer's pooled experts into the pinned staging buffer.
+    //
+    // `stream_kick` filled them on the calling thread, one `expert_blob` at a time (three memcpys out of the file
+    // mapping, each of them paying its page faults).  A staging buffer holds all 256 experts of a layer and is
+    // 1.32 GiB, so the pool's share of one layer (256 minus its 62 slots) is ~1 GiB: one thread took 1.6 s per layer
+    // on the MiniMax-M2.5 UD-IQ2_XXS pack (a 512-token prompt: 96.6 s), while the GPU has the layer's own ~10-20 ms
+    // queued, so it waited for nearly all of it.  The experts are disjoint slices of `dst` and `expert_blob` writes
+    // nothing else, so the range splits over these threads with no lock and no ordering.
+    // The count is `STRATA_M2_FILL_THREADS` (0: one thread, the A/B arm), started with the staging buffers.
+    struct FillPool {
+        std::mutex mu;
+        std::condition_variable cv, done_cv;
+        std::function<void(int, int)> job;   // the current fill: the experts [lo, hi)
+        int job_n = 0, gen = 0, n_running = 0, nthreads = 0;
+        bool quit = false;
+        std::vector<std::thread> threads;
+        void start(int n) {
+            if (n <= 0 || !threads.empty()) return;
+            nthreads = n;
+            for (int t = 0; t < n; ++t) threads.emplace_back([this, t] { work(t); });
+        }
+        ~FillPool() {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                quit = true;
+            }
+            cv.notify_all();
+            for (auto& t : threads)
+                if (t.joinable()) t.join();
+        }
+        void work(int t) {
+            strata::platform::name_this_thread("strata-m2-fill", t);
+            int seen = 0;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return quit || gen != seen; });
+                    if (quit) return;
+                    seen = gen;
+                }
+                // A fixed stride per thread: the experts are equal-sized blobs, so this splits the work evenly and
+                // each thread walks its own part of the layer (and of the file) in order.
+                const int n = job_n;
+                const int lo = (int) ((int64_t) n * t / nthreads), hi = (int) ((int64_t) n * (t + 1) / nthreads);
+                if (lo < hi) job(lo, hi);
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (--n_running == 0) done_cv.notify_one();
+                }
+            }
+        }
+        /// `fn` over the experts [0, n) on the pool, and return once all of them are done.
+        void run(std::function<void(int, int)> fn, int n) {
+            if (nthreads <= 0 || n < 2) {
+                fn(0, n);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                job = std::move(fn);
+                job_n = n;
+                n_running = nthreads;
+                ++gen;
+            }
+            cv.notify_all();
+            std::unique_lock<std::mutex> lk(mu);
+            done_cv.wait(lk, [&] { return n_running == 0; });
+        }
+    };
+    FillPool fill;
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -3065,13 +3136,19 @@ struct Engine {
             CK(cudaEventSynchronize(ev_used[b]));   // the buffer's last reader on card 0 is done
             if (split_dev > 0) CK(cudaEventSynchronize(ev_used2[b]));   // ... and on card 1 (the pair is shared)
             uint8_t* dst = stage[b];
-            for (int x = 0; x < ne; ++x) {
-                if (H.slot_of[(size_t) x] >= 0) continue;   // read from its VRAM slot: nothing to stream
-                if (L.host_has(x))   // --resident-budget-gib: it is already pinned, take it there
-                    std::memcpy(dst + (size_t) x * L.stride, L.host_blob(x), (size_t) L.L.bytes);
-                else
-                    expert_blob(L, x, dst + (size_t) x * L.stride);
-            }
+            // The experts are copied by the fill pool's threads, not by this one: this thread has the layer's
+            // launches to queue (`stream_done` has just recorded that the GPU is done with this buffer).
+            fill.run(
+                [&](int lo, int hi) {
+                    for (int x = lo; x < hi; ++x) {
+                        if (H.slot_of[(size_t) x] >= 0) continue;   // read from its VRAM slot: nothing to stream
+                        if (L.host_has(x))   // --resident-budget-gib: it is already pinned, take it there
+                            std::memcpy(dst + (size_t) x * L.stride, L.host_blob(x), (size_t) L.L.bytes);
+                        else
+                            expert_blob(L, x, dst + (size_t) x * L.stride);
+                    }
+                },
+                ne);
             return;
         }
         // The copies go to the LAYER's card, on its own copy stream: a kernel of card 1 reading card 0's staging
@@ -4376,6 +4453,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 std::memset(E.stage[b], 0, max_layer + kMmqTail);
                 CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
+            }
+            {   // the fill pool (see FillPool): the prompt's staging was filled by one thread, ~1.6 s a layer.
+                // 16 threads is where the curve bends on a 16-core part (measured on a 512-token prompt, same staging
+                // and same prompt each run: 1 thread 96.6 s, 6 -> 28.9 s, 12 -> 23.9 s, 16 -> 19.7 s, 24 -> 20.6 s).
+                int nfill = 16;
+                if (const char* v = std::getenv("STRATA_M2_FILL_THREADS")) nfill = std::atoi(v);
+                const int cpus = (int) std::thread::hardware_concurrency();
+                nfill = std::clamp(nfill, 0, std::max(1, cpus - 1));
+                E.fill.start(nfill);
+                if (nfill > 0)
+                    std::fprintf(stderr, "strata-m2: the prompt's staged experts are copied by %d threads\n", nfill);
             }
             if (E.split_dev > 0) {   // the second card's "done reading" events (the buffers are shared, the events
                 CK(cudaSetDevice(E.split_dev));   // are not: an event belongs to the card that creates it)
