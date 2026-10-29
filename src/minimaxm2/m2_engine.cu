@@ -1679,7 +1679,8 @@ struct Engine {
     long long hy_peer = 0;
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
-    bool stream_native = false;   // native (IQ1_M) prompt path streams the pool's experts to the GPU (opt-in kill switch STRATA_M2_NO_STREAM_NATIVE when !use_mmq)
+    bool stream_native = false;   // native (IQ1_M) prompt path streams the pool's experts to the GPU (kill switch
+                                  // STRATA_M2_NO_STREAM_NATIVE); it is the path of every hybrid layer, MMQ or not
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
     bool lhy(size_t li) const {
@@ -2022,7 +2023,10 @@ struct Engine {
             };
             for (const Layer& L : m->layers) use_mmq = use_mmq && mmq_ok(L);
             if (m->has_mtp) use_mmq = use_mmq && mmq_ok(m->mtp);
-            stream_native = !use_mmq && std::getenv("STRATA_M2_NO_STREAM_NATIVE") == nullptr;
+            // The native streamed path serves every layer MMQ cannot read: MMQ needs all of a layer's experts in one
+            // block, so a hybrid layer (some experts in slots) always takes the native path, and `use_mmq` no longer
+            // implies `stream_native == false`.
+            stream_native = std::getenv("STRATA_M2_NO_STREAM_NATIVE") == nullptr;
             stream_vram = std::getenv("STRATA_M2_STREAM_VRAM") != nullptr;
             if (use_mmq) {
                 const int64_t ne = (int64_t) T * Kp;
@@ -2832,10 +2836,21 @@ struct Engine {
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
-        } else if (T > kGemmT && use_mmq) {
+        } else if (T > kGemmT && use_mmq && !lhy(li)) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
+            //
+            // Only a layer whose experts all sit in one block may take it: MMQ steps over them from ONE base pointer
+            // with `L.stride` (`Product.w` / `expert_bytes`), which is `L.blobs` only when every expert has a slot.  A
+            // hybrid layer streams just the experts WITHOUT a slot into the staging and leaves the residents' places
+            // as they were, so MMQ read the wrong bytes for those experts: their rows came out as garbage, the
+            // prompt's logits went to NaN, `k_argmax` left its INT32_MAX sentinel in `pick`, and the next decode step
+            // fed that id to the embedding lookup -- `table + 2^31 * row_bytes`, which the card refuses with
+            // HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION inside embed_rows_kernel.  Hybrid layers take the streamed
+            // native path instead: it reads a resident expert from its blob and the pool's from the staging, and on
+            // this machine (RX 9070 + RX 6800, IQ2_XXS) it also reads the prompt faster than MMQ at an equal
+            // placement (512 tokens: 10.5 tok/s against 8.8, `--expert-vram 0`).
             const int ne = (int) g.n_expert;
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);

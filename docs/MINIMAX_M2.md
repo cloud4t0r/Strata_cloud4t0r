@@ -215,6 +215,24 @@ sets the count (0 puts the fill back on one thread); the default is 16, at most 
 The same bytes land in the same places, so the answer does not move: a 512-token prompt gave byte-identical full
 logits with one thread and with 16, and the reference prompt still answers `8261`.
 
+### Which prompt path a layer takes
+
+Two prompt paths exist. `stream_native` repacks a layer's pooled experts into the staging buffer and runs them with
+the native grouped kernels, reading each resident expert from its VRAM blob. The MMQ path runs llama.cpp's int8
+matrix kernels over one base pointer per layer, stepping expert by expert with `L.stride`.
+
+MMQ can therefore only read a layer whose experts all sit in one block: every expert resident, so the base is the
+layer's VRAM blob. A hybrid layer streams only the experts WITHOUT a slot into the staging and leaves the residents'
+places untouched, so MMQ used to read those experts from whatever the buffer held. The prompt's logits came out as
+garbage, `k_argmax` left its `INT32_MAX` sentinel in `pick`, and the next decode step handed that id to the
+embedding lookup, which computes `table + 2^31 * row_bytes`: the card aborted with
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` inside `embed_rows_kernel`. It took a prompt above `--hybrid-rows`
+(the default 128) and at least one resident expert, and it also hit the 27 October binary. Hybrid layers now take
+the native streamed path; MMQ is left to the all-resident layers.
+
+On this machine the native path is also the faster one at an equal placement: a 512-token prompt with
+`--expert-vram 0` (RX 9070 + RX 6800, IQ2_XXS) read at 10.5 tok/s against MMQ's 8.8.
+
 ### A RAM budget for the experts
 
 Without `--low-ram` the engine copies the pooled experts of every layer into pinned host RAM: 49.10 GiB for M2
