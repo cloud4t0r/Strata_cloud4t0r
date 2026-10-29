@@ -4439,7 +4439,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 size_t sb = vram_gib >= 0 ? budget : (f > srsv ? f - srsv : 0);
                 if (sb + staging_card + ((size_t) 256 << 20) > f)
                     sb = f > staging_card + ((size_t) 512 << 20) ? f - staging_card - ((size_t) 512 << 20) : 0;
-                slot_off = S;   // the second card takes the experts the primary does not hold
+                // In the peer tier the two cards serve the SAME layer: the second holds what the primary does not
+                // (experts S..S+S_split-1), so the two must add up to no more than `ne`.  In a plain layer split they
+                // serve DIFFERENT layers, each with its own 256 experts: starting the second card at `S` capped it
+                // to `ne - S` (97 of 256 on a host with 22.67 GiB free, whose layers could hold 178).
+                slot_off = E.peer_device >= 0 ? S : 0;
                 // ...and only those: its own slots per layer can be MORE than the primary's (its VRAM is free while the
                 // primary's holds its share of the sessions), and S + slot_off used to be able to pass the count of a
                 // layer's experts - H.slot_of / exp_in_slot are ne entries long, and writing past them corrupted the
@@ -4741,7 +4745,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (refused != 0)
             std::fprintf(stderr, "strata-m2: %zu expert blobs could not be pinned (cudaHostAlloc refused them): they are "
                                  "read from the file\n", refused);
-        else if (host_all != 0 && host < host_all)
+        else if (host_all != 0 && host + ((size_t) 1 << 20) < host_all)
             std::fprintf(stderr, "strata-m2: the host budget is what stopped the copy, at %.2f of %.2f GiB\n",
                          (double) host / (1 << 30), (double) host_all / (1 << 30));
         if (E.split_dev >= 0)
