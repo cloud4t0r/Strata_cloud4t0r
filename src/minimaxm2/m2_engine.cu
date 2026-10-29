@@ -3605,6 +3605,31 @@ struct Engine {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return;
         const int64_t ne = m->g.n_expert;
+        // A replacement moves an expert from the host pool into a slot.  When the WHOLE pool is pinned host memory
+        // the pool already reads at RAM speed, and the copy (4.2 MiB an expert, over PCIe) costs more than the
+        // difference: a two-card host measured 43.5 against 41.0 tok/s at the start of an answer with them off.  With
+        // the pool read out of the file (--low-ram) they are worth a lot - +26% on the reference machine - because
+        // there the copy replaces a disk read.
+        {
+            bool pool_pinned = true;
+            for (size_t li = 0; li < hy.size(); ++li) {
+                const Layer& L = layer_of(li);
+                if (L.n_slots <= 0 || L.n_slots >= ne) continue;
+                if (L.h_resident < (int) ne - L.n_slots) {
+                    pool_pinned = false;
+                    break;
+                }
+            }
+            if (pool_pinned) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "strata-m2: the expert pool is all pinned host memory: the slots stay as "
+                                         "placed (the copies would cost more than they save)\n");
+                }
+                return;
+            }
+        }
         int left = max_swaps;
         // The two cards hold their own layers, and a layer's blobs live on ITS card: the copies below go to the
         // layer's card with that card current, and a SYNCHRONOUS copy keeps them ordered with the kernels that read
