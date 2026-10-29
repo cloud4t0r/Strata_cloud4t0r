@@ -1,1 +1,0 @@
-run_m2_lowram.sh
