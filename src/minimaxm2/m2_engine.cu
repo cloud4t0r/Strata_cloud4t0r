@@ -4403,6 +4403,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t host_cap = E.low_ram ? 0
                                      : host_gib > 0 ? (size_t) (host_gib * (double) (1ull << 30)) : (size_t) -1;
     size_t host = 0;      // the bytes pinned so far (the budget's running total)
+    size_t pool_all = 0;  // the bytes the whole pool would take (the report's denominator)
+    size_t refused = 0;   // experts the kernel would not pin: cudaHostAlloc refused them, they stay in the file
     {   // the low-RAM mode's repack buffers: one expert's blob, out of the mapping (before the slots' copy,
         // which uses it).  Pinned: their copies are asynchronous (see the members)
         size_t max_bytes = 0;
@@ -4569,6 +4571,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 if (E.peer_hy[li].slot_of[(size_t) x] >= 0) pool_first = x + 1;
         const size_t left = host_cap == (size_t) -1 ? (size_t) -1 : host_cap > host ? host_cap - host : 0;
         const int pool = (int) ne - pool_first;
+        pool_all += (size_t) pool * L.stride + kMmqTail;
         const int take = (pool > 0 && left > kMmqTail)
                              ? (int) std::min<size_t>((size_t) pool, (left - kMmqTail) / L.stride)
                              : 0;
@@ -4580,6 +4583,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         while (want > 0 && cudaHostAlloc((void**) &L.hblobs, bytes, cudaHostAllocDefault) != cudaSuccess) {
             (void) cudaGetLastError();
             L.hblobs = nullptr;
+            refused += (size_t) (want - want / 2);
             want /= 2;
             bytes = want > 0 ? (size_t) want * L.stride + kMmqTail : 0;
         }
@@ -4711,6 +4715,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         size_t host_all = 0;
         for (Layer* L : all)
             if (!mtp_only || L == &m.mtp) host_all += L->stride * (size_t) ne + kMmqTail;
+        if (pool_all != 0) host_all = pool_all;   // the report's denominator is what the POOL would take
         char hb[192];
         int hmin = 0, hmax = 0, hfirst = 0;
         for (size_t li = 0; li < all.size(); ++li) {
@@ -4731,6 +4736,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             std::snprintf(hb, sizeof hb, "%.2f of %.2f GiB in %s host memory (%d-%d of %lld per layer, the experts %d-%d: "
                           "the pool's)", (double) host / (1 << 30), (double) host_all / (1 << 30),
                           "pinned", hmin, hmax, (long long) ne, hfirst, hfirst + hmax - 1);
+        // Why the copy stopped short: the kernel refused the pinned allocation, or the budget ran out (the two used
+        // to be indistinguishable, and a report of "50 of 66 GiB" read like a lost 16 GiB).
+        if (refused != 0)
+            std::fprintf(stderr, "strata-m2: %zu expert blobs could not be pinned (cudaHostAlloc refused them): they are "
+                                 "read from the file\n", refused);
+        else if (host_all != 0 && host < host_all)
+            std::fprintf(stderr, "strata-m2: the host budget is what stopped the copy, at %.2f of %.2f GiB\n",
+                         (double) host / (1 << 30), (double) host_all / (1 << 30));
         if (E.split_dev >= 0)
             std::fprintf(stderr, "strata-m2: hybrid experts: %d of %lld per layer on card 0 (%.2f GiB) and %d on card 1 "
                          "(%.2f GiB), %s, a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f "
