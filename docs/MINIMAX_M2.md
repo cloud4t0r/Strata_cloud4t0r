@@ -482,6 +482,8 @@ through host memory (host-staged, not peer-to-peer) because the two cards are di
 | `STRATA_M2_NO_STREAM_NATIVE` | Set to any value to keep the prompt on the CPU pool (no streaming) |
 | `STRATA_M2_STREAM_VRAM` | Set to any value to stage the streamed experts in VRAM instead of pinned host RAM |
 | `STRATA_M2_FILL_THREADS` | Threads that fill the prompt's staging buffer (default 16, one less than the machine's cores at most); `0` puts the fill back on one thread |
+| `STRATA_M2_SWAPS_AFTER_PROMPT` | Slot replacements allowed right after a prompt (default 256) |
+| `STRATA_M2_SWAPS_PERIODIC` | Slot replacements the decode may make every 32 positions (default 256) |
 
 ## Peer tier (experimental)
 
@@ -594,6 +596,15 @@ pool's experts in pinned host RAM (`--resident-budget-gib 40`) was meant to test
 land: its first pass spent 18.5 s in the pool against 18.2 s waiting for the routing, and its second pass faulted
 on the second card (`Memory access fault ... Page not present`, on a host address). That mode is not the default,
 and the fault is not explained yet.
+
+The slots follow the counts: after a prompt the engine replaces up to `STRATA_M2_SWAPS_AFTER_PROMPT` slots with
+the experts the prompt used, then `STRATA_M2_SWAPS_PERIODIC` more every 32 positions, from the counts the decode
+itself feeds. Both were carried over from Flash-Next (2048 and 8), and an expert blob is 4.2 MiB here: 1716
+replacements cost 1.2 s after every prompt, each one a synchronisation, a 4.2 MiB read out of the file and a
+4.2 MiB copy over PCIe. Measured on the reference prompt (32K, `--low-ram`): at 2048/8 a 64-token answer took
+8.66 s, at 256/256 it took 7.99 s with the decode itself unchanged (7103 against 6964 ms) and the same tokens; on
+an 8-token answer, 2.77 s against 1.94 s. The decode's own counts carry a long answer, so the prompt's budget no
+longer has to guess the answer's length.
 
 ## Notes
 

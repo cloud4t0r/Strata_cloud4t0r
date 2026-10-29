@@ -1818,7 +1818,7 @@ struct Engine {
         count_rows(n);
         if (pos % kRebalanceEvery == 0) {
             CK(cudaStreamSynchronize(st));
-            rebalance(8);
+            rebalance(hybrid_swaps_periodic);
         }
     }
 
@@ -3787,7 +3787,7 @@ struct Engine {
         rows_G_last = G;
         if (m->hybrid) {
             count_rows(T);
-            if (++win_count % kRebalanceEvery == 0) rebalance(8);
+            if (++win_count % kRebalanceEvery == 0) rebalance(hybrid_swaps_periodic);
         }
     }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
@@ -3921,7 +3921,24 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
     }
-    int hybrid_swaps_after_prompt = 2048;
+    // How many slots a prompt may replace before the decode starts, and how many a long answer replaces every
+    // kRebalanceEvery positions.  Both are GLOBAL budgets (see rebalance), and on MiniMax-M2.5 an expert blob is
+    // 4.2 MiB: 2048 slots are ~8.6 GiB read from the file and copied over PCIe, in series (a synchronisation per
+    // swap), which cost 1.2 s after every prompt.  Flash-Next could afford that: its experts are far smaller.
+    // Measured on this machine (RX 9070 + RX 6800, 32K, --low-ram, --layer-split 31, the reference prompt):
+    //   64 tokens: 2048 after the prompt -> 8.66 s, 0.8 s of it the replacements; 256 + 256 every 32 -> 7.99 s,
+    //   the decode itself unchanged (7103 against 6964 ms), and the same tokens come out.
+    //    8 tokens: 2.77 s against 1.94 s (the prompt's 1.2 s of replacements for eight tokens of decode).
+    // The counts the decode feeds carry a long answer on their own, so the prompt's budget no longer has to guess
+    // the answer's length.
+    int hybrid_swaps_after_prompt = [] {
+        const char* v = std::getenv("STRATA_M2_SWAPS_AFTER_PROMPT");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 256;
+    }();
+    int hybrid_swaps_periodic = [] {
+        const char* v = std::getenv("STRATA_M2_SWAPS_PERIODIC");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 256;
+    }();
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
