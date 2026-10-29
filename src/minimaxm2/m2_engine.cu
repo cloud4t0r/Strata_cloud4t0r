@@ -1454,6 +1454,10 @@ struct Engine {
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
+    // A prompt chunk's tokens and a slot table, both pinned: their upload is an asynchronous copy, and the source
+    // of an asynchronous copy must be pinned (a pageable source makes the card's SDMA engine read a page the driver
+    // has not mapped into it - "Page not present", on a host address, the second card, 2026-10-29).
+    int32_t* htoks = nullptr;
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
     int32_t* ami;
@@ -1623,9 +1627,12 @@ struct Engine {
     // The repack buffers: one expert's blob, for the GPU's copy out of the mapping.  ONE PER STREAM: the copy
     // out of the host buffer is ASYNC, so the host buffer stays in use until the stream has taken it - one
     // buffer shared by the prompt path and the slot replacement has them corrupt each other's expert (the
-    // two copies overlap, and the answer changes with the speed of the machine).
-    std::vector<uint8_t> repack;         // the decode path's (the slot replacement)
-    std::vector<uint8_t> repack_pf;      // the prompt path's (the staged copy)
+    // two copies overlap, and the answer changes with the speed of the machine).  PINNED for the same reason:
+    // the copy is asynchronous, and a pageable source hands the card a page of ours the driver has not pinned -
+    // on a machine under memory pressure that page is not resident and the copy faults ("Page not present", a
+    // host address, the second card, 2026-10-29).
+    uint8_t* repack = nullptr;      // the decode path's (the slot replacement)
+    uint8_t* repack_pf = nullptr;   // the prompt path's (the staged copy)
     std::vector<strata::kernels::cpu::NativeFmt> zc_fmt;   // the per-job layouts of the experts read in place
     int32_t* d_mtab = nullptr;          // [ctx][3] t, h, w of the current request's prompt cells (vision)
     const int32_t* mtab_now = nullptr;  // set for a forward over prompt cells that need it, else null
@@ -1908,6 +1915,34 @@ struct Engine {
         else f((float*) nullptr);
     }
 
+    /// Frees the MMQ buffers.  A hybrid layer cannot use them (MMQ reads a whole layer's experts from one block,
+    /// `L.blobs`, and a hybrid layer's experts live in two places), and they were allocated with the first card
+    /// current, so the second card's layers could not reach them either.  The members are part of the two cards'
+    /// `set[]`, so both copies are cleared with them.
+    void drop_mmq() {
+        if (!use_mmq) return;
+        int prev = 0;
+        CK(cudaGetDevice(&prev));
+        CK(cudaSetDevice(0));   // init() allocated them there
+        CK(cudaGetLastError());
+        for (void* p : {mq_x, mq_hq, (void*) mq_gu, (void*) mq_h})
+            if (p) CK(cudaFree(p));
+        for (int32_t* p : {rcnt, rcur, rbounds, rmax, ident, rinv})
+            if (p) CK(cudaFree(p));
+        mctx.reset();
+        mq_x = mq_hq = nullptr;
+        mq_gu = mq_h = nullptr;
+        rcnt = rcur = rbounds = rmax = ident = rinv = nullptr;
+        for (Buf& b : set) {
+            b.mq_x = b.mq_hq = nullptr;
+            b.mq_gu = b.mq_h = nullptr;
+            b.rcnt = b.rcur = b.rbounds = b.rmax = b.ident = b.rinv = nullptr;
+        }
+        use_mmq = false;
+        CK(cudaSetDevice(prev));
+        CK(cudaGetLastError());
+    }
+
     void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
         ctx = ctx_;
@@ -2076,6 +2111,7 @@ struct Engine {
             amv = dalloc((size_t) kArgBlocks * kVerify);
             ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
             CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &htoks, (size_t) T * 4, cudaHostAllocDefault));
             n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
             att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
             pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
@@ -3205,8 +3241,8 @@ struct Engine {
                     // the host buffer stays in use until the copy has taken it: wait for the stream before
                     // filling it again
                     CK(cudaStreamSynchronize(cs));
-                    expert_blob(L, x, repack_pf.data());
-                    CK(cudaMemcpyAsync(dst + (size_t) x * L.stride, repack_pf.data(), L.L.bytes, cudaMemcpyHostToDevice,
+                    expert_blob(L, x, repack_pf);
+                    CK(cudaMemcpyAsync(dst + (size_t) x * L.stride, repack_pf, L.L.bytes, cudaMemcpyHostToDevice,
                                        cs));
                 }
                 x = y;
@@ -3522,8 +3558,8 @@ struct Engine {
                     } else {
                         // the low-RAM mode: the expert is repacked out of the mapping first
                         CK(cudaStreamSynchronize(st));
-                        expert_blob(L, x, repack.data());
-                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, repack.data(), L.L.bytes,
+                        expert_blob(L, x, repack);
+                        CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, repack, L.L.bytes,
                                            cudaMemcpyHostToDevice, st));
                     }
                     --left;
@@ -3533,11 +3569,13 @@ struct Engine {
                 }
                 if (vi >= victims.size()) break;
             }
-            if (changed)
-                CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+            if (changed) {
+                std::memcpy(htoks, H.slot_of.data(), (size_t) ne * 4);
+                CK(cudaMemcpyAsync(H.slot_of_d, htoks, (size_t) ne * 4, cudaMemcpyHostToDevice, st));
+            }
             for (double& v : H.score) v *= 0.5;
         }
-        CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
+        CK(cudaStreamSynchronize(st));   // the upload is done before the host table changes
     }
 
     void shrink_att(size_t floats) {
@@ -3660,7 +3698,8 @@ struct Engine {
             const int T = (int) std::min<int64_t>(tmax, n - i);
             CK(cudaStreamSynchronize(st));
             hpin[1] = (int32_t) pos;
-            CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+            std::memcpy(htoks, toks + i, (size_t) T * 4);
+            CK(cudaMemcpyAsync(tok, htoks, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             chunk_pictures(pos, T);
             forward(T, pos, i + T == n ? 1 : 0, false, false);
@@ -3669,7 +3708,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
                 if (T > 1)
                     CK(cudaMemcpyAsync(mtp_seed() + N, hmain, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpyAsync(tok_m, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(tok_m, htoks, (size_t) T * 4, cudaMemcpyHostToDevice, st));
                 CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
                 forward_mtp(T, pos, mtp_seed(), false, false);
             }
@@ -4073,6 +4112,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
                      (double) packed_bytes / (1 << 30));
     }
+    // The MMQ buffers only matter to a layer whose experts all sit in one block, and a hybrid layer never takes that
+    // path (see the prompt path in layer()).  The experts already do not fit in VRAM (`total > fr`), so the placement
+    // is going to be hybrid: free them HERE, before the slot budget is cut, and measure again so the slots take the
+    // room (~386 MiB at chunk 2048 on this model: three experts a layer).  A machine whose experts all fit is not
+    // hybrid and keeps MMQ.
+    if (E.use_mmq && total > fr) {
+        E.drop_mmq();
+        CK(cudaMemGetInfo(&fr, &tot));
+        std::fprintf(stderr, "strata-m2: the experts do not fit in VRAM, so a prompt layer runs on the native kernels: "
+                             "the MMQ buffers are freed and their VRAM goes to the slots\n");
+    }
     size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
     // the MAIN layers' experts fit, the MTP block's not all (UD-Q6_K_XL on 32 GB): the main layers all in VRAM - the
     // text is the all-in-VRAM text, the decode graph stays - and the MTP block's experts on slots + the CPU pool (its
@@ -4224,13 +4274,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t host_cap = E.low_ram ? 0
                                      : host_gib > 0 ? (size_t) (host_gib * (double) (1ull << 30)) : (size_t) -1;
     size_t host = 0;      // the bytes pinned so far (the budget's running total)
-    bool pinned = true;   // every arena so far came from cudaHostAlloc
     {   // the low-RAM mode's repack buffers: one expert's blob, out of the mapping (before the slots' copy,
-        // which uses it)
+        // which uses it).  Pinned: their copies are asynchronous (see the members)
         size_t max_bytes = 0;
         for (Layer* L : all) max_bytes = std::max(max_bytes, L->L.bytes);
-        E.repack.assign(max_bytes, 0);
-        E.repack_pf.assign(max_bytes, 0);
+        CK(cudaHostAlloc((void**) &E.repack, max_bytes, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &E.repack_pf, max_bytes, cudaHostAllocDefault));
     }
     E.hy.resize(all.size());
     if (E.peer_device >= 0) E.peer_hy.resize(all.size());
@@ -4298,8 +4347,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             // arena went through the driver's bounce buffer at 5 MB/s on this box.
             for (int s = 0; s < S; ++s) {
                 const int e = slot_off + s;   // the expert this slot holds (the second card's are the ones the first does not)
-                expert_blob(L, e, E.repack.data());
-                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                expert_blob(L, e, E.repack);
+                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, E.repack, L.L.bytes, cudaMemcpyHostToDevice));
             }
         }
         Engine::Hy& H = E.hy[li];
@@ -4340,8 +4389,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                     // card's otherwise (see peer_first above)
                     const int e = ((E.peer_device == place_dev) ? slot_off + S : S_first) + s;
                     // out of the mapping (the host copy below is the POOL's, and this expert is on a card)
-                    expert_blob(L, e, E.repack.data());
-                    CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, E.repack.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                    expert_blob(L, e, E.repack);
+                    CK(cudaMemcpy(L.peer_blobs + (size_t) s * L.stride, E.repack, L.L.bytes, cudaMemcpyHostToDevice));
                     P.slot_of[(size_t) e] = s;
                     if (li == 0 && getenv("STRATA_M2_DUMP_ROWS")) {   // DIAG: the peer's slot content
                         static std::vector<uint8_t> want, got;
@@ -4394,22 +4443,23 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         const int take = (pool > 0 && left > kMmqTail)
                              ? (int) std::min<size_t>((size_t) pool, (left - kMmqTail) / L.stride)
                              : 0;
-        if (take > 0) {
-            const size_t bytes = (size_t) take * L.stride + kMmqTail;
-            if (cudaHostAlloc((void**) &L.hblobs, bytes, cudaHostAllocDefault) != cudaSuccess) {
-                (void) cudaGetLastError();
-                pinned = false;
-                L.hblobs = (uint8_t*) std::malloc(bytes);
-                if (!L.hblobs) {
-                    err = "no host memory for the experts (" + std::to_string(bytes >> 20) + " MiB)";
-                    return false;
-                }
-            }
+        int want = take;
+        size_t bytes = want > 0 ? (size_t) want * L.stride + kMmqTail : 0;
+        // The arena must be PINNED: the pool reads it at every token and the prompt's stream takes it from RAM (the
+        // asynchronous copies below need a pinned source), so a refused allocation takes fewer experts instead of
+        // falling back to pageable memory, which is both slower than the file and unsafe to copy from asynchronously.
+        while (want > 0 && cudaHostAlloc((void**) &L.hblobs, bytes, cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            L.hblobs = nullptr;
+            want /= 2;
+            bytes = want > 0 ? (size_t) want * L.stride + kMmqTail : 0;
+        }
+        if (want > 0) {
             L.h_first = pool_first;
-            L.h_resident = take;
+            L.h_resident = want;
             host += bytes;
             std::memset(L.hblobs, 0, bytes);
-            for (int64_t e = L.h_first; e < (int64_t) L.h_first + take; ++e) expert_blob(L, e, L.host_blob(e));
+            for (int64_t e = L.h_first; e < (int64_t) L.h_first + want; ++e) expert_blob(L, e, L.host_blob(e));
         }
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
@@ -4543,15 +4593,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             std::snprintf(hb, sizeof hb, "none in host memory (every expert is read from the file)");
         else if (host >= host_all)
             std::snprintf(hb, sizeof hb, "all %.2f GiB in %s host memory", (double) host / (1 << 30),
-                          pinned ? "pinned" : "pageable");
+                          "pinned");
         else if (hmin == hmax)
             std::snprintf(hb, sizeof hb, "%.2f of %.2f GiB in %s host memory (%d of %lld per layer, the experts %d-%d: "
                           "the pool's)", (double) host / (1 << 30), (double) host_all / (1 << 30),
-                          pinned ? "pinned" : "pageable", hmin, (long long) ne, hfirst, hfirst + hmax - 1);
+                          "pinned", hmin, (long long) ne, hfirst, hfirst + hmax - 1);
         else
             std::snprintf(hb, sizeof hb, "%.2f of %.2f GiB in %s host memory (%d-%d of %lld per layer, the experts %d-%d: "
                           "the pool's)", (double) host / (1 << 30), (double) host_all / (1 << 30),
-                          pinned ? "pinned" : "pageable", hmin, hmax, (long long) ne, hfirst, hfirst + hmax - 1);
+                          "pinned", hmin, hmax, (long long) ne, hfirst, hfirst + hmax - 1);
         if (E.split_dev >= 0)
             std::fprintf(stderr, "strata-m2: hybrid experts: %d of %lld per layer on card 0 (%.2f GiB) and %d on card 1 "
                          "(%.2f GiB), %s, a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f "

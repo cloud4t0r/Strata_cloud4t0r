@@ -247,6 +247,14 @@ It used to be sized on a per-layer share of the budget (`budget / layers / strid
 came to 158 experts where the pool has 166: the last 8 were read out of the file at every decode step, and the
 arena still took 30.42 GiB where 22.05 GiB hold the whole pool.
 
+The arena is PINNED, and every asynchronous copy in the engine now reads from pinned memory: the two repack
+buffers, the slot table and a prompt chunk's tokens. A pageable source used to make the card's copy engine read
+pages the driver had not mapped into it; the kernel log names it (`Faulty UTCL2 client ID: SDMA0`,
+`PERMISSION_FAULTS: 0x3`, a host address) and the engine saw `Memory access fault ... Page not present`. That was
+the intermittent fault of 2026-10-29 with `--resident-budget-gib 40`: one run in five died, always on the second
+card. When pinned memory runs out, a layer now pins half as many experts (down to none, read from the file) instead
+of falling back to pageable memory, which is both slower than the file and unsafe to copy from asynchronously.
+
 ```sh
 ./build-hip2/strata-m2 --model ... --resident-budget-gib 30
 ```
