@@ -562,6 +562,31 @@ after the start read 26 prompt tokens at 4.7 tok/s and decoded 45 at 5.1.
 - The layer split runs without the decode graph (from the engine code). One card's decode at the same
   context and mode is not measured yet.
 
+Where a decode step's time goes (same machine, 32K, `--low-ram`, `--pool-workers 15`, `--layer-split 31`,
+62 and 60 slots a layer, a 64-token answer, the file in the page cache, 11.5 tok/s):
+
+| | seconds | share of the decode |
+| --- | ---: | ---: |
+| the whole answer | 5.54 | 100% |
+| the CPU pool's expert rows | 4.78 | 86% |
+| waiting for the routing's rows | 1.08 | 19% |
+
+19,270 of the batch entries went to the pool, 0.248 ms each. At a decode step every entry is its own job (one
+token), so each one reads a whole expert blob of 5.3 MiB and no expert is reused between two tokens: that works
+out to ~21 GB/s of host memory read, which is what the decode spends its time on. The CPU-GPU rendezvous is a
+fifth of it (the routing wait), and the card's own work is smaller still.
+
+The split moves with the file cache, and the two numbers do not add up to the answer's time (the pool runs while
+the card works): the same 64-token answer took 21.8 s with the cache cold, where the pool alone (22.5 s) was
+larger than the total and the routing wait 3.2 s.
+
+The lever that changes the order of magnitude is therefore the number of experts in VRAM, not the handshake:
+62 of 256 a layer is 24%, so three quarters of those bytes are read from the host at every token. Keeping the
+pool's experts in pinned host RAM (`--resident-budget-gib 40`) was meant to test that, and the comparison did not
+land: its first pass spent 18.5 s in the pool against 18.2 s waiting for the routing, and its second pass faulted
+on the second card (`Memory access fault ... Page not present`, on a host address). That mode is not the default,
+and the fault is not explained yet.
+
 ## Notes
 
 - The build's CMake cache may have a stale `CMAKE_PROJECT_INCLUDE` that must be removed before reconfiguring:

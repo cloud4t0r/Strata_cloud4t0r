@@ -1793,6 +1793,7 @@ struct Engine {
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
     double hy_cpu_ms = 0;
+    double hy_wait_ms = 0;   // time the pool's thread spent waiting for the routing's rows to reach the host
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
     // window never steps over one), so plain and speculative decoding see the same slot tables at every position
@@ -3349,7 +3350,11 @@ struct Engine {
         Hy& H = hy[li];
         // the layer's OWN copy (the layer split: the second card's layers have their own weights)
         const Layer& L = layer_of((size_t) li);
-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+        {
+            const auto tw = Clock::now();
+            while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+            }
+            hy_wait_ms += ms_since(tw);
         }
         const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
@@ -3982,6 +3987,7 @@ struct Engine {
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_peer = 0;
         hy_cpu_ms = 0;
+        hy_wait_ms = 0;
         reset();
         std::fprintf(stderr, "strata-m2: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
@@ -5586,9 +5592,9 @@ int strata::minimaxm2::run(int argc, char** argv) {
             char peer_txt[64] = "";
             if (E.hy_peer > 0) std::snprintf(peer_txt, sizeof peer_txt, ", %lld on the peer", E.hy_peer);
             std::fprintf(stderr, "strata-m2: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
-                         "CPU pool%s in %.0f ms, %lld slot replacements\n", E.hy_gpu, n,
+                         "CPU pool%s in %.0f ms (waited %.0f ms for the routing), %lld slot replacements\n", E.hy_gpu, n,
                          n ? 100.0 * (double) E.hy_gpu / (double) n : 0.0,
-                         E.hy_cpu, peer_txt, E.hy_cpu_ms, E.hy_swaps);
+                         E.hy_cpu, peer_txt, E.hy_cpu_ms, E.hy_wait_ms, E.hy_swaps);
         }
     } report{E};
     E.reset();
