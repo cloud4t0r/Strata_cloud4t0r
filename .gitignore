@@ -34,8 +34,11 @@ td.log
 /mtp/
 /run-*.bat
 /run-*.sh
+/run.sh
 /run_minimax_m2.sh
 /.run_minimax_m2.override.json
+/run_m2_lowram.sh
+/run_minimax_m25.sh
 /strata-*.json
 /strata-*.log
 /ds4-slots/

@@ -1,1 +1,1 @@
-run-deepseek-v4.1-flash-ist-das-2.25bpw.sh
+run_m2_lowram.sh
