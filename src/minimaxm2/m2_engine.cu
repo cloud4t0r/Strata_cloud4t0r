@@ -4212,6 +4212,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
                      (double) packed_bytes / (1 << 30));
     }
+    if (E.mmq_hybrid)
+        std::fprintf(stderr, "strata-m2: MMQ reads the hybrid layers' prompts too (STRATA_M2_MMQ_HYBRID): the fill "
+                             "stages their residents out of their VRAM blob\n");
     // The MMQ buffers only matter to a layer whose experts all sit in one block, and a hybrid layer never takes that
     // path (see the prompt path in layer()).  The experts already do not fit in VRAM (`total > fr`), so the placement
     // is going to be hybrid: free them HERE, before the slot budget is cut, and measure again so the slots take the
