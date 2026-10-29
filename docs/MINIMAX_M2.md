@@ -237,6 +237,15 @@ embedding lookup, which computes `table + 2^31 * row_bytes`: the card aborted wi
 (the default 128) and at least one resident expert, and it also hit the 27 October binary. Hybrid layers now take
 the native streamed path; MMQ is left to the all-resident layers.
 
+`STRATA_M2_MMQ_HYBRID=1` puts MMQ back on hybrid layers, and the fill then stages EVERY expert of the layer: the
+residents are copied out of their VRAM blob first (a device-to-host copy each, 4.2 MiB on M2.5), so MMQ reads the
+right bytes. It is off by default because the native path is faster where the chunks are small: on the reference
+machine a 512-token prompt takes 22.2 s that way against 32.1 s through MMQ (the residents' copies are 17 GiB of
+device-to-host traffic over the prompt). On a machine whose chunks are thousands of tokens MMQ is the opposite: a
+two-card host measured a 23.6 s warm-up through MMQ against 168.9 s through the native kernels. Either way the
+logits stay finite and the same token comes out: 200,064 logits compared, no NaN or infinity, a largest difference
+of 0.38 (MMQ quantises the activations to int8, the native path does not), and the same argmax.
+
 On this machine the native path is also the faster one at an equal placement: a 512-token prompt with
 `--expert-vram 0` (RX 9070 + RX 6800, IQ2_XXS) read at 10.5 tok/s against MMQ's 8.8.
 
@@ -492,6 +501,7 @@ through host memory (host-staged, not peer-to-peer) because the two cards are di
 | `STRATA_M2_SWAPS_AFTER_PROMPT` | Slot replacements allowed right after a prompt (default 256) |
 | `STRATA_M2_SWAPS_PERIODIC` | Slot replacements the decode may make every 32 positions (default 256) |
 | `STRATA_M2_NO_PREAD` | Set to any value to copy the prompt's experts out of the mapping instead of reading them with `pread` |
+| `STRATA_M2_MMQ_HYBRID` | Set to any value to run hybrid layers' prompts through MMQ (the fill then stages the residents out of VRAM; default: the native kernels) |
 
 ## Peer tier (experimental)
 

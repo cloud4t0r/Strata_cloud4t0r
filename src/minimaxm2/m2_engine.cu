@@ -1617,6 +1617,11 @@ struct Engine {
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
     // the prompt's MMQ experts
     bool use_mmq = false;
+    // MMQ on a HYBRID layer (some experts in VRAM): off by default, because the fill then has to stage the
+    // residents out of their blob (a device-to-host copy per expert) and the native path is faster where the
+    // chunks are small.  On a machine where the prompt is thousands of tokens (2 cards, big chunks) MMQ reads
+    // them far faster, and STRATA_M2_MMQ_HYBRID=1 asks for it.
+    bool mmq_hybrid = false;
     std::unique_ptr<MMQ::Context> mctx;
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
     void *mq_x = nullptr, *mq_hq = nullptr;
@@ -1848,6 +1853,7 @@ struct Engine {
     cudaEvent_t ev_used_of(int d, int b) const { return on_card2(d) ? ev_used2[b] : ev_used[b]; }
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
     int stream_pos = 0;
+    bool stream_mmq = false;   // the prompt of this sequence goes through MMQ: the fill stages EVERY expert of a layer
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
     double hy_cpu_ms = 0;
     double hy_wait_ms = 0;   // time the pool's thread spent waiting for the routing's rows to reach the host
@@ -2113,6 +2119,7 @@ struct Engine {
             // block, so a hybrid layer (some experts in slots) always takes the native path, and `use_mmq` no longer
             // implies `stream_native == false`.
             stream_native = std::getenv("STRATA_M2_NO_STREAM_NATIVE") == nullptr;
+            mmq_hybrid = use_mmq && std::getenv("STRATA_M2_MMQ_HYBRID") != nullptr;
             stream_vram = std::getenv("STRATA_M2_STREAM_VRAM") != nullptr;
             if (use_mmq) {
                 const int64_t ne = (int64_t) T * Kp;
@@ -2923,7 +2930,7 @@ struct Engine {
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
-        } else if (T > kGemmT && use_mmq && !lhy(li)) {
+        } else if (T > kGemmT && use_mmq && (!lhy(li) || mmq_hybrid)) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
@@ -3045,7 +3052,7 @@ struct Engine {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
-            stream_begin(seq);
+            stream_begin(seq, T > kGemmT && use_mmq && mmq_hybrid);
         }
         // the layer split: the embedding and the first layers are on the first card, so the run starts there.
         // The head of the previous call may have left the second card current, so the device is set
@@ -3220,7 +3227,11 @@ struct Engine {
     const Layer& layer_at(int li) const { return li < (int) m->layers.size() ? m->layers[(size_t) li] : m->mtp; }
 
     /// A streamed forward over the state indices `seq`: the first two layers' experts start copying now.
-    void stream_begin(const std::vector<int>& seq) {
+    /// `stream_mmq` says the prompt of these layers goes through MMQ, which reads every expert of a layer from ONE
+    /// base pointer and `L.stride` (see layer()): the fill must then put the residents in the staging too, out of
+    /// their VRAM blob, or MMQ reads whatever the buffer held for them.
+    void stream_begin(const std::vector<int>& seq, bool mmq = false) {
+        stream_mmq = mmq;
         stream_seq = seq;
         stream_pos = 0;
         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
@@ -3238,6 +3249,28 @@ struct Engine {
             CK(cudaEventSynchronize(ev_used[b]));   // the buffer's last reader on card 0 is done
             if (split_dev > 0) CK(cudaEventSynchronize(ev_used2[b]));   // ... and on card 1 (the pair is shared)
             uint8_t* dst = stage[b];
+            // MMQ reads every expert of the layer from this buffer, `L.stride` apart, so the residents have to be
+            // here too: they live in VRAM, and this copies them out of their blob (a device-to-host copy each, on
+            // the layer's own card).  Without it MMQ read whatever the buffer held for them.
+            if (stream_mmq && lhy(li)) {
+                const int d = card_of(li);
+                int prev = 0;
+                CK(cudaGetDevice(&prev));
+                if (prev != d) {
+                    CK(cudaSetDevice(d));
+                    CK(cudaGetLastError());
+                }
+                for (int x = 0; x < ne; ++x) {
+                    const int s = H.slot_of[(size_t) x];
+                    if (s < 0) continue;
+                    CK(cudaMemcpy(dst + (size_t) x * L.stride, L.blobs + (size_t) s * L.stride, L.L.bytes,
+                                  cudaMemcpyDeviceToHost));
+                }
+                if (prev != d) {
+                    CK(cudaSetDevice(prev));
+                    CK(cudaGetLastError());
+                }
+            }
             // The experts are copied by the fill pool's threads, not by this one: this thread has the layer's
             // launches to queue (`stream_done` has just recorded that the GPU is done with this buffer).
             fill.run(
@@ -4184,7 +4217,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // is going to be hybrid: free them HERE, before the slot budget is cut, and measure again so the slots take the
     // room (~386 MiB at chunk 2048 on this model: three experts a layer).  A machine whose experts all fit is not
     // hybrid and keeps MMQ.
-    if (E.use_mmq && total > fr) {
+    if (E.use_mmq && total > fr && !E.mmq_hybrid) {
         E.drop_mmq();
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-m2: the experts do not fit in VRAM, so a prompt layer runs on the native kernels: "
