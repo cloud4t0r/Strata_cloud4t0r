@@ -269,6 +269,33 @@ __global__ void k_gate_rows(float* sh, const float* gate, int n, int T) {
 __device__ __forceinline__ float kv_ld(float v) { return v; }
 __device__ __forceinline__ float kv_ld(__half v) { return __half2float(v); }
 __device__ __forceinline__ float kv_ld(int8_t v) { return (float) v; }
+/// Four elements in one 16-byte load.  The decode's score loop gives one thread one CELL, so consecutive threads read
+/// addresses `HD` apart: one byte at a time that is one 32-byte transaction (or a 128-byte line) per useful byte, and
+/// measured far slower than the arithmetic.  A 16-byte load is the largest group every element type allows, and the
+/// four products are still accumulated in the same order, so the result does not move.
+template <class KV> __device__ __forceinline__ void kv_ld4(const KV* p, float* o);
+template <> __device__ __forceinline__ void kv_ld4<float>(const float* p, float* o) {
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    o[0] = v.x;
+    o[1] = v.y;
+    o[2] = v.z;
+    o[3] = v.w;
+}
+template <> __device__ __forceinline__ void kv_ld4<__half>(const __half* p, float* o) {
+    const __half2 a = *reinterpret_cast<const __half2*>(p);
+    const __half2 b = *reinterpret_cast<const __half2*>(p + 2);
+    o[0] = __low2float(a);
+    o[1] = __high2float(a);
+    o[2] = __low2float(b);
+    o[3] = __high2float(b);
+}
+template <> __device__ __forceinline__ void kv_ld4<int8_t>(const int8_t* p, float* o) {
+    const char4 v = *reinterpret_cast<const char4*>(p);
+    o[0] = (float) v.x;
+    o[1] = (float) v.y;
+    o[2] = (float) v.z;
+    o[3] = (float) v.w;
+}
 __device__ __forceinline__ void kv_st(float* p, float v) { *p = v; }
 __device__ __forceinline__ void kv_st(__half* p, float v) { *p = __float2half(v); }
 
@@ -503,11 +530,25 @@ __global__ void k_attn_part(const float* q, const KV* kc, const KV* vc, const __
             for (int b = 0; b < kKvBlocks; ++b) {
                 const int i0 = b * kKvBlock;
                 float part = 0.f;
-                for (int i = i0; i < i0 + kKvBlock; ++i) part += qs[i] * kv_ld(kp[i]);
+                for (int i = i0; i < i0 + kKvBlock; i += 4) {   // four elements a load, same order
+                    float k4[4];
+                    kv_ld4(kp + i, k4);
+                    part += qs[i] * k4[0];
+                    part += qs[i + 1] * k4[1];
+                    part += qs[i + 2] * k4[2];
+                    part += qs[i + 3] * k4[3];
+                }
                 a += part * __half2float(ks[b]);
             }
         } else {
-            for (int i = 0; i < HD; ++i) a += qs[i] * kv_ld(kp[i]);
+            for (int i = 0; i < HD; i += 4) {
+                float k4[4];
+                kv_ld4(kp + i, k4);
+                a += qs[i] * k4[0];
+                a += qs[i + 1] * k4[1];
+                a += qs[i + 2] * k4[2];
+                a += qs[i + 3] * k4[3];
+            }
         }
         s = a * scale;
     }
