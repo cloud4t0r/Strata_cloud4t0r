@@ -27,6 +27,7 @@ struct Model {
     double eps = 0, rope_full = 0, rope_swa = 0, expert_scale = 0;
     bool expert_norm = false;
     std::vector<double> n_head, n_head_kv, is_swa, clamp_exp, clamp_shexp;
+    std::vector<float> rope_freqs;   ///< rope_freqs.weight: llama3's frequency factors, full-attention blocks only
 
     int64_t heads(int64_t l) const { return (int64_t) n_head[(size_t) l]; }
     int64_t kv_heads(int64_t l) const { return (int64_t) n_head_kv[(size_t) l]; }

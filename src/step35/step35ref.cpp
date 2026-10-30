@@ -129,11 +129,16 @@ void rms_norm(std::vector<float>& x, const std::vector<float>& w, double eps) {
 
 float silu(float v) { return (float) ((double) v / (1.0 + std::exp(-(double) v))); }
 
-/// RoPE on one head: the first `n_rot` of its dims turn, the rest are left alone.  `pairs` are (even, odd).
-void rope(float* v, int64_t head_dim, int64_t n_rot, int64_t pos, double base) {
+/// RoPE on one head: the first `n_rot` of its dims turn, the rest are left alone.  `ff`, when given, is the
+/// model's rope_freqs table (llama3 scaling): ggml divides the pair's angle by it (ggml-cpu ops.cpp:6194,
+/// `rope_yarn(theta/ff, ...)`), and llama.cpp hands that table to the full-attention blocks only.
+void rope(float* v, int64_t head_dim, int64_t n_rot, int64_t pos, double base, const std::vector<float>* ff) {
     for (int64_t i = 0; i + 1 < n_rot; i += 2) {
         const double freq = 1.0 / std::pow(base, (double) i / (double) n_rot);
-        const double theta = (double) pos * freq;
+        double theta = (double) pos * freq;
+        if (ff && (size_t) (i / 2) < ff->size() && (*ff)[(size_t) (i / 2)] != 0.0f) {
+            theta /= (double) (*ff)[(size_t) (i / 2)];
+        }
         const double c = std::cos(theta), s = std::sin(theta);
         const double a = v[i], b = v[i + 1];
         v[i] = (float) (a * c - b * s);
@@ -178,6 +183,7 @@ bool load(const std::string& path, Model& m, std::string& err) {
         // block half of them
         m.n_rot_swa = m.head_dim;
         m.n_rot_full = m.head_dim / 2;
+        if (f.find("rope_freqs.weight")) m.rope_freqs = vector_of(f, "rope_freqs.weight");
         const MetaValue* tok = f.meta().get("tokenizer.ggml.tokens");
         if (!tok || tok->type != MetaType::ARRAY) throw std::runtime_error("missing tokenizer.ggml.tokens");
         m.n_vocab = (int64_t) tok->count;
@@ -239,8 +245,11 @@ bool forward(const Model& m, const std::vector<int32_t>& tokens, int64_t layers,
                 };
                 per_head_norm(q, nh, q_norm_w);
                 per_head_norm(k, nkv, k_norm_w);
-                for (int64_t hh = 0; hh < nh; ++hh) rope(q.data() + hh * hd, hd, rot, p, base);
-                for (int64_t hh = 0; hh < nkv; ++hh) rope(k.data() + hh * hd, hd, rot, p, base);
+                // llama.cpp: the frequency factors go to the FULL-attention blocks and nowhere else
+                const std::vector<float>* ff = m.sliding(L) ? nullptr : &m.rope_freqs;
+                if (ff && ff->empty()) ff = nullptr;
+                for (int64_t hh = 0; hh < nh; ++hh) rope(q.data() + hh * hd, hd, rot, p, base, ff);
+                for (int64_t hh = 0; hh < nkv; ++hh) rope(k.data() + hh * hd, hd, rot, p, base, ff);
                 kv[(size_t) L][(size_t) p].k = k;
                 kv[(size_t) L][(size_t) p].v = v;
                 // attention: causal, and on a sliding block only the last `window` positions
