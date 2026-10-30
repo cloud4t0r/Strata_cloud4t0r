@@ -927,7 +927,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # `strata` switches to for a step35 model (the family switch at the top of its main) and that strata-step35
   # wraps on its own.  It carries the file's own validator (--inspect) and the CPU reference (--ref, step35ref.cpp)
   # that the GPU kernels will be compared against; the kernels themselves come next.
-  add_library(strata_step35 STATIC src/step35/step35_engine.cu src/step35/step35ref.cpp src/step35/step35_kernels.cu src/step35/step35_gemv.cu src/step35/step35_moe.cu src/step35/step35_attn.cu src/step35/step35_block.cu)
+  add_library(strata_step35 STATIC src/step35/step35_engine.cu src/step35/step35ref.cpp src/step35/step35_kernels.cu src/step35/step35_gemv.cu src/step35/step35_moe.cu src/step35/step35_attn.cu src/step35/step35_block.cu src/step35/step35_seq.cu)
   target_include_directories(strata_step35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/step35 PRIVATE ${_strata_gpu_include_directories} "${STRATA_GGML_DIR}/ggml/include")
   target_link_libraries(strata_step35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)

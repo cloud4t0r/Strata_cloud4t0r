@@ -80,6 +80,12 @@ bool upload_moe_block(const strata::GgufModel& file, int layer, MoeBlock& b, std
 void release_moe_block(MoeBlock& b);
 bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
 
+/// The whole model over a prompt of several positions, DENSE blocks only for now: every position goes through
+/// each block at once (see src/step35/step35_seq.cu).  `sums` receives, per block, the hidden state summed over
+/// every position - the figure `--ref` prints - and `out` the last block's output, [n_pos][n_embd].
+bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
+                      std::vector<float>& out, std::vector<double>& sums, std::string& err);
+
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
 /// mapping into three reused device buffers for each block.  Slow by design - it is what lets the whole model

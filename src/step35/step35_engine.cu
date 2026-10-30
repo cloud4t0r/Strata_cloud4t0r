@@ -664,6 +664,37 @@ int gpu_all(const std::string& path, int32_t token, int pos) {
     }
 }
 
+/// `--gpu-seq`: a PROMPT of several positions through the dense blocks on the GPU.
+int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks, int pos) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        std::vector<int32_t> ids;
+        for (size_t i = 0; i < tokens_csv.size();) {
+            size_t j = tokens_csv.find(',', i);
+            if (j == std::string::npos) j = tokens_csv.size();
+            ids.push_back((int32_t) std::strtol(tokens_csv.substr(i, j - i).c_str(), nullptr, 10));
+            i = j + 1;
+        }
+        if (ids.empty()) {
+            std::printf("strata-step35: --gpu-seq needs --tokens <id,id,...>\n");
+            return 2;
+        }
+        std::vector<float> out;
+        std::vector<double> sums;
+        std::string err;
+        if (!kernels::run_prompt_dense(file, ids, pos, n_blocks, out, sums, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("strata-step35: %zu position(s) through %d dense block(s) on the GPU\n", ids.size(), n_blocks);
+        for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
 void usage() {
     std::printf(
         "strata-step35: the Step-3.7-Flash engine path (GGUF architecture step35)\n"
@@ -765,11 +796,14 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
 int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0;
-    bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false;
+    bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--gpu-seq") == 0) {
+            trunk = argv[++i];
+            want_seq = true;
         } else if (std::strcmp(argv[i], "--gpu-all") == 0) {
             trunk = argv[++i];
             want_all = true;
@@ -806,6 +840,7 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump);
+    if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos);
     if (want_all) {
         if (token < 0) {
             std::printf("strata-step35: --gpu-all needs --token <id>\n");
