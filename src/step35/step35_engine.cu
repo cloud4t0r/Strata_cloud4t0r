@@ -682,6 +682,10 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
             std::printf("strata-step35: --gpu-seq needs --tokens <id,id,...>\n");
             return 2;
         }
+        // `--layers` omitted is 0, and the help says the prompt goes through every block: a pass over zero blocks
+        // prints an empty result and looks like a model that answers nothing.
+        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
         std::vector<float> out;
         std::vector<double> sums;
         std::string err;
@@ -827,7 +831,9 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
         std::printf("strata-step35: %s\n", err.c_str());
         return 1;
     }
-    if (layers < 0 || layers > m.n_layers) layers = m.n_layers;
+    // `--layers` omitted is 0 here, and 0 has always meant "every block" in the help text: the comparison that
+    // left the range check as `layers < 0` ran no block at all and printed the embedding as if it were an answer.
+    if (layers <= 0 || layers > m.n_layers) layers = m.n_layers;
     std::vector<int32_t> ids;
     for (size_t i = 0; i < tokens_csv.size();) {
         size_t j = tokens_csv.find(',', i);
