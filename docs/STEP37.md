@@ -126,6 +126,33 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No integration.** `setup.py`, `strata launch --family step35`, the app and `serve` know nothing about the
   family yet. `strata` dispatches a `step35` file to `strata-step35`, and that is all.
 
+## The KV cache: what is already there, and what is missing
+
+A prompt now runs, but its K/V is thrown away. Reusing it is the one thing between here and a chat turn, and the
+build is mostly in `strata_kernels` already - the Qwen3.6 and MiniMax-M2 engines use it:
+
+- `kv_q8.hpp`: the cell is `int8` codes plus one `f16` scale per `KV_Q8_GROUP` (64) dimensions, for K and for V.
+- `kv_append_q8_step` / `kv_append_q8_steps`: append one cell (or n tokens' cells) at a position read from
+  DEVICE memory, with a page table, so a captured graph stays valid.
+- a gather of the cells named by an id list, into fp16 scratch, and the attention kernels that read `int8` K/V
+  with their scales (the MiniMax-M2 path's `k_attn_*`).
+- `kv_stream.hpp` for a host copy, when the cache outgrows VRAM.
+
+What has to be written:
+
+1. A `Session` that owns, per layer, the K/V codes and scales, and a `n_cached` position count. Today
+   `src/step35/step35_seq.cu` allocates q/k/v inside the layer loop and frees them at the end of the pass.
+2. The prefill writing each position's cells with `kv_append_q8_steps` instead of keeping fp32 tensors.
+3. A decode step: one position, `n_pos = 1`, attention over `0..n_cached` through the quantized cache kernel
+   rather than `attn_causal` (which takes fp32 K/V for the whole sequence and is the validation vehicle).
+4. A parity test: prefill 6 positions, decode 1, against `--ref --tokens "<7 ids>"` - the reference already does
+   the whole sequence, so the comparison costs nothing new.
+
+Size, in arithmetic rather than measurement: 8 KV heads x 128 dims = 1024 values per layer per token, so
+1024 int8 + 16 f16 scales = 1056 bytes per side, 2112 per layer, ~95 KB per token for the 45 layers. That is
+0.78 GB at 8192 tokens, 3.1 GB at 32768 and 12.4 GB at 131072 - which is why the quantized form is the one to
+build first: the fp32 cache would be 4.5x that.
+
 ## Tests
 
 ```sh
