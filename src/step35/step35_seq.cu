@@ -18,6 +18,7 @@
 #include "strata/step35/block.hpp"
 #include "strata/step35/gemv.hpp"
 #include "strata/step35/kernels.hpp"
+#include "strata/step35/moe.hpp"
 
 #include <cuda_runtime.h>
 #include <ggml.h>
@@ -51,6 +52,24 @@ bool proj(ggml_type t, const void* w, const float* x, float* y, int n_in, int n_
         }
     }
     return true;
+}
+
+/// One tensor, raw (the quantized bytes as stored), on the device.
+void* upload(const strata::GgufModel& f, const std::string& name, size_t& bytes) {
+    size_t shard = 0;
+    const strata::TensorInfo* t = f.find(name, &shard);
+    if (!t) throw std::runtime_error("missing tensor " + name);
+    bytes = strata::tensor_payload_bytes(*t);
+    void* d = nullptr;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) throw std::runtime_error("out of device memory for " + name);
+    if (cudaMemcpy(d, f.shard(shard).tensor_data(*t), bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("copy failed for " + name);
+    return d;
+}
+
+__global__ void k_acc_scaled_rows(float* acc, const float* y, float w, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += w * y[i];
 }
 
 __global__ void k_add_n(float* x, const float* y, int n) {
@@ -108,6 +127,15 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                       int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err) {
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
+    const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
+    const std::string pfx = "step35.";
+    const int n_expert = (int) file.meta().get(pfx + "expert_count")->num();
+    const int top_k = (int) file.meta().get(pfx + "expert_used_count")->num();
+    const int n_ff_exp = (int) file.meta().get(pfx + "expert_feed_forward_length")->num();
+    const int n_ff_sh = (int) file.meta().get(pfx + "expert_shared_feed_forward_length")->num();
+    const float exp_scale = (float) file.meta().get(pfx + "expert_weights_scale")->num();
+    const strata::MetaValue* normv = file.meta().get(pfx + "expert_weights_norm");
+    const bool exp_norm = normv && normv->type == strata::MetaType::BOOL && normv->u != 0;
     const int e = (int) n_embd;
     if (!embed_rows(file, tokens, n_embd, out, err)) return false;
 
@@ -121,8 +149,9 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     cudaMemcpy(d_h, out.data(), out.size() * sizeof(float), cudaMemcpyHostToDevice);
 
     for (int layer = 0; layer < n_blocks; ++layer) {
+        const bool is_moe = layer >= dense_layers;
         DenseBlock b;
-        if (!upload_block(file, layer, b, err)) return false;
+        if (!upload_block(file, layer, b, err, !is_moe)) return false;
         const int hd = b.head_dim, nh = b.n_head, nkv = b.n_head_kv;
         float *x = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *gt = nullptr, *res = nullptr;
         float *g = nullptr, *u = nullptr, *act = nullptr, *d = nullptr;
@@ -165,15 +194,104 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         if (ok) ok = proj((ggml_type) b.t_wo, b.wo, ao, res, nh * hd, e, n_pos, d_q8, err);
         if (ok) k_add_n<<<(n_pos * e + 255) / 256, 256>>>(d_h, res, n_pos * e);
 
-        // ---- the dense feed-forward
         if (ok) cudaMemcpy(x, d_h, (size_t) n_pos * e * sizeof(float), cudaMemcpyDeviceToDevice);
         if (ok) per_head_rms_norm(x, n_pos, e, b.ffn_norm, b.eps, nullptr);
-        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_gate, x, g, e, b.ff, n_pos, d_q8, err);
-        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_up, x, u, e, b.ff, n_pos, d_q8, err);
-        if (ok) cudaMemcpy(act, g, (size_t) n_pos * b.ff * sizeof(float), cudaMemcpyDeviceToDevice);
-        if (ok) k_silu_mul_n<<<(n_pos * b.ff + 255) / 256, 256>>>(act, u, n_pos * b.ff, 0.0f);
-        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_down, act, d, b.ff, e, n_pos, d_q8, err);
-        if (ok) k_add_n<<<(n_pos * e + 255) / 256, 256>>>(d_h, d, n_pos * e);
+        if (ok && !is_moe) {
+            // ---- the dense feed-forward
+            ok = proj((ggml_type) b.t_ffn, b.ffn_gate, x, g, e, b.ff, n_pos, d_q8, err);
+            if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_up, x, u, e, b.ff, n_pos, d_q8, err);
+            if (ok) cudaMemcpy(act, g, (size_t) n_pos * b.ff * sizeof(float), cudaMemcpyDeviceToDevice);
+            if (ok) k_silu_mul_n<<<(n_pos * b.ff + 255) / 256, 256>>>(act, u, n_pos * b.ff, 0.0f);
+            if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_down, act, d, b.ff, e, n_pos, d_q8, err);
+            if (ok) k_add_n<<<(n_pos * e + 255) / 256, 256>>>(d_h, d, n_pos * e);
+        } else if (ok) {
+            // ---- the mixture of experts, ONE POSITION AT A TIME (each position routes on its own)
+            const std::string pre = "blk." + std::to_string(layer) + ".";
+            size_t shard_g = 0, shard_d = 0;
+            const strata::TensorInfo* tg = file.find(pre + "ffn_gate_exps.weight", &shard_g);
+            const strata::TensorInfo* td = file.find(pre + "ffn_down_exps.weight", &shard_d);
+            if (!tg || !td) { err = "missing expert tensor"; ok = false; }
+            const size_t gate_bytes = ok ? strata::tensor_payload_bytes(*tg) / (size_t) n_expert : 0;
+            const size_t down_bytes = ok ? strata::tensor_payload_bytes(*td) / (size_t) n_expert : 0;
+            const uint8_t* base_g = ok ? (const uint8_t*) file.shard(shard_g).tensor_data(*tg) : nullptr;
+            const uint8_t* base_d = ok ? (const uint8_t*) file.shard(shard_d).tensor_data(*td) : nullptr;
+            size_t shard_u = 0;
+            const strata::TensorInfo* tu = file.find(pre + "ffn_up_exps.weight", &shard_u);
+            const uint8_t* base_u = tu ? (const uint8_t*) file.shard(shard_u).tensor_data(*tu) : nullptr;
+            if (!tu) { err = "missing ffn_up_exps"; ok = false; }
+            size_t rb = 0;
+            void* router = nullptr;
+            float* sbias = nullptr;
+            void *sg = nullptr, *su = nullptr, *sd = nullptr;
+            float *logits = nullptr, *eg = nullptr, *eu = nullptr, *eact = nullptr, *ed = nullptr, *eacc = nullptr;
+            int32_t* ids = nullptr;
+            float* wts = nullptr;
+            void *dg = nullptr, *du = nullptr, *dd = nullptr;
+            int t_sh = 0;
+            if (ok) {
+                try {
+                    router = upload(file, pre + "ffn_gate_inp.weight", rb);
+                    t_sh = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
+                    if (file.find(pre + "exp_probs_b.bias")) sbias = (float*) upload(file, pre + "exp_probs_b.bias", rb);
+                    sg = upload(file, pre + "ffn_gate_shexp.weight", rb);
+                    su = upload(file, pre + "ffn_up_shexp.weight", rb);
+                    sd = upload(file, pre + "ffn_down_shexp.weight", rb);
+                } catch (const std::exception& ex) {
+                    err = ex.what();
+                    ok = false;
+                }
+            }
+            ok = ok && cudaMalloc((void**) &logits, (size_t) n_expert * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &eg, (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &eu, (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &eact, (size_t) n_ff_sh * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &ed, (size_t) e * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &eacc, (size_t) e * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &ids, (size_t) top_k * sizeof(int32_t)) == cudaSuccess &&
+                 cudaMalloc((void**) &wts, (size_t) top_k * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc(&dg, gate_bytes) == cudaSuccess && cudaMalloc(&du, gate_bytes) == cudaSuccess &&
+                 cudaMalloc(&dd, down_bytes) == cudaSuccess;
+            float clamp_exp = 0, clamp_sh = 0;
+            for (const auto& c : {std::make_pair("swiglu_clamp_exp", &clamp_exp),
+                                  std::make_pair("swiglu_clamp_shexp", &clamp_sh)}) {
+                const strata::MetaValue* v = file.meta().get(pfx + c.first);
+                if (v && v->type == strata::MetaType::ARRAY && (int) v->items.size() > layer)
+                    *c.second = (float) v->items[(size_t) layer].num();
+            }
+            std::vector<int32_t> h_ids((size_t) top_k);
+            std::vector<float> h_w((size_t) top_k);
+            for (int p = 0; ok && p < n_pos; ++p) {
+                const float* xp = x + (size_t) p * e;
+                float* hp = d_h + (size_t) p * e;
+                ok = gemv(GGML_TYPE_F32, router, xp, logits, e, n_expert, d_q8, nullptr);
+                if (ok) moe_route(logits, sbias, 1, n_expert, top_k, exp_scale, exp_norm, ids, wts, nullptr);
+                if (ok) ok = cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok) ok = cudaMemcpy(h_w.data(), wts, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok) ok = cudaMemset(eacc, 0, (size_t) e * sizeof(float)) == cudaSuccess;
+                for (int k = 0; ok && k < top_k; ++k) {
+                    const size_t ex = (size_t) h_ids[(size_t) k];
+                    ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (ok) ok = gemv((ggml_type) tg->type, dg, xp, eg, e, n_ff_exp, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) tg->type, du, xp, eu, e, n_ff_exp, d_q8, nullptr);
+                    if (ok) ok = cudaMemcpy(eact, eg, (size_t) n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+                    if (ok) k_silu_mul_n<<<(n_ff_exp + 255) / 256, 256>>>(eact, eu, n_ff_exp, clamp_exp);
+                    if (ok) ok = gemv((ggml_type) tg->type, dd, eact, ed, n_ff_exp, e, d_q8, nullptr);
+                    if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, h_w[(size_t) k], e);
+                }
+                if (ok) ok = gemv((ggml_type) t_sh, sg, xp, eg, e, n_ff_sh, d_q8, nullptr);
+                if (ok) ok = gemv((ggml_type) t_sh, su, xp, eu, e, n_ff_sh, d_q8, nullptr);
+                if (ok) ok = cudaMemcpy(eact, eg, (size_t) n_ff_sh * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+                if (ok) k_silu_mul_n<<<(n_ff_sh + 255) / 256, 256>>>(eact, eu, n_ff_sh, clamp_sh);
+                if (ok) ok = gemv((ggml_type) t_sh, sd, eact, ed, n_ff_sh, e, d_q8, nullptr);
+                if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, 1.0f, e);
+                if (ok) k_add_n<<<(e + 255) / 256, 256>>>(hp, eacc, e);
+            }
+            for (void* q : {router, (void*) sbias, sg, su, sd, (void*) logits, (void*) eg, (void*) eu,
+                            (void*) eact, (void*) ed, (void*) eacc, (void*) ids, (void*) wts, dg, du, dd})
+                if (q) cudaFree(q);
+        }
         if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
         if (!ok && err.empty()) err = "a kernel failed";
         for (void* p : {(void*) x, (void*) q, (void*) k, (void*) v, (void*) ao, (void*) gt, (void*) res,

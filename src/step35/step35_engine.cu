@@ -686,7 +686,7 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
-        std::printf("strata-step35: %zu position(s) through %d dense block(s) on the GPU\n", ids.size(), n_blocks);
+        std::printf("strata-step35: %zu position(s) through %d block(s) on the GPU (dense, then mixture of experts)\n", ids.size(), n_blocks);
         for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);
         return 0;
     } catch (const std::exception& ex) {
