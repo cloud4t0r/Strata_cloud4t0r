@@ -105,8 +105,8 @@ outputs are the comparison:
 strata-step35 --gpu-chat <first shard> --tokens "0,671,6102,294,8760,344" --next "671" [--layers N] [--max-context N]
 ```
 
-`--ref` needs `--layers N` to run any block at all: without it the reference reads the file and runs zero blocks,
-which looks like a real answer and is not one.
+Omitting `--layers` runs every block, as the help says; it used to run none, and print the embedding as if it
+were the model's answer. `--gpu-seq` reads it the same way now.
 
 ## What is measured
 
@@ -152,11 +152,12 @@ cells with `strata_kernels`' `kv_append_q8_steps` and then attends over `0 .. po
   a device step buffer that holds the position - the kernels read the position from device memory, not from an
   argument. Pools are allocated when a layer is first used, so `--layers 4` does not pay for 45.
 - `src/step35/step35_attn_cached.cu`: `attn_q8_cached`, one warp per (row, query head), the online softmax in
-  registers. It has no window bound at all, which the validation vehicle does not: `attn_causal` keeps a window's
-  scores in a fixed `scores[512]` of shared memory and overruns it on a full-attention block from position 512 on.
-  Measured on a one-head run against a float64 host: right to 3.9e-07 at 512 keys, 1.6e-03 off at 513, 5.0e-02 at
-  1024, with no CUDA error and no crash. A gather into fp16 scratch was the alternative and it is the wrong one at
-  a long context: 4 KB per cell per layer, 512 MB at 131072, moved on every token.
+  registers, the `int8` codes read in place. A gather into fp16 scratch was the alternative and it is the wrong one
+  at a long context: 4 KB per cell per layer (512 MB at 131072) moved on every token, against 1 KB of codes and no
+  staging buffer. Both attention kernels now run the same online softmax, so neither has a window bound:
+  `attn_causal` used to keep a window's scores in a `scores[512]` of shared memory, which a full-attention block
+  overran from position 512 on - measured 1.6e-03 off the float64 answer at 513 keys, 5.0e-02 at 1024, with no CUDA
+  error - and it used to clamp a window wider than 512 down to 512.
 
 Size, measured from the engine's own print: **2112 B per layer per token** (1024 codes + 16 f16 scales, twice),
 **95 KB per token over the 45 layers** - 0.78 GB at 8192 positions, 3.1 GB at 32768, 12.4 GB at 131072. The fp32
@@ -167,18 +168,20 @@ once reading the cache, once reading the fp32 K/V of the pass:
 
 | | |
 |---|---|
-| rms of each position, cache against no cache | -0.004%, -0.10%, +0.06%, +0.68%, -0.24%, -0.09%, +0.18% (mean 0.19%) |
-| block 44's sum over the 7 positions | +0.09% |
-| the 45 block sums | 0.69% mean, 6.4% worst - block 40, whose 7-position sum is the smallest of the 45 (-960 where its neighbours are -5000), so a 58-point difference reads as 6%. The path with no cache is itself 16.7% from `--ref` on that block |
 | a 7-position prefill against the same 6 + 1 decode | position 6 lands on the same rms and the same first four values to six decimals: prefill and decode agree **bit for bit** |
+| rms of each position, cache against no cache | -0.004%, +0.45%, -0.40%, +0.82%, -0.05%, +0.08%, -1.47% (mean 0.47%) |
+| block 44's sum over the 7 positions | +0.08% (22156.0 against 22135.5) |
+| the 45 block sums | 0.50% mean, 2.8% worst |
 
-Against the float64 reference over 45 blocks the cache path is 0.03% to 2.43% on the rms per position - and the
-path that reads no cache is already 0.00% to 2.25% at those same positions. 2.25 of that 2.43 is the Q8_1
-activation quantization named above, not the K/V: the cache adds 0.18 of a point at worst, on a quantity that is
-already 2% off its own float64 answer.
+Against the float64 reference, the same 7 positions answer 0.03% to 2.43% away when they read the cache, and
+0.03% to 3.95% when they do not - block 44's sum is within 0.1% across the three. The ordering there is not a
+measure of either path: at 45 blocks a 1e-7 change in one attention reduction (the online softmax reorders a few
+hundred additions) moves the last position by a point or two of the rms, the same way the int8 K/V does, because
+near-ties at this depth decide a couple of percent either way. It is the model's sensitivity, and it is the same
+order as llama.cpp's own GPU-against-CPU spread of 1.5e-02 to 3.0e-02 quoted above.
 
-Over 4 blocks, prefill 6 positions then decode 1, the 7 positions land within 0.13% of `--ref --layers 4` on the
-same 7 tokens.
+The comparison that isolates the cache is the one that does not run 45 blocks: over 4 blocks, prefill 6 positions
+then decode 1, the 7 positions land within 0.13% of `--ref --layers 4` on the same 7 tokens.
 
 ## Tests
 
@@ -195,7 +198,9 @@ Six tests, none of which needs the 76 GB download:
   Q5_K, F32), against a float64 host dot.
 - `step35_moe_parity` - the router: expert ids must match **exactly**, and a forced tie must resolve to the
   lower index on both sides.
-- `step35_attn_parity` - causal GQA with the sliding window, over both head counts.
+- `step35_attn_parity` - causal GQA with the sliding window, over both head counts, and two 520-position
+  cases past the 512 keys the kernel used to hold in shared memory (they fail on the previous kernel:
+  3.5e-04 and 4.5e-03).
 - `step35_kv_parity` - the cache: the `int8` cell compared code by code and scale by scale with a host that
   applies kv_q8's rule; the attention over the dequantized cells at both head counts; a decode row **bit for bit**
   the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; and a decode row at
