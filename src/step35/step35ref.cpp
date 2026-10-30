@@ -129,20 +129,26 @@ void rms_norm(std::vector<float>& x, const std::vector<float>& w, double eps) {
 
 float silu(float v) { return (float) ((double) v / (1.0 + std::exp(-(double) v))); }
 
-/// RoPE on one head: the first `n_rot` of its dims turn, the rest are left alone.  `ff`, when given, is the
-/// model's rope_freqs table (llama3 scaling): ggml divides the pair's angle by it (ggml-cpu ops.cpp:6194,
-/// `rope_yarn(theta/ff, ...)`), and llama.cpp hands that table to the full-attention blocks only.
+/// RoPE on one head: the first `n_rot` of its dims turn, the rest are left alone.
+///
+/// Pairing is NEOX - element j turns with element j + n_rot/2 - because llama_model_rope_type() returns
+/// LLAMA_ROPE_TYPE_NEOX for LLM_ARCH_STEP35 (src/llama-model.cpp), and ggml's rotate_pairs reads it as
+/// (i0, i0 + n_dims/2) with i0 stepping by 2 over the first half.  The angle of pair j is
+/// pos * base^(-2j/n_rot), divided by `ff[j]` when the model's rope_freqs table is given (llama3 scaling,
+/// ggml-cpu ops.cpp:6194).  Adjacent pairing (2i, 2i+1) is the NORM convention and is WRONG here; at the
+/// positions of a short test the two differ by little, which is why this is written down.
 void rope(float* v, int64_t head_dim, int64_t n_rot, int64_t pos, double base, const std::vector<float>* ff) {
-    for (int64_t i = 0; i + 1 < n_rot; i += 2) {
-        const double freq = 1.0 / std::pow(base, (double) i / (double) n_rot);
+    const int64_t half = n_rot / 2;
+    for (int64_t j = 0; j < half; ++j) {
+        const double freq = 1.0 / std::pow(base, (double) (2 * j) / (double) n_rot);
         double theta = (double) pos * freq;
-        if (ff && (size_t) (i / 2) < ff->size() && (*ff)[(size_t) (i / 2)] != 0.0f) {
-            theta /= (double) (*ff)[(size_t) (i / 2)];
+        if (ff && (size_t) j < ff->size() && (*ff)[(size_t) j] != 0.0f) {
+            theta /= (double) (*ff)[(size_t) j];
         }
         const double c = std::cos(theta), s = std::sin(theta);
-        const double a = v[i], b = v[i + 1];
-        v[i] = (float) (a * c - b * s);
-        v[i + 1] = (float) (a * s + b * c);
+        const double a = v[j], b = v[j + half];
+        v[j] = (float) (a * c - b * s);
+        v[j + half] = (float) (a * s + b * c);
     }
     (void) head_dim;
 }
