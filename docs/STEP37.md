@@ -4,8 +4,9 @@ Step models are StepFun's (`stepfun-ai`): **Step-3.5-Flash** is text-only and **
 decoder plus a vision encoder. Both are 196B parameters with 11B active, and both use the GGUF architecture
 `step35`, so one engine path runs the two.
 
-This engine path is **new and incomplete on purpose**. What runs today is the whole model, one token at a time,
-with the experts read from the file. What does not run yet is listed at the end, and it is a real list.
+This engine path is **new and incomplete on purpose**. What runs today is the whole model over a prompt of several
+positions, then decode steps that read the prompt's own K/V out of a quantized cache, with the experts read from
+the file. What does not run yet is listed at the end, and it is a real list.
 
 ## What the file says
 
@@ -68,7 +69,7 @@ hf download stepfun-ai/Step-3.7-Flash-GGUF \
 Two shards, 46.65 GB + 29.11 GB, plus 3.71 GB for the MTP heads. `--include` takes **one** pattern: a second
 pattern on the same line is read as a filename and silently downloads nothing.
 
-## The three commands
+## The four commands
 
 `--inspect` reads the file and checks every tensor against the keys that describe it. It opens no GPU.
 
@@ -96,6 +97,17 @@ hidden state summed over all positions after each block - the figure `--ref` pri
 strata-step35 --gpu-seq <first shard> --tokens "0,671,6102,294,8760,344" --layers 4
 ```
 
+`--gpu-chat` runs a PROMPT through every block with the quantized K/V cache, then each `--next` token as a decode
+step that attends to the cells the prompt wrote. It prints the same per-position figures `--ref` prints, so the two
+outputs are the comparison:
+
+```sh
+strata-step35 --gpu-chat <first shard> --tokens "0,671,6102,294,8760,344" --next "671" [--layers N] [--max-context N]
+```
+
+`--ref` needs `--layers N` to run any block at all: without it the reference reads the file and runs zero blocks,
+which looks like a real answer and is not one.
+
 ## What is measured
 
 All figures on this machine (2 x 16 GB AMD, 62 GB RAM, ROCm at `/opt/rocm`), against llama.cpp built from the
@@ -109,6 +121,7 @@ same file:
 | **all 45 blocks, one token** | **0.12% on the rms, 0.50% on the sum** |
 | a prompt of 6 positions, 3 dense + 1 expert block | 3.3e-04 to 7.5e-04 |
 | speed | **1.39 s per token**, warm page cache (2.13 s cold) |
+| prompt of 6 positions, 45 blocks, then decodes | prefill **3.9 s** for the 6, then **0.96 s per decoded token** |
 
 The residual difference is the Q8_1 quantization of the activations, which K-quant matvecs carry by design; it
 is not a difference of arithmetic. llama.cpp's own GPU (fp16) and CPU (f32) runs differ by 1.5e-02 to 3.0e-02 on
@@ -116,42 +129,56 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 ## What does not work yet
 
-- **No KV cache.** A prompt of several positions now runs (dense and expert blocks both), but the K/V of that
-  pass is thrown away: a second turn recomputes the first. That reuse is the one thing between here and a chat
-  turn, and the figures to beat are the ones above.
 - **No MTP.** The three NextN blocks are readable (`--inspect --mtp` checks them) but not run.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
   what makes it fit in 32 GB, and it is also why it is slow.
 - **No integration.** `setup.py`, `strata launch --family step35`, the app and `serve` know nothing about the
   family yet. `strata` dispatches a `step35` file to `strata-step35`, and that is all.
+- **The cache is not streamed and not captured.** A cache that outgrows VRAM has no host copy yet
+  (`kv_stream.hpp` has one for the QSA layers), and the position still crosses to the device as a 4-byte H2D copy,
+  so the pass is not a CUDA graph. A decode step is a full pass over 45 blocks - 0.96 s, most of it the
+experts streamed out of the file.
 
-## The KV cache: what is already there, and what is missing
+## The KV cache: what it is, and what it cost
 
-A prompt now runs, but its K/V is thrown away. Reusing it is the one thing between here and a chat turn, and the
-build is mostly in `strata_kernels` already - the Qwen3.6 and MiniMax-M2 engines use it:
+The prompt and the decode steps differ in nothing but `n_pos`. `src/step35/step35_seq.cu` writes each position's
+cells with `strata_kernels`' `kv_append_q8_steps` and then attends over `0 .. pos0+n_pos-1` through
+`attn_q8_cached`, which reads the `int8` codes in place. A decode step is that same call with one token at
+`pos0 = n_cached`, so the two cannot drift apart:
 
-- `kv_q8.hpp`: the cell is `int8` codes plus one `f16` scale per `KV_Q8_GROUP` (64) dimensions, for K and for V.
-- `kv_append_q8_step` / `kv_append_q8_steps`: append one cell (or n tokens' cells) at a position read from
-  DEVICE memory, with a page table, so a captured graph stays valid.
-- a gather of the cells named by an id list, into fp16 scratch, and the attention kernels that read `int8` K/V
-  with their scales (the MiniMax-M2 path's `k_attn_*`).
-- `kv_stream.hpp` for a host copy, when the cache outgrows VRAM.
+- `include/strata/step35/session.hpp` / `src/step35/step35_session.cu`: the `Session`. Per layer, K and V as
+  `int8` codes plus one `f16` scale per 64 values (`kv_q8.hpp`'s cell), behind a page table of 128-cell pages, and
+  a device step buffer that holds the position - the kernels read the position from device memory, not from an
+  argument. Pools are allocated when a layer is first used, so `--layers 4` does not pay for 45.
+- `src/step35/step35_attn_cached.cu`: `attn_q8_cached`, one warp per (row, query head), the online softmax in
+  registers. It has no window bound at all, which the validation vehicle does not: `attn_causal` keeps a window's
+  scores in a fixed `scores[512]` of shared memory and overruns it on a full-attention block from position 512 on.
+  Measured on a one-head run against a float64 host: right to 3.9e-07 at 512 keys, 1.6e-03 off at 513, 5.0e-02 at
+  1024, with no CUDA error and no crash. A gather into fp16 scratch was the alternative and it is the wrong one at
+  a long context: 4 KB per cell per layer, 512 MB at 131072, moved on every token.
 
-What has to be written:
+Size, measured from the engine's own print: **2112 B per layer per token** (1024 codes + 16 f16 scales, twice),
+**95 KB per token over the 45 layers** - 0.78 GB at 8192 positions, 3.1 GB at 32768, 12.4 GB at 131072. The fp32
+cache would be 4.5x that, which is why the quantized form was built first.
 
-1. A `Session` that owns, per layer, the K/V codes and scales, and a `n_cached` position count. Today
-   `src/step35/step35_seq.cu` allocates q/k/v inside the layer loop and frees them at the end of the pass.
-2. The prefill writing each position's cells with `kv_append_q8_steps` instead of keeping fp32 tensors.
-3. A decode step: one position, `n_pos = 1`, attention over `0..n_cached` through the quantized cache kernel
-   rather than `attn_causal` (which takes fp32 K/V for the whole sequence and is the validation vehicle).
-4. A parity test: prefill 6 positions, decode 1, against `--ref --tokens "<7 ids>"` - the reference already does
-   the whole sequence, so the comparison costs nothing new.
+What the cache costs, measured on the same prompt (`0,671,6102,294,8760,344,671`, 45 blocks) by running it twice -
+once reading the cache, once reading the fp32 K/V of the pass:
 
-Size, in arithmetic rather than measurement: 8 KV heads x 128 dims = 1024 values per layer per token, so
-1024 int8 + 16 f16 scales = 1056 bytes per side, 2112 per layer, ~95 KB per token for the 45 layers. That is
-0.78 GB at 8192 tokens, 3.1 GB at 32768 and 12.4 GB at 131072 - which is why the quantized form is the one to
-build first: the fp32 cache would be 4.5x that.
+| | |
+|---|---|
+| rms of each position, cache against no cache | -0.004%, -0.10%, +0.06%, +0.68%, -0.24%, -0.09%, +0.18% (mean 0.19%) |
+| block 44's sum over the 7 positions | +0.09% |
+| the 45 block sums | 0.69% mean, 6.4% worst - block 40, whose 7-position sum is the smallest of the 45 (-960 where its neighbours are -5000), so a 58-point difference reads as 6%. The path with no cache is itself 16.7% from `--ref` on that block |
+| a 7-position prefill against the same 6 + 1 decode | position 6 lands on the same rms and the same first four values to six decimals: prefill and decode agree **bit for bit** |
+
+Against the float64 reference over 45 blocks the cache path is 0.03% to 2.43% on the rms per position - and the
+path that reads no cache is already 0.00% to 2.25% at those same positions. 2.25 of that 2.43 is the Q8_1
+activation quantization named above, not the K/V: the cache adds 0.18 of a point at worst, on a quantity that is
+already 2% off its own float64 answer.
+
+Over 4 blocks, prefill 6 positions then decode 1, the 7 positions land within 0.13% of `--ref --layers 4` on the
+same 7 tokens.
 
 ## Tests
 
@@ -159,7 +186,7 @@ build first: the fp32 cache would be 4.5x that.
 ctest -R step35
 ```
 
-Five tests, none of which needs the 76 GB download:
+Six tests, none of which needs the 76 GB download:
 
 - `step35_metadata_test` - the family, the guard, and five files the guard must refuse (synthetic).
 - `step35_rope_parity` - NEOX pairing and the frequency factors, **bit for bit** against a float64 host; and a
@@ -169,3 +196,7 @@ Five tests, none of which needs the 76 GB download:
 - `step35_moe_parity` - the router: expert ids must match **exactly**, and a forced tie must resolve to the
   lower index on both sides.
 - `step35_attn_parity` - causal GQA with the sliding window, over both head counts.
+- `step35_kv_parity` - the cache: the `int8` cell compared code by code and scale by scale with a host that
+  applies kv_q8's rule; the attention over the dequantized cells at both head counts; a decode row **bit for bit**
+  the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; and a decode row at
+  position 1023, past the 512 the validation vehicle can hold.
