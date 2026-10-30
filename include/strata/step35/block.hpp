@@ -45,11 +45,39 @@ struct DenseBlock {
 };
 
 /// Uploads block `layer` of `file` (a step35 trunk shard set) and its shared rope_freqs table.
-bool upload_block(const strata::GgufModel& file, int layer, DenseBlock& b, std::string& err);
+/// `with_ffn` false uploads the attention half alone (a mixture-of-experts block has no dense ffn_* tensor).
+bool upload_block(const strata::GgufModel& file, int layer, DenseBlock& b, std::string& err, bool with_ffn = true);
 void release_block(DenseBlock& b);
 
 /// Runs the block over one token whose embedding is `h` (n_embd floats, device), at `pos`, in place.
 /// `scratch_q8` is a device buffer of gemv_q8_bytes(n_embd).  Returns false on a kernel launch error.
 bool run_dense_block(const DenseBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
+
+/// A mixture-of-experts block: the same attention as DenseBlock, then the router and the experts.  The three
+/// expert tensors are [n_embd, n_ff_exp, n_expert] with expert e contiguous, so the existing gemv takes one
+/// expert by pointer - no grouped kernel is invented here.  EVERY expert of the block is resident: this is the
+/// validation path for one block, not the memory plan for 42 (that one streams, as MiniMax-M2 does).
+struct MoeBlock {
+    DenseBlock attn;             // the attention half, and the shared expert's shape
+    void* router = nullptr;      // ffn_gate_inp.weight, F32 [n_embd, n_expert]
+    float* select_bias = nullptr;  // exp_probs_b.bias, or null
+    void* exps_gate = nullptr;   // ffn_gate_exps.weight, [n_embd, n_ff_exp, n_expert]
+    void* exps_up = nullptr;     // ffn_up_exps.weight
+    void* exps_down = nullptr;   // ffn_down_exps.weight
+    void* shexp_gate = nullptr;  // ffn_gate_shexp.weight, [n_embd, n_ff_shexp]
+    void* shexp_up = nullptr;
+    void* shexp_down = nullptr;
+    int n_expert = 0, top_k = 0, n_ff_exp = 0, n_ff_shexp = 0;
+    int t_exps = 0, t_shexp = 0;
+    float scale = 0;
+    bool weights_norm = false;
+    float clamp_exp = 0, clamp_shexp = 0;
+    size_t expert_gate_bytes = 0, expert_down_bytes = 0;   // one expert's share of each 3-D tensor
+    bool loaded = false;
+};
+
+bool upload_moe_block(const strata::GgufModel& file, int layer, MoeBlock& b, std::string& err);
+void release_moe_block(MoeBlock& b);
+bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
 
 }  // namespace strata::step35::kernels

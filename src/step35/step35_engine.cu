@@ -505,6 +505,108 @@ int gpu_block(const std::string& path, int32_t token, int layer, int pos) {
     }
 }
 
+/// `--gpu-moe`: one mixture-of-experts block on the GPU with the file's own weights, for one token.
+int gpu_moe(const std::string& path, int32_t token, int layer, int pos) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        size_t shard = 0;
+        const strata::TensorInfo* emb = file.find("token_embd.weight", &shard);
+        if (!emb) { std::printf("strata-step35: no token_embd.weight\n"); return 1; }
+        const int64_t n_embd = (int64_t) emb->shape[0];
+        std::vector<float> row((size_t) n_embd);
+        const size_t row_bytes = ggml_row_size((ggml_type) emb->type, n_embd);
+        const auto* tr = ggml_get_type_traits((ggml_type) emb->type);
+        tr->to_float((const uint8_t*) file.shard(shard).tensor_data(*emb) + (size_t) token * row_bytes, row.data(), n_embd);
+
+        kernels::MoeBlock b;
+        std::string err;
+        if (!kernels::upload_moe_block(file, layer, b, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        float* d_h = nullptr;
+        void* d_q8 = nullptr;
+        cudaMalloc(&d_h, row.size() * sizeof(float));
+        cudaMalloc(&d_q8, kernels::gemv_q8_bytes((int) n_embd));
+        cudaMemcpy(d_h, row.data(), row.size() * sizeof(float), cudaMemcpyHostToDevice);
+        if (!kernels::run_moe_block(b, d_h, pos, d_q8, (int) kernels::gemv_q8_bytes((int) n_embd), err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<float> got((size_t) n_embd);
+        cudaMemcpy(got.data(), d_h, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        double sum = 0, ss = 0;
+        for (float x : got) { sum += (double) x; ss += (double) x * (double) x; }
+        std::printf("strata-step35: gpu MoE block %d, token %d at position %d: %d experts, top %d, %s, scale %.1f\n",
+                    layer, token, pos, b.n_expert, b.top_k, b.attn.sliding ? "sliding" : "full", (double) b.scale);
+        std::printf("  sum %.6f  rms %.6f  first four: %.6f %.6f %.6f %.6f\n", sum,
+                    std::sqrt(ss / (double) n_embd), got[0], got[1], got[2], got[3]);
+        cudaFree(d_h);
+        cudaFree(d_q8);
+        kernels::release_moe_block(b);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
+/// `--gpu-chain`: the first N blocks on the GPU, one after the other, from the token's embedding.  This is the
+/// only honest way to compare a block above the first: block 3 works on what block 2 handed it, not on the
+/// embedding, so comparing it alone against the reference compares two different inputs.
+int gpu_chain(const std::string& path, int32_t token, int n_layers, int pos) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        size_t shard = 0;
+        const strata::TensorInfo* emb = file.find("token_embd.weight", &shard);
+        if (!emb) { std::printf("strata-step35: no token_embd.weight\n"); return 1; }
+        const int64_t n_embd = (int64_t) emb->shape[0];
+        const int64_t dense_layers = (int64_t) file.meta().get("step35.leading_dense_block_count")->num();
+        std::vector<float> row((size_t) n_embd);
+        const size_t row_bytes = ggml_row_size((ggml_type) emb->type, n_embd);
+        const auto* tr = ggml_get_type_traits((ggml_type) emb->type);
+        tr->to_float((const uint8_t*) file.shard(shard).tensor_data(*emb) + (size_t) token * row_bytes, row.data(), n_embd);
+
+        float* d_h = nullptr;
+        void* d_q8 = nullptr;
+        cudaMalloc(&d_h, row.size() * sizeof(float));
+        cudaMalloc(&d_q8, kernels::gemv_q8_bytes((int) n_embd));
+        cudaMemcpy(d_h, row.data(), row.size() * sizeof(float), cudaMemcpyHostToDevice);
+        for (int layer = 0; layer < n_layers; ++layer) {
+            std::string err;
+            std::vector<float> check((size_t) n_embd);
+            const bool dense = layer < (int) dense_layers;
+            if (dense) {
+                kernels::DenseBlock b;
+                if (!kernels::upload_block(file, layer, b, err) ||
+                    !kernels::run_dense_block(b, d_h, pos, d_q8, (int) kernels::gemv_q8_bytes((int) n_embd), err)) {
+                    std::printf("strata-step35: block %d: %s\n", layer, err.c_str());
+                    return 1;
+                }
+                kernels::release_block(b);
+            } else {
+                kernels::MoeBlock b;
+                if (!kernels::upload_moe_block(file, layer, b, err) ||
+                    !kernels::run_moe_block(b, d_h, pos, d_q8, (int) kernels::gemv_q8_bytes((int) n_embd), err)) {
+                    std::printf("strata-step35: block %d: %s\n", layer, err.c_str());
+                    return 1;
+                }
+                kernels::release_moe_block(b);
+            }
+            cudaMemcpy(check.data(), d_h, check.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            double sum = 0;
+            for (float x : check) sum += (double) x;
+            std::printf("  block %2d (%s) : sum %.6f\n", layer, dense ? "dense" : "MoE", sum);
+        }
+        cudaFree(d_h);
+        cudaFree(d_q8);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
 void usage() {
     std::printf(
         "strata-step35: the Step-3.7-Flash engine path (GGUF architecture step35)\n"
@@ -606,11 +708,17 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
 int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0;
-    bool want_ref = false, want_gpu = false;
+    bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--gpu-chain") == 0) {
+            trunk = argv[++i];
+            want_chain = true;
+        } else if (std::strcmp(argv[i], "--gpu-moe") == 0) {
+            trunk = argv[++i];
+            want_moe = true;
         } else if (std::strcmp(argv[i], "--gpu-block") == 0) {
             trunk = argv[++i];
             want_gpu = true;
@@ -638,6 +746,20 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump);
+    if (want_chain) {
+        if (token < 0 || layers <= 0) {
+            std::printf("strata-step35: --gpu-chain needs --token <id> and --layers N\n");
+            return 2;
+        }
+        return gpu_chain(trunk, (int32_t) token, (int) layers, (int) pos);
+    }
+    if (want_moe) {
+        if (token < 0) {
+            std::printf("strata-step35: --gpu-moe needs --token <id>\n");
+            return 2;
+        }
+        return gpu_moe(trunk, (int32_t) token, (int) gpu_layer, (int) pos);
+    }
     if (want_gpu) {
         if (token < 0) {
             std::printf("strata-step35: --gpu-block needs --token <id>\n");
