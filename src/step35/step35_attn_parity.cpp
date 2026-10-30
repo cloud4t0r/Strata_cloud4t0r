@@ -7,6 +7,10 @@
 // prefix and 16+ have exactly 16 keys, and a second case with no window at all.
 //
 // Both head widths the model uses are covered (64 and 96 query heads), each with 8 KV heads, and head_dim 128.
+//
+// Two more cases run 520 positions, past the 512 keys the kernel used to fit in a `scores[512]` of shared memory:
+// one with no window, one whose window (600) is wider than that array and used to be silently clamped to 512.
+// Both were wrong before the online softmax and both are exact against the float64 host now.
 #include "strata/step35/attn.hpp"
 
 #include <cuda_runtime.h>
@@ -142,6 +146,8 @@ int main() {
     attn_case(40, 96, 8, 128, 0, "sliding block, no window");
     attn_case(24, 64, 8, 128, 16, "full block, window shorter than the sequence");
     attn_case(40, 96, 8, 128, 512, "window larger than the sequence");
+    attn_case(520, 16, 8, 128, 0, "no window, past the old 512-key shared-memory array");
+    attn_case(520, 16, 8, 128, 600, "window wider than the old 512-key array");
 
     if (failures) {
         std::printf("step35_attn_parity: %d check(s) failed\n", failures);

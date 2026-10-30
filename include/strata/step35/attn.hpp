@@ -5,8 +5,14 @@
 // one shape would silently mis-run the other, which is why this is a parameter and the parity test covers both.
 //
 // This entry point takes the whole K/V of the sequence, in fp32, and is the vehicle that says the arithmetic is
-// right.  The engine's decode path keeps the cache quantized (strata_kernels' kv_q8) and will read it in place;
-// that path is a different kernel with its own parity test, not this one.
+// right.  The engine's decode path keeps the cache quantized (strata_kernels' kv_q8) and reads it in place there;
+// that is a different kernel with its own parity test, not this one.
+//
+// Both kernels run the same ONLINE softmax - the running max, the denominator and the weighted value vector in
+// registers - so neither is bounded by a window size.  `attn_causal` used to keep the window's scores in a
+// `scores[512]` of shared memory and clamp the window to it; a full-attention block at position 512 then wrote one
+// score past the array, measured 1.6e-03 off the float64 answer at 513 keys and 5.0e-02 at 1024, with no CUDA
+// error.  The parity test now runs 520 keys so that cannot come back.
 #pragma once
 
 #include <cstdint>
@@ -39,11 +45,10 @@ struct KvQ8View {
 /// with pos_r = step[kStepPos] - (n_pos - 1 - r) and k'/v' the dequantized cells (`code * scale`).  A `window` <= 0
 /// means the whole prefix.  `head_dim` must be a multiple of 4 and at most 512.
 ///
-/// WHY IT IS NOT `attn_causal` WITH A GATHER.  Two reasons, and both matter at a long context: the gathered fp16
-/// scratch would be 4 KB per cell per layer (512 MB at 131072) moved on every token, and `attn_causal` keeps a
-/// window's scores in a 512-entry shared array, which a full-attention block outgrows at position 512 (513 keys:
-/// measured 1.6e-03 off the float64 answer there, 5.0e-02 at 1024, with no error reported).  This kernel keeps the
-/// running max, denominator and weighted value vector in registers instead, so it has no window bound at all.
+/// WHY IT IS NOT `attn_causal` WITH A GATHER.  Because of the gather: the fp16 scratch would be 4 KB per cell per
+/// layer - 512 MB at 131072 - moved on every token, where reading the codes costs 1 KB and no staging buffer.  The
+/// arithmetic is the same as `attn_causal`'s (both run the online softmax), so the two can be held to the same
+/// float64 host; the difference this kernel's parity test pins is the software the numbers come from, not the maths.
 void attn_q8_cached(const float* q, float* out, const KvQ8View& kv, int n_pos, int n_head, int window, void* stream);
 
 }  // namespace strata::step35::kernels
