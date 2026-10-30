@@ -80,4 +80,11 @@ bool upload_moe_block(const strata::GgufModel& file, int layer, MoeBlock& b, std
 void release_moe_block(MoeBlock& b);
 bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
 
+/// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
+/// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
+/// mapping into three reused device buffers for each block.  Slow by design - it is what lets the whole model
+/// run on 32 GB of VRAM - and the page cache does the reading, so the second pass over a layer is cheap.
+bool run_stream_block(const strata::GgufModel& file, int layer, float* h, int pos, void* scratch_q8,
+                      std::string& err);
+
 }  // namespace strata::step35::kernels

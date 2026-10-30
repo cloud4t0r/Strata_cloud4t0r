@@ -354,4 +354,112 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* q8, int n_scratch
     return ok;
 }
 
+bool run_stream_block(const GgufModel& file, int layer, float* h, int pos, void* q8, std::string& err) {
+    const std::string p = "step35.";
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    // the resident part: attention, router, bias, shared expert - a few MB, not the experts
+    MoeBlock b{};
+    size_t bytes = 0;
+    try {
+        if (!upload_block(file, layer, b.attn, err, false)) return false;
+        b.n_expert = (int) num(file, p + "expert_count", true);
+        b.top_k = (int) num(file, p + "expert_used_count", true);
+        b.n_ff_exp = (int) num(file, p + "expert_feed_forward_length", true);
+        b.n_ff_shexp = (int) num(file, p + "expert_shared_feed_forward_length", true);
+        b.scale = (float) num(file, p + "expert_weights_scale", true);
+        const MetaValue* nrm = file.meta().get(p + "expert_weights_norm");
+        b.weights_norm = nrm && nrm->type == MetaType::BOOL && nrm->u != 0;
+        for (const auto& c : {std::make_pair("swiglu_clamp_exp", &b.clamp_exp),
+                              std::make_pair("swiglu_clamp_shexp", &b.clamp_shexp)}) {
+            const MetaValue* v = file.meta().get(p + c.first);
+            if (v && v->type == MetaType::ARRAY && (int) v->items.size() > layer)
+                *c.second = (float) v->items[(size_t) layer].num();
+        }
+        b.router = upload(file, pre + "ffn_gate_inp.weight", bytes);
+        if (file.find(pre + "exp_probs_b.bias")) b.select_bias = (float*) upload(file, pre + "exp_probs_b.bias", bytes);
+        b.shexp_gate = upload(file, pre + "ffn_gate_shexp.weight", bytes);
+        b.t_shexp = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
+        b.shexp_up = upload(file, pre + "ffn_up_shexp.weight", bytes);
+        b.shexp_down = upload(file, pre + "ffn_down_shexp.weight", bytes);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    // where the experts live in the mapping: one expert is contiguous inside its [n_embd, n_ff, n_expert] tensor
+    size_t sg = 0, su = 0, sd = 0;
+    const TensorInfo* tg = file.find(pre + "ffn_gate_exps.weight", &sg);
+    const TensorInfo* tu = file.find(pre + "ffn_up_exps.weight", &su);
+    const TensorInfo* td = file.find(pre + "ffn_down_exps.weight", &sd);
+    if (!tg || !tu || !td) {
+        err = "missing expert tensor";
+        return false;
+    }
+    const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) b.n_expert;
+    const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) b.n_expert;
+    const uint8_t* base_g = (const uint8_t*) file.shard(sg).tensor_data(*tg);
+    const uint8_t* base_u = (const uint8_t*) file.shard(su).tensor_data(*tu);
+    const uint8_t* base_d = (const uint8_t*) file.shard(sd).tensor_data(*td);
+    const int t_exps = (int) tg->type;
+
+    if (!run_attention(b.attn, h, pos, q8, err)) return false;
+
+    const int e = b.attn.n_embd;
+    float *x = nullptr, *logits = nullptr, *g = nullptr, *u = nullptr, *act = nullptr, *d = nullptr, *acc = nullptr;
+    int32_t* ids = nullptr;
+    float* w = nullptr;
+    void *dg = nullptr, *du = nullptr, *dd = nullptr;
+    auto ok_alloc = cudaMalloc((void**) &x, (size_t) e * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &logits, (size_t) b.n_expert * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &g, (size_t) b.n_ff_exp * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &u, (size_t) b.n_ff_exp * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &act, (size_t) b.n_ff_exp * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &d, (size_t) e * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &acc, (size_t) e * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &ids, (size_t) b.top_k * sizeof(int32_t)) == cudaSuccess &&
+                    cudaMalloc((void**) &w, (size_t) b.top_k * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc(&dg, gate_bytes) == cudaSuccess && cudaMalloc(&du, gate_bytes) == cudaSuccess &&
+                    cudaMalloc(&dd, down_bytes) == cudaSuccess;
+    if (!ok_alloc) {
+        err = "out of device memory";
+        return false;
+    }
+    bool ok = cudaMemcpy(x, h, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+    if (ok) per_head_rms_norm(x, 1, e, b.attn.ffn_norm, b.attn.eps, nullptr);
+    if (ok) gemv(GGML_TYPE_F32, b.router, x, logits, e, b.n_expert, q8, nullptr);
+    if (ok) moe_route(logits, b.select_bias, 1, b.n_expert, b.top_k, b.scale, b.weights_norm, ids, w, nullptr);
+    std::vector<int32_t> h_ids((size_t) b.top_k);
+    std::vector<float> h_w((size_t) b.top_k);
+    if (ok) ok = cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (ok) ok = cudaMemcpy(h_w.data(), w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+    if (ok) ok = cudaMemset(acc, 0, (size_t) e * sizeof(float)) == cudaSuccess;
+    for (int k = 0; ok && k < b.top_k; ++k) {
+        const size_t ex = (size_t) h_ids[(size_t) k];
+        ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) ok = gemv((ggml_type) t_exps, dg, x, g, e, b.n_ff_exp, q8, nullptr);
+        if (ok) ok = gemv((ggml_type) t_exps, du, x, u, e, b.n_ff_exp, q8, nullptr);
+        if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) k_silu_mul<<<(b.n_ff_exp + 255) / 256, 256>>>(act, u, b.n_ff_exp, b.clamp_exp);
+        if (ok) ok = gemv((ggml_type) t_exps, dd, act, d, b.n_ff_exp, e, q8, nullptr);
+        if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, h_w[(size_t) k], e);
+    }
+    if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_gate, x, g, e, b.n_ff_shexp, q8, nullptr);
+    if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_up, x, u, e, b.n_ff_shexp, q8, nullptr);
+    if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_shexp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+    if (ok) k_silu_mul<<<(b.n_ff_shexp + 255) / 256, 256>>>(act, u, b.n_ff_shexp, b.clamp_shexp);
+    if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_down, act, d, b.n_ff_shexp, e, q8, nullptr);
+    if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, 1.0f, e);
+    if (ok) k_add<<<(e + 255) / 256, 256>>>(h, acc, e);
+    if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
+    if (!ok) err = "a kernel failed in the streamed expert half";
+    for (void* q : {(void*) x, (void*) logits, (void*) g, (void*) u, (void*) act, (void*) d, (void*) acc,
+                    (void*) ids, (void*) w, dg, du, dd})
+        if (q) cudaFree(q);
+    for (void** q : {&b.router, (void**) &b.select_bias, &b.shexp_gate, &b.shexp_up, &b.shexp_down})
+        if (*q) cudaFree(*q);
+    release_block(b.attn);
+    return ok;
+}
+
 }  // namespace strata::step35::kernels
