@@ -822,21 +822,21 @@ class StopTokens(unittest.TestCase):
 
     def test_minimax_stops_at_its_end_of_turn_only(self):
         import strata_tokenizer as ST
-        from serve.server import stop_token_ids
+        from serve.server import end_token_ids
         b2u = ST.bytes_to_unicode()
         tokens = [b2u[b] for b in range(256)] + ["<think>", "</think>", "[e~[", "]~b]"]
         tok = ST.Tokenizer(tokens, [], [1] * 256 + [4, 4, 3, 3])
-        self.assertEqual(stop_token_ids(tok), {258})
+        self.assertEqual(end_token_ids(tok), {258})
         for b in b"<|":
-            self.assertNotIn(b, stop_token_ids(tok))
+            self.assertNotIn(b, end_token_ids(tok))
 
     def test_qwen_keeps_im_end_and_endoftext(self):
         import strata_tokenizer as ST
-        from serve.server import stop_token_ids
+        from serve.server import end_token_ids
         b2u = ST.bytes_to_unicode()
         tokens = [b2u[b] for b in range(256)] + ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
-        self.assertEqual(stop_token_ids(ST.Tokenizer(tokens, [], [1] * 256 + [3, 3, 3])), {257, 258})
-        self.assertEqual(stop_token_ids(ByteTokenizer()), {257, 258})
+        self.assertEqual(end_token_ids(ST.Tokenizer(tokens, [], [1] * 256 + [3, 3, 3])), {257, 258})
+        self.assertEqual(end_token_ids(ByteTokenizer()), {257, 258})
         svc = Service(MockEngine(ByteTokenizer(), "ok"), ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
         self.assertEqual(svc.stop_ids, {257, 258})
 
@@ -1151,7 +1151,7 @@ class ToolCallTagInProse(unittest.TestCase):
 
 
 class ToolCallRecovery(unittest.TestCase):
-    """Opt-in ("tool_call_recovery": true): the model sometimes writes a call in a form next to the template's.  These
+    """On by default in the server since 0.2.8 (config "tool_call_recovery": false turns it off): the model sometimes writes a call in a form next to the template's.  These
     shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude Code, signalnine/q27): with the switch on, a
     declared tool's call in one of them is the call; anything else stays content, verbatim."""
     SCHEMA = ToolCallTerminators.SCHEMA
@@ -1279,6 +1279,29 @@ class ToolCallRecoverySwitch(unittest.TestCase):
     def test_switch(self):
         self.assertEqual(self.run_reply(False), [])
         self.assertEqual(self.run_reply(True), [ToolCallRecovery.CALL])
+
+    def test_on_by_default_and_the_config_turns_it_off(self):
+        """0.2.8: a server that is told nothing reads these calls; "tool_call_recovery": false is the off switch."""
+        from serve.server import tool_call_recovery_setting
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIs(svc.tool_call_recovery, True)
+        self.assertIs(tool_call_recovery_setting({}), True)
+        self.assertIs(tool_call_recovery_setting({"model": "x"}), True)
+        self.assertIs(tool_call_recovery_setting({"tool_call_recovery": True}), True)
+        self.assertIs(tool_call_recovery_setting({"tool_call_recovery": False}), False)
+        for bad in ("false", 0, 1, None, "off"):
+            with self.assertRaises(SystemExit):
+                tool_call_recovery_setting({"tool_call_recovery": bad})
+
+    def test_a_fresh_service_reads_the_call_without_being_told(self):
+        tok = ByteTokenizer()
+        script = "</think>\n\n<function=write>\n" + ToolCallRecovery.PARAMS
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            evs = [x for kind, x in svc.run(tok.encode("hi"), True, ToolCallRecovery.SCHEMA, 3000, {},
+                                            threading.Event()) if kind == "event"]
+        self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [ToolCallRecovery.CALL])
 
 
 class UnfinishedToolCall(unittest.TestCase):
