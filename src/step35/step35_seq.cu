@@ -12,13 +12,18 @@
 //   * the gate is per (position, head), and the arrays are laid out exactly that way, so the gate kernel is
 //     called with n_pos * n_head rows.
 //
-// Scope: the dense blocks.  The mixture-of-experts blocks route PER POSITION, so they go through the same
-// machinery one position at a time; that is the next change, and it is named rather than half-done here.
+// WITH A CACHE (`Session* session`) the pass also OWNS ITS K/V: after rope, each position's cells are written with
+// kv_append_q8_steps and the attention reads the cache in place, over `0 .. pos0+n_pos-1` rather than over this
+// pass's tensors alone.  That is what makes the second pass cheap - a decode row reads the cells the prompt wrote
+// instead of recomputing them - and it is why the same function is both the prefill and the decode step: a decode
+// is this function with one token at `pos0 = n_cached`.  Without a session, the attention is `attn_causal` over the
+// fp32 tensors of this pass, which is the validation vehicle for the arithmetic.
 #include "strata/step35/attn.hpp"
 #include "strata/step35/block.hpp"
 #include "strata/step35/gemv.hpp"
 #include "strata/step35/kernels.hpp"
 #include "strata/step35/moe.hpp"
+#include "strata/step35/session.hpp"
 
 #include <cuda_runtime.h>
 #include <ggml.h>
@@ -124,7 +129,8 @@ std::vector<int> positions_for(int n_pos, int n_heads, int pos0) {
 }  // namespace
 
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,
-                      int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err) {
+                      int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err,
+                      Session* session) {
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
     const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
@@ -133,6 +139,10 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     const int top_k = (int) file.meta().get(pfx + "expert_used_count")->num();
     const int n_ff_exp = (int) file.meta().get(pfx + "expert_feed_forward_length")->num();
     const int n_ff_sh = (int) file.meta().get(pfx + "expert_shared_feed_forward_length")->num();
+    // the sliding window, from the file rather than from a constant: every sliding block has it, and a block whose
+    // window the cache applied differently would be a quiet difference between the two attention paths
+    const strata::MetaValue* wv = file.meta().get(pfx + "attention.sliding_window");
+    const int window = wv ? (int) wv->num() : 512;
     const float exp_scale = (float) file.meta().get(pfx + "expert_weights_scale")->num();
     const strata::MetaValue* normv = file.meta().get(pfx + "expert_weights_norm");
     const bool exp_norm = normv && normv->type == strata::MetaType::BOOL && normv->u != 0;
@@ -188,7 +198,19 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         if (ok) per_head_rms_norm(k, n_pos * nkv, hd, b.k_norm, b.eps, nullptr);
         if (ok) rope_neox(q, n_pos * nh, hd, b.n_rot, dpq, b.base, b.rope_ff, b.n_ff_rope, nullptr);
         if (ok) rope_neox(k, n_pos * nkv, hd, b.n_rot, dpk, b.base, b.rope_ff, b.n_ff_rope, nullptr);
-        if (ok) attn_causal(q, k, v, ao, n_pos, nh, nkv, hd, b.sliding ? 512 : 0, nullptr);
+        if (ok && session) {
+            // the cache's own geometry, checked rather than assumed: a session built for another model would
+            // otherwise write these cells with this model's numbers and answer from them
+            if (session->n_head_kv != nkv || session->head_dim != hd || session->page_size != kKvPageSize) {
+                err = "the cache was built for " + std::to_string(session->n_head_kv) + " KV heads of " +
+                      std::to_string(session->head_dim) + " dims, this block has " + std::to_string(nkv) + " of " +
+                      std::to_string(hd);
+                ok = false;
+            }
+            if (ok) ok = session_append(*session, layer, pos0, n_pos, k, v, err);
+            if (ok) ok = session_attend(*session, layer, q, ao, pos0, n_pos, nh, b.sliding ? window : 0, err);
+        }
+        if (ok && !session) attn_causal(q, k, v, ao, n_pos, nh, nkv, hd, b.sliding ? window : 0, nullptr);
         if (ok) ok = proj((ggml_type) b.t_gate, b.gate, x, gt, e, nh, n_pos, d_q8, err);
         if (ok) k_gate_rows<<<n_pos * nh, 128>>>(ao, gt, hd);
         if (ok) ok = proj((ggml_type) b.t_wo, b.wo, ao, res, nh * hd, e, n_pos, d_q8, err);

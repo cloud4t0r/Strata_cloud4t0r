@@ -22,6 +22,8 @@
 
 namespace strata::step35::kernels {
 
+struct Session;   // the quantized K/V cache, in session.hpp (forward: only a pointer crosses here)
+
 /// The device buffers of one dense block, uploaded from the file.  Freed by release().
 struct DenseBlock {
     void* q = nullptr;      // attn_q, attn_k, attn_v, attn_output, attn_gate: quantized GGUF blocks, as stored
@@ -80,11 +82,18 @@ bool upload_moe_block(const strata::GgufModel& file, int layer, MoeBlock& b, std
 void release_moe_block(MoeBlock& b);
 bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
 
-/// The whole model over a prompt of several positions, DENSE blocks only for now: every position goes through
-/// each block at once (see src/step35/step35_seq.cu).  `sums` receives, per block, the hidden state summed over
-/// every position - the figure `--ref` prints - and `out` the last block's output, [n_pos][n_embd].
+/// The whole model over a prompt of several positions, DENSE blocks then the mixture-of-experts ones: every
+/// position goes through each block at once (see src/step35/step35_seq.cu).  `sums` receives, per block, the hidden
+/// state summed over every position - the figure `--ref` prints - and `out` the last block's output,
+/// [n_pos][n_embd].
+///
+/// `session`, when given, is the conversation's quantized K/V: the pass writes its cells (`session_append`) and
+/// reads the cache in place (`session_attend`) instead of attenting over the tensors it just computed.  A decode
+/// step is this same call with one token at `pos0 = session.n_cached`, so prefill and decode cannot drift apart.
+/// With `session` null the attention is `attn_causal` over this pass's fp32 K/V - the validation path.
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
-                      std::vector<float>& out, std::vector<double>& sums, std::string& err);
+                      std::vector<float>& out, std::vector<double>& sums, std::string& err,
+                      Session* session = nullptr);
 
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the

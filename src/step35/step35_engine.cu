@@ -14,10 +14,13 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/step35/block.hpp"
 #include "strata/step35/gemv.hpp"
+#include "strata/step35/session.hpp"
 
 #include <ggml.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -688,6 +691,102 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
         }
         std::printf("strata-step35: %zu position(s) through %d block(s) on the GPU (dense, then mixture of experts)\n", ids.size(), n_blocks);
         for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);
+        // the same per-position figures `--ref` prints, from the fp32 K/V of this pass: the line the cache's own
+        // `--gpu-chat` is compared against, position by position
+        const int n_embd = out.empty() ? 0 : (int) (out.size() / ids.size());
+        for (size_t p = 0; n_embd > 0 && p < ids.size(); ++p) {
+            const float* h = out.data() + p * (size_t) n_embd;
+            double ss = 0;
+            for (int i = 0; i < n_embd; ++i) ss += (double) h[i] * (double) h[i];
+            std::printf("  position %zu: rms %.6f, first four:", p, std::sqrt(ss / (double) n_embd));
+            for (int i = 0; i < 4; ++i) std::printf(" %.6f", h[i]);
+            std::printf("\n");
+        }
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
+/// `--gpu-chat`: a prompt, then decode steps that reuse its K/V through the quantized cache.  The figures printed
+/// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
+/// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
+int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
+             int max_ctx) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        auto parse = [](const std::string& csv) {
+            std::vector<int32_t> v;
+            for (size_t i = 0; i < csv.size();) {
+                size_t j = csv.find(',', i);
+                if (j == std::string::npos) j = csv.size();
+                v.push_back((int32_t) std::strtol(csv.substr(i, j - i).c_str(), nullptr, 10));
+                i = j + 1;
+            }
+            return v;
+        };
+        const std::vector<int32_t> prompt = parse(tokens_csv), next = parse(next_csv);
+        if (prompt.empty()) {
+            std::printf("strata-step35: --gpu-chat needs --tokens <id,id,...>\n");
+            return 2;
+        }
+        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
+        const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
+        const int n_head_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
+        const int head_dim = (int) file.meta().get("step35.attention.key_length")->num();
+        const int needed = (int) prompt.size() + (int) next.size();
+        const int capacity = std::max(max_ctx, needed);
+
+        kernels::Session s;
+        std::string err;
+        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("strata-step35: cache: %llu B per token per layer, %d cells over %d layer(s) -> %.3f GB "
+                    "if every layer is used\n",
+                    (unsigned long long) kernels::session_bytes_per_token(s) / (uint64_t) s.n_layers, s.capacity,
+                    s.n_layers, (double) s.capacity * (double) kernels::session_bytes_per_token(s) / 1e9);
+
+        // ---- the prompt: n positions in one pass, their cells written as they go
+        std::vector<float> out;
+        std::vector<double> sums;
+        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &s)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("strata-step35: prefill of %zu position(s) through %d block(s)\n", prompt.size(), n_blocks);
+        for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);
+        std::vector<float> rows = out;   // [position][n_embd], the figures --ref prints
+
+        // ---- the decode steps: ONE position each, attending to the cells the prompt left behind
+        int pos = (int) prompt.size();
+        for (size_t d = 0; d < next.size(); ++d) {
+            std::vector<int32_t> one(1, next[d]);
+            std::vector<float> dout;
+            std::vector<double> dsums;
+            if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, dsums, err, &s)) {
+                std::printf("strata-step35: decode %zu: %s\n", d, err.c_str());
+                return 1;
+            }
+            double ss = 0;
+            for (float x : dout) ss += (double) x * (double) x;
+            std::printf("  decode %zu (token %d at position %d, %d cached): sum %.6f rms %.6f\n", d, next[d], pos,
+                        s.n_cached, dsums.empty() ? 0.0 : dsums.back(), std::sqrt(ss / (double) n_embd));
+            rows.insert(rows.end(), dout.begin(), dout.end());
+            ++pos;
+        }
+        for (size_t p = 0; p * (size_t) n_embd < rows.size(); ++p) {
+            const float* h = rows.data() + p * (size_t) n_embd;
+            double ss = 0;
+            for (int i = 0; i < n_embd; ++i) ss += (double) h[i] * (double) h[i];
+            std::printf("  position %zu: rms %.6f, first four:", p, std::sqrt(ss / (double) n_embd));
+            for (int i = 0; i < 4; ++i) std::printf(" %.6f", h[i]);
+            std::printf("\n");
+        }
+        kernels::session_destroy(s);
         return 0;
     } catch (const std::exception& ex) {
         std::printf("strata-step35: %s\n", ex.what());
@@ -709,6 +808,12 @@ void usage() {
         "      Run the CPU reference over the blocks (default: all of them, 3 dense then 42 MoE) and print\n"
         "      what each one produced.  The reference a kernel is compared against; no GPU.\n"
         "      produced.  The reference a kernel is compared against; it does not touch a GPU.\n"
+        "\n"
+        "  strata-step35 --gpu-chat <first shard> --tokens <id,id,...> [--next <id,id,...>] [--layers N]\n"
+        "      [--max-context N]\n"
+        "      Prefill the prompt with the quantized K/V cache, then decode each --next token against it.  Prints\n"
+        "      the per-block sums and, per position, the rms and first four values --ref prints: the two outputs\n"
+        "      are the comparison the cache is held to.\n"
         "\n"
         "The forward pass is not in this build yet.  The flags it will take are strata's own (--model,\n"
         "--max-context, --tokens, --max-new, --serve) plus --mtp for the NextN file.\n");
@@ -794,13 +899,17 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
 }  // namespace
 
 int run(int argc, char** argv) {
-    std::string trunk, mtp, tokens, dump;
-    int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0;
+    std::string trunk, mtp, tokens, dump, next;
+    int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
+    bool want_chat = false;
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--gpu-chat") == 0) {
+            trunk = argv[++i];
+            want_chat = true;
         } else if (std::strcmp(argv[i], "--gpu-seq") == 0) {
             trunk = argv[++i];
             want_seq = true;
@@ -823,10 +932,14 @@ int run(int argc, char** argv) {
             mtp = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0) {
             tokens = argv[++i];
+        } else if (std::strcmp(argv[i], "--next") == 0) {
+            next = argv[++i];
         } else if (std::strcmp(argv[i], "--dump") == 0) {
             dump = argv[++i];
         } else if (std::strcmp(argv[i], "--layers") == 0) {
             layers = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--max-context") == 0) {
+            max_ctx = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--layer") == 0) {
             gpu_layer = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--token") == 0) {
@@ -840,6 +953,7 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump);
+    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos);
     if (want_all) {
         if (token < 0) {
