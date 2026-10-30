@@ -927,7 +927,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # `strata` switches to for a step35 model (the family switch at the top of its main) and that strata-step35
   # wraps on its own.  It carries the file's own validator (--inspect) and the CPU reference (--ref, step35ref.cpp)
   # that the GPU kernels will be compared against; the kernels themselves come next.
-  add_library(strata_step35 STATIC src/step35/step35_engine.cu src/step35/step35ref.cpp src/step35/step35_kernels.cu src/step35/step35_gemv.cu)
+  add_library(strata_step35 STATIC src/step35/step35_engine.cu src/step35/step35ref.cpp src/step35/step35_kernels.cu src/step35/step35_gemv.cu src/step35/step35_moe.cu)
   target_include_directories(strata_step35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/step35 PRIVATE ${_strata_gpu_include_directories} "${STRATA_GGML_DIR}/ggml/include")
   target_link_libraries(strata_step35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)
@@ -946,6 +946,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(step35_gemv_parity PRIVATE ${_strata_gpu_include_directories} "${STRATA_GGML_DIR}/ggml/include")
   target_link_libraries(step35_gemv_parity PRIVATE strata_step35 strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME step35_gemv_parity COMMAND step35_gemv_parity)
+  # the router: sigmoid, selection bias that does not enter the weights, top-k with a defined tie order, scale
+  add_executable(step35_moe_parity src/step35/step35_moe_parity.cpp)
+  target_include_directories(step35_moe_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(step35_moe_parity PRIVATE strata_step35 ${_strata_gpu_runtime_target})
+  add_test(NAME step35_moe_parity COMMAND step35_moe_parity)
   target_link_libraries(strata PRIVATE strata_step35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_STEP35=1)
 

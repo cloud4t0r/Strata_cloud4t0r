@@ -324,13 +324,25 @@ bool forward(const Model& m, const std::vector<int32_t>& tokens, int64_t layers,
                     for (int64_t i = 0; i < m.n_expert; ++i) {
                         probs[(size_t) i] = 1.0 / (1.0 + std::exp(-(double) logits[(size_t) i]));
                     }
-                    std::vector<int64_t> order((size_t) m.n_expert);
-                    for (int64_t i = 0; i < m.n_expert; ++i) order[(size_t) i] = i;
-                    auto key = [&](int64_t i) {
-                        return probs[(size_t) i] + (bias.empty() ? 0.0 : (double) bias[(size_t) i]);
-                    };
-                    std::partial_sort(order.begin(), order.begin() + m.top_k, order.end(),
-                                      [&](int64_t a, int64_t c) { return key(a) > key(c); });
+                    // top-k, largest selection score first, TIES TO THE LOWEST INDEX - the same rule the device
+                    // kernel follows, so the two can be compared exactly and two runs never differ
+                    std::vector<int64_t> order;
+                    std::vector<char> taken((size_t) m.n_expert, 0);
+                    for (int64_t k = 0; k < m.top_k; ++k) {
+                        int64_t best_i = -1;
+                        double best = -1e300;
+                        for (int64_t e = 0; e < m.n_expert; ++e) {
+                            if (taken[(size_t) e]) continue;
+                            const double sel = probs[(size_t) e] + (bias.empty() ? 0.0 : (double) bias[(size_t) e]);
+                            if (sel > best || (sel == best && (best_i < 0 || e < best_i))) {
+                                best = sel;
+                                best_i = e;
+                            }
+                        }
+                        if (best_i < 0) break;
+                        taken[(size_t) best_i] = 1;
+                        order.push_back(best_i);
+                    }
                     std::vector<double> w((size_t) m.top_k);
                     double sum = 0;
                     for (int64_t k = 0; k < m.top_k; ++k) {
