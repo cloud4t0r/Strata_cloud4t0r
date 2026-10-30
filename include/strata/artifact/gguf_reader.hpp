@@ -687,8 +687,52 @@ inline std::string check_architecture_minimax_m2(const GgufFile& g) {
     return {};
 }
 
-// ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
-// architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
+/// Step-3.7-Flash's guard: the keys the release carries, the three per-layer arrays sized to block_count, and the
+/// counts that must agree (top-k inside the expert count, the dense prefix inside the block count, whole GQA
+/// splits).  It reads the file's own words; the tensor-level audit - every q/k/v/output/gate width against the
+/// layer's head count - is the engine's (`strata-step35 --inspect`), which needs the weights anyway.
+inline std::string check_architecture_step35(const GgufFile& g) {
+    static const char* const keys[] = {
+        "step35.block_count", "step35.embedding_length", "step35.context_length", "step35.feed_forward_length",
+        "step35.attention.head_count", "step35.attention.head_count_kv", "step35.attention.key_length",
+        "step35.attention.value_length", "step35.attention.layer_norm_rms_epsilon",
+        "step35.attention.sliding_window", "step35.attention.sliding_window_pattern",
+        "step35.rope.freq_base", "step35.rope.freq_base_swa", "step35.expert_count", "step35.expert_used_count",
+        "step35.expert_feed_forward_length", "step35.expert_shared_feed_forward_length",
+        "step35.expert_weights_scale", "step35.expert_weights_norm", "step35.leading_dense_block_count",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num() && v->type != MetaType::ARRAY) return std::string(k) + " is neither a number nor an array";
+    }
+    const MetaValue* nl = g.get("step35.block_count");
+    if (nl->u == 0) return "step35.block_count is zero";
+    // one entry per block, or the layer pattern would be read past its end
+    static const char* const per_layer[] = {"step35.attention.head_count", "step35.attention.head_count_kv",
+                                            "step35.attention.sliding_window_pattern"};
+    for (const char* k : per_layer) {
+        const MetaValue* v = g.get(k);
+        if (v->type != MetaType::ARRAY) return std::string(k) + " is not an array";
+        if (v->count != nl->u)
+            return std::string(k) + " has " + std::to_string(v->count) + " entries for " + std::to_string(nl->u) +
+                   " blocks";
+    }
+    const MetaValue* used = g.get("step35.expert_used_count");
+    const MetaValue* cnt = g.get("step35.expert_count");
+    if (used->u > cnt->u) return "step35.expert_used_count is bigger than step35.expert_count";
+    const MetaValue* dense = g.get("step35.leading_dense_block_count");
+    if (dense->u > nl->u) return "step35.leading_dense_block_count is bigger than step35.block_count";
+    const MetaValue* heads = g.get("step35.attention.head_count");
+    const MetaValue* kv = g.get("step35.attention.head_count_kv");
+    for (uint64_t i = 0; i < heads->items.size() && i < kv->items.size(); ++i) {
+        if (heads->items[i].u == 0 || kv->items[i].u == 0 || heads->items[i].u % kv->items[i].u != 0)
+            return "step35.attention.head_count does not split into head_count_kv on block " + std::to_string(i);
+    }
+    return {};
+}
+
+// ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE// architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
 // shape is refused with the key that differs rather than silently mis-run.
 
@@ -875,6 +919,7 @@ inline std::string check_architecture(const GgufFile& f) {
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
     if (family == ModelFamily::MiniMaxM2) return check_architecture_minimax_m2(f);
+    if (family == ModelFamily::Step35) return check_architecture_step35(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

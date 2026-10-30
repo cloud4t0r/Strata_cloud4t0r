@@ -349,6 +349,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(model_family_test tests/core/model_family_test.cpp)
   target_link_libraries(model_family_test PRIVATE strata_artifact)
   add_test(NAME model_family_test COMMAND model_family_test)
+  # Step-3.7-Flash (step35): the family it is recognised as, and the guard on its per-layer arrays (synthetic)
+  add_executable(step35_metadata_test tests/core/step35_metadata_test.cpp)
+  target_link_libraries(step35_metadata_test PRIVATE strata_artifact)
+  add_test(NAME step35_metadata_test COMMAND step35_metadata_test)
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
@@ -918,6 +922,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata-m2 PRIVATE strata_minimaxm2 ${_strata_gpu_runtime_target})
   target_link_libraries(strata PRIVATE strata_minimaxm2)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_MINIMAXM2=1)
+
+  # the engine path for Step-3.7-Flash (GGUF architecture step35): src/step35/step35_engine.cu, a library that
+  # `strata` switches to for a step35 model (the family switch at the top of its main) and that strata-step35
+  # wraps on its own.  It carries the file's own validator (--inspect) and the CPU reference (--ref, step35ref.cpp)
+  # that the GPU kernels will be compared against; the kernels themselves come next.
+  add_library(strata_step35 STATIC src/step35/step35_engine.cu src/step35/step35ref.cpp)
+  target_include_directories(strata_step35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/step35 PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_step35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  if(STRATA_NATIVE_EXPERTS)
+    target_link_libraries(strata_step35 PRIVATE strata_kernels_cpu)
+  endif()
+  add_executable(strata-step35 src/step35/step35_main.cpp)
+  target_link_libraries(strata-step35 PRIVATE strata_step35 ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_step35)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_STEP35=1)
 
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).
   # Its own executable for now (strata-dsv41); a family switch in `strata` comes after first light.  OFF by default: it
