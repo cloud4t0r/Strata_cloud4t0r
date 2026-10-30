@@ -89,6 +89,13 @@ strata-step35 --ref <first shard> --tokens "0,671,6102" --layers 3 [--dump out.f
 strata-step35 --gpu-all <first shard> --token 671 --pos 0
 ```
 
+`--gpu-seq` runs a PROMPT of several positions through every block, dense and mixture of experts, and prints the
+hidden state summed over all positions after each block - the figure `--ref` prints, so the two line up.
+
+```sh
+strata-step35 --gpu-seq <first shard> --tokens "0,671,6102,294,8760,344" --layers 4
+```
+
 ## What is measured
 
 All figures on this machine (2 x 16 GB AMD, 62 GB RAM, ROCm at `/opt/rocm`), against llama.cpp built from the
@@ -100,6 +107,7 @@ same file:
 | dense blocks 0-2 | 1.6e-04 to 9.1e-04 of the value scale |
 | first expert block | 1.5e-04 |
 | **all 45 blocks, one token** | **0.12% on the rms, 0.50% on the sum** |
+| a prompt of 6 positions, 3 dense + 1 expert block | 3.3e-04 to 7.5e-04 |
 | speed | **1.39 s per token**, warm page cache (2.13 s cold) |
 
 The residual difference is the Q8_1 quantization of the activations, which K-quant matvecs carry by design; it
@@ -108,8 +116,9 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 ## What does not work yet
 
-- **No KV cache.** Each token recomputes everything, and the block functions handle one position. A prompt of
-  several tokens is not supported at all, so the model cannot yet be given a chat turn.
+- **No KV cache.** A prompt of several positions now runs (dense and expert blocks both), but the K/V of that
+  pass is thrown away: a second turn recomputes the first. That reuse is the one thing between here and a chat
+  turn, and the figures to beat are the ones above.
 - **No MTP.** The three NextN blocks are readable (`--inspect --mtp` checks them) but not run.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
