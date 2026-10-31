@@ -138,10 +138,10 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 ## What does not work yet
 
-- **No MTP.** The three NextN blocks are readable (`--inspect --mtp` checks them) but not run. The trunk's own head
-  does run now: `--logits` on `--gpu-seq` or `--gpu-chat` applies the file's `output_norm` and `output` to the last
-  position and prints the five tokens it would answer with, which is the figure `--ref` prints - and the two agree
-  on the first four at 45 blocks (see the table above). Whatever MTP is built on, it is built on that.
+- **MTP drafts, but nothing uses them.** The three NextN blocks run (`--gpu-mtp`, and `--ref --mtp` on the CPU) and
+  propose tokens; what does not exist is the loop that would turn a draft into a speed-up: no sampler, no
+  acceptance, no generation. See the section below for what they answer.
+- **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
   what makes it fit in 32 GB, and it is also why it is slow.
@@ -244,6 +244,48 @@ That run also found an older defect, now fixed: `run_prompt_dense` sized its `q8
 it to projections 11264 and 12288 wide, overrunning it by up to 96 KB on every prompt pass. At 6 positions the
 bytes landed in memory the next allocation replaced; at 1600 they faulted the GPU inside `quantize_q8_1_kernel`.
 The scratch is now sized per block for the widest input it quantizes.
+
+## The MTP draft heads
+
+```sh
+strata-step35 --gpu-mtp <first shard> --mtp <NextN file> --tokens "0,671,6102,294,8760,344" [--drafts N] [--layers N]
+strata-step35 --ref      <first shard> --mtp <NextN file> --tokens "..."                  # the same, on the CPU
+```
+
+The trunk runs the prompt through its cache, then continues **greedily on its own** for as many tokens as there are
+draft heads, then each NextN block is fed the token the trunk itself chose at that position and the previous head's
+`h_nextn`. A draft is worth something only if it proposes what the trunk would have said, so every head's top-1 is
+printed against the trunk's token next to it, and the run ends with the count.
+
+The wiring is llama.cpp's `graph_mtp`, block for block: `rms_norm(token_embd[token], nextn.enorm)` concatenated
+with `rms_norm(h, nextn.hnorm)` (the embedding first), back to n_embd through `nextn.eh_proj`, one **dense** decoder
+block of the NextN file (96 query heads, 8 KV, window 512, FFN 11264, no clamp), then `nextn.shared_head_norm` and
+`nextn.shared_head_head`. The NextN file carries its own embedding table and its own head, so a draft borrows
+nothing from the trunk but the hidden state.
+
+**One cell, and only its own.** A NextN layer runs once per chain: the trunk never computed K/V for it, and no
+earlier draft went through it either, so its attention has exactly the cell this step writes. Running it with the
+window of 512 it declares is wrong - it reads cells nothing ever wrote, and the first attempt answered `NaN`. What
+a draft knows comes from `h_nextn` and the token.
+
+Measured on three prompts (the same six, eight and ten token sequences, IQ3_XXS trunk and the Q8_0 NextN file,
+45 blocks). The bold token is the head's top-1, and ✓ means it is the token the trunk chose next:
+
+| prompt | the trunk continues | block 45 | block 46 | block 47 |
+|---|---|---|---|---|
+| `0,671,6102,294,8760,344` | `11111 16 455 6102` | **16** ✓ | 128007 ✗ (455 third) | **6102** ✓ |
+| `… 671,6102` | `294 8760 344 671` | **8760** ✓ | 294 ✗ (344 second) | 270 ✗ |
+| `… 671,6102,294,8760` | `344 671 6102 294` | **671** ✓ | 11111 ✗ | 4593 ✗ (294 second) |
+
+The first head proposes the trunk's own next token **3 times out of 3**; the two chained heads **1 time out of 6**.
+That is the shape to expect: block 45 is handed the trunk's hidden state, blocks 46 and 47 continue from a hidden
+state their predecessor produced. Three prompts are not a benchmark - this says what the wiring does, not what a
+draft is worth, and the worth needs the acceptance loop that does not exist yet.
+
+Against the CPU reference the two paths answer the **same top-1 on all three heads**, with `h_nextn` rms within
+0.3% (2.5716 against 2.5731, 3.5184 against 3.5215, 3.3113 against 3.3220) and the third to fifth places swapping
+on near-ties - a Q8_0 file against a float32 host, which is the size of the difference the page quotes everywhere
+else.
 
 ## Tests
 
