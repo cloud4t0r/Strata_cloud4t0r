@@ -743,23 +743,67 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         const int needed = (int) prompt.size() + (int) next.size();
         const int capacity = std::max(max_ctx, needed);
 
+        // Which blocks keep the whole prefix and which read a window - from the file, block by block, because a
+        // block that attended over a window the cache did not apply (or the reverse) would answer something
+        // plausible and wrong.  A sliding layer's cache is a ring of `window + kKvPassMax - 1` cells.
+        const strata::MetaValue* swa = file.meta().get("step35.attention.sliding_window_pattern");
+        const strata::MetaValue* wv = file.meta().get("step35.attention.sliding_window");
+        const int window = wv ? (int) wv->num() : 512;
+        std::vector<int> windows((size_t) n_blocks, 0);
+        for (int l = 0; l < n_blocks; ++l) {
+            // the model-wide pattern first, then the per-block key `upload_block` itself reads: a file that declares
+            // one and not the other must not silently get a full cache where a window is attended - step35_seq.cu
+            // refuses that combination instead of answering from cells the next position already reused
+            bool sliding = false;
+            if (swa && swa->type == strata::MetaType::ARRAY && (size_t) l < swa->items.size()) {
+                sliding = swa->items[(size_t) l].num() != 0;
+            } else if (const strata::MetaValue* pb =
+                           file.meta().get("blk." + std::to_string(l) + ".attention.sliding_window_pattern")) {
+                if (pb->type == strata::MetaType::ARRAY && (size_t) l < pb->items.size())
+                    sliding = pb->items[(size_t) l].num() != 0;
+                else if (pb->is_num())
+                    sliding = pb->num() != 0;
+            }
+            if (sliding) windows[(size_t) l] = window;
+        }
+
         kernels::Session s;
         std::string err;
-        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err)) {
+        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err, windows)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
-        std::printf("strata-step35: cache: %llu B per token per layer, %d cells over %d layer(s) -> %.3f GB "
-                    "if every layer is used\n",
-                    (unsigned long long) kernels::session_bytes_per_token(s) / (uint64_t) s.n_layers, s.capacity,
-                    s.n_layers, (double) s.capacity * (double) kernels::session_bytes_per_token(s) / 1e9);
+        int n_full = 0, n_ring = 0, ring_cells = 0;
+        for (int l = 0; l < n_blocks; ++l) {
+            const int c = kernels::session_layer_cells(s, l);
+            if (windows[(size_t) l] > 0) { ++n_ring; ring_cells = c; } else { ++n_full; }
+        }
+        std::printf("strata-step35: cache: %d full layer(s) x %d cells, %d sliding layer(s) x %d cells (window %d)"
+                    " -> %.3f GB at %d positions, %.3f GB if every layer kept every position\n",
+                    n_full, s.capacity, n_ring, ring_cells, window,
+                    (double) kernels::session_bytes_at(s, s.capacity) / 1e9, s.capacity,
+                    (double) s.capacity * (double) kernels::session_bytes_per_token(s) / 1e9);
 
-        // ---- the prompt: n positions in one pass, their cells written as they go
+        // ---- the prompt, in passes of at most kKvPassMax positions: a sliding layer's ring is sized for one such
+        // pass, and the rows of a pass are independent (each reads the cells of the positions before it), so
+        // splitting the prompt moves no bit - the parity test appends in two chunks and compares the whole thing.
         std::vector<float> out;
         std::vector<double> sums;
-        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &s)) {
-            std::printf("strata-step35: %s\n", err.c_str());
-            return 1;
+        for (size_t off = 0; off < prompt.size(); off += (size_t) kernels::kKvPassMax) {
+            const size_t n = std::min((size_t) kernels::kKvPassMax, prompt.size() - off);
+            const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
+            std::vector<float> part;
+            std::vector<double> csum;
+            if (!kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &s)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            if (sums.empty()) {
+                sums = csum;
+            } else {
+                for (size_t l = 0; l < sums.size() && l < csum.size(); ++l) sums[l] += csum[l];
+            }
+            out.insert(out.end(), part.begin(), part.end());
         }
         std::printf("strata-step35: prefill of %zu position(s) through %d block(s)\n", prompt.size(), n_blocks);
         for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);

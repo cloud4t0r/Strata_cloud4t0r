@@ -207,6 +207,20 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                       std::to_string(hd);
                 ok = false;
             }
+            // The window the cache rings this layer with must be the one this block attends over: a block reading a
+            // window out of a pool that keeps every position is merely wasteful, but the reverse reads cells that
+            // were reused by the position after it - a wrong answer with nothing to show for it.
+            const int w_layer = ok && (size_t) layer < session->windows.size() ? session->windows[(size_t) layer] : 0;
+            if (ok && (w_layer > 0) != b.sliding) {
+                err = "block " + std::to_string(layer) + " reads " + (b.sliding ? "a window" : "the whole prefix") +
+                      ", but its cache was built " + (w_layer > 0 ? "with a ring" : "to keep every position");
+                ok = false;
+            }
+            if (ok && b.sliding && w_layer != window) {
+                err = "block " + std::to_string(layer) + " has a window of " + std::to_string(w_layer) +
+                      ", the file's sliding_window says " + std::to_string(window);
+                ok = false;
+            }
             if (ok) ok = session_append(*session, layer, pos0, n_pos, k, v, err);
             if (ok) ok = session_attend(*session, layer, q, ao, pos0, n_pos, nh, b.sliding ? window : 0, err);
         }

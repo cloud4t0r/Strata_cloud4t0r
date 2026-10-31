@@ -150,7 +150,8 @@ cells with `strata_kernels`' `kv_append_q8_steps` and then attends over `0 .. po
 - `include/strata/step35/session.hpp` / `src/step35/step35_session.cu`: the `Session`. Per layer, K and V as
   `int8` codes plus one `f16` scale per 64 values (`kv_q8.hpp`'s cell), behind a page table of 128-cell pages, and
   a device step buffer that holds the position - the kernels read the position from device memory, not from an
-  argument. Pools are allocated when a layer is first used, so `--layers 4` does not pay for 45.
+  argument. Pools are allocated when a layer is first used, so `--layers 4` does not pay for 45. Each layer has its
+  own table, which is what lets a sliding layer's table repeat and turn its pool into a ring.
 - `src/step35/step35_attn_cached.cu`: `attn_q8_cached`, one warp per (row, query head), the online softmax in
   registers, the `int8` codes read in place. A gather into fp16 scratch was the alternative and it is the wrong one
   at a long context: 4 KB per cell per layer (512 MB at 131072) moved on every token, against 1 KB of codes and no
@@ -159,9 +160,32 @@ cells with `strata_kernels`' `kv_append_q8_steps` and then attends over `0 .. po
   overran from position 512 on - measured 1.6e-03 off the float64 answer at 513 keys, 5.0e-02 at 1024, with no CUDA
   error - and it used to clamp a window wider than 512 down to 512.
 
-Size, measured from the engine's own print: **2112 B per layer per token** (1024 codes + 16 f16 scales, twice),
-**95 KB per token over the 45 layers** - 0.78 GB at 8192 positions, 3.1 GB at 32768, 12.4 GB at 131072. The fp32
+Size, from the session's own arithmetic (`session_bytes_at`, which `step35_kv_parity` now checks on the model's
+real geometry): **2112 B per layer per token** (1024 codes + 16 f16 scales, twice) for a layer that keeps every
+position - **95 KB per token over the 45 layers**, 0.78 GB at 8192, 3.1 GB at 32768, 12.4 GB at 131072. The fp32
 cache would be 4.5x that, which is why the quantized form was built first.
+
+**The 33 sliding layers keep a ring, not the prefix.** Only one block in four attends over the whole prefix; the
+others read a window of 512 positions and never look further back, so the cells they hold past that window are
+written by the pass and read by nobody. Those layers hold `window + kKvPassMax - 1` cells instead - 1536 at a
+window of 512 - and their page table repeats every `cells / page_size` pages, so position *p* and *p + 1536* land
+on the same physical page. The attention kernel is untouched: it already resolved a cell through
+`table[cell / page_size]`, and a repeating table is still a table. On the file's own pattern (12 full blocks, 33
+sliding) the cache is, from `session_bytes_at` and checked by `step35_kv_parity`:
+
+| positions | with the ring | every layer keeping every position |
+|---|---|---|
+| 8192 | 0.315 GB | 0.78 GB |
+| 32768 | 0.938 GB | 3.11 GB |
+| 131072 | **3.431 GB** | **12.46 GB** |
+
+The 33 sliding layers drop from 9.1 GB to 0.11 GB at 131072; the 12 full ones keep their 3.32 GB, because a
+full-attention block really does read the whole prefix.
+
+The price is one rule: **a pass writes at most `kKvPassMax` positions (1024)**. A pass writes all of its cells
+before any of its rows is attended, so a pass long enough to lap the ring would let its first row read cells its
+last row had already overwritten. `--gpu-chat` prefills in passes of 1024 positions and `session_append` refuses a
+longer one, naming the ring's size, rather than answering something plausible and wrong.
 
 What the cache costs, measured on the same prompt (`0,671,6102,294,8760,344,671`, 45 blocks) by running it twice -
 once reading the cache, once reading the fp32 K/V of the pass:
@@ -203,5 +227,9 @@ Six tests, none of which needs the 76 GB download:
   3.5e-04 and 4.5e-03).
 - `step35_kv_parity` - the cache: the `int8` cell compared code by code and scale by scale with a host that
   applies kv_q8's rule; the attention over the dequantized cells at both head counts; a decode row **bit for bit**
-  the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; and a decode row at
-  position 1023, past the 512 the validation vehicle can hold.
+  the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; a decode row at
+  position 1023, past the 512 the validation vehicle can hold; a **ring** on a sliding layer (window 8, 1152
+  cells) lapped twice by 2048 positions, whose page table is read back and whose last row is still the host's; a
+  pass of 2048 positions into that ring **refused** with the ring's size in the message; and the 45-layer sizes at
+  8192, 32768 and 131072 - 0.315 / 0.938 / 3.431 GB with the ring against 0.779 / 3.114 / 12.457 GB keeping every
+  position.

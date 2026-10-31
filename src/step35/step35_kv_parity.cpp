@@ -434,6 +434,127 @@ void long_prefix_case() {
     sk::session_destroy(s);
 }
 
+// ---- 6: A RING ON A SLIDING LAYER.  The 33 sliding blocks of this model read a window of 512 and never look
+// further back, so their cells past that window are written and read by nobody.  Here a layer with a window of 8
+// keeps `8 + kKvPassMax - 1` cells rounded to pages instead of the whole 2048-position prefix, the positions lap
+// that ring twice, and the answer must still be the host's - which is the only thing that says the page table's
+// repeat lands on the right cells.  A pass too long for the ring must be REFUSED, not answered.
+void ring_case() {
+    const int n_pos = 2048, n_head = 96, n_head_kv = 8, head_dim = 128, window = 8;
+    std::vector<float> q = noise((size_t) n_pos * n_head * head_dim, 41u);
+    std::vector<float> k = noise((size_t) n_pos * n_head_kv * head_dim, 42u);
+    std::vector<float> v = noise((size_t) n_pos * n_head_kv * head_dim, 43u);
+
+    sk::Session s;
+    std::string err;
+    const std::vector<int> windows(1, window);
+    if (!sk::session_create(s, 1, n_head_kv, head_dim, n_pos, err, windows)) {
+        std::printf("FAIL  ring: %s\n", err.c_str());
+        ++failures;
+        return;
+    }
+    const int need = std::min(s.capacity, window + sk::kKvPassMax - 1);
+    const int want = ((need + s.page_size - 1) / s.page_size) * s.page_size;
+    check(sk::session_layer_cells(s, 0) == want && want < s.capacity,
+          "a sliding layer's ring is the window plus one pass, not the whole prefix");
+
+    float* d_q = to_device(q);
+    float* d_k = to_device(k);
+    float* d_v = to_device(v);
+    float* d_o = nullptr;
+    check_cuda(cudaMalloc((void**) &d_o, (size_t) n_head * head_dim * sizeof(float)), "malloc out");
+
+    // two passes of kKvPassMax positions: 2048 cells written into a ring of `want`, so every slot is reused
+    bool ok = true;
+    for (int off = 0; ok && off < n_pos; off += sk::kKvPassMax) {
+        const int n = std::min(sk::kKvPassMax, n_pos - off);
+        ok = sk::session_append(s, 0, off, n, d_k + (size_t) off * n_head_kv * head_dim,
+                                d_v + (size_t) off * n_head_kv * head_dim, err);
+    }
+    if (!ok) {
+        std::printf("FAIL  ring: append: %s\n", err.c_str());
+        ++failures;
+        return;
+    }
+    check(s.layers[0].cells == want && s.n_cached == n_pos,
+          "the pool holds the ring's cells while the sequence holds every position");
+
+    // the table's repeat, read back: page i and page i + ring_pages are the same physical page
+    const int n_pages = s.capacity / s.page_size, ring_pages = want / s.page_size;
+    std::vector<int32_t> table((size_t) n_pages);
+    check_cuda(cudaMemcpy(table.data(), s.layers[0].table, table.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
+               "read table");
+    bool table_ok = ring_pages < n_pages;
+    for (int i = 0; i < n_pages; ++i) table_ok = table_ok && table[(size_t) i] == i % ring_pages;
+    check(table_ok, "the ring's page table repeats every ring_pages, and the prefix's pages all map inside it");
+
+    ok = sk::session_attend(s, 0, d_q + (size_t) (n_pos - 1) * n_head * head_dim, d_o, n_pos - 1, 1, n_head, window,
+                            err);
+    check_cuda(cudaDeviceSynchronize(), "sync ring");
+    if (!ok) {
+        std::printf("FAIL  ring: attend: %s\n", err.c_str());
+        ++failures;
+        return;
+    }
+    const std::vector<float> got = from_device(d_o, (size_t) n_head * head_dim);
+
+    std::vector<float> kdq(k.size()), vdq(k.size());
+    for (int p = 0; p < n_pos; ++p) {
+        std::vector<int8_t> kc, vc;
+        std::vector<uint16_t> ks, vs;
+        host_quantize(&k[(size_t) p * n_head_kv * head_dim], n_head_kv, head_dim, kc, ks);
+        host_quantize(&v[(size_t) p * n_head_kv * head_dim], n_head_kv, head_dim, vc, vs);
+        const std::vector<float> kf = dequantize(kc, ks, n_head_kv, head_dim);
+        const std::vector<float> vf = dequantize(vc, vs, n_head_kv, head_dim);
+        std::copy(kf.begin(), kf.end(), kdq.begin() + (size_t) p * n_head_kv * head_dim);
+        std::copy(vf.begin(), vf.end(), vdq.begin() + (size_t) p * n_head_kv * head_dim);
+    }
+    std::vector<float> ref(q.size(), 0);
+    host_row(q, kdq, vdq, n_pos - 1, n_head, n_head_kv, head_dim, window, ref);
+    const double rel = rel_l2(got, std::vector<float>(ref.begin() + (size_t) (n_pos - 1) * n_head * head_dim, ref.end()));
+    char label[240];
+    std::snprintf(label, sizeof label,
+                  "the row of position %d, after the ring lapped it, is the host's (rel_l2 %.1e)", n_pos - 1, rel);
+    check(rel < 1e-5, label);
+
+    // a pass that would lap the ring before its own last row is written must not be answered at all
+    const bool refused = !sk::session_append(s, 0, 0, n_pos, d_k, d_v, err);
+    std::snprintf(label, sizeof label, "a pass of %d positions into a %d-cell ring is refused: %s", n_pos, want,
+                  refused ? err.c_str() : "it was accepted");
+    check(refused && err.find("ring holds") != std::string::npos, label);
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
+    sk::session_destroy(s);
+}
+
+// ---- 7: THE FIGURES THE DOC QUOTES, on the model's real geometry, from the session's own arithmetic - so the
+// numbers in STEP37.md are pinned by a test rather than by a print nobody can re-run without the 76 GB file.
+void ring_sizes_case() {
+    const int n_layers = 45, n_kv = 8, hd = 128, window = 512;
+    std::vector<int> windows((size_t) n_layers, window);
+    for (int l = 0; l < n_layers; l += 4) windows[(size_t) l] = 0;   // one full-attention block in four
+    for (const int capacity : {8192, 32768, 131072}) {
+        sk::Session s;
+        std::string err;
+        if (!sk::session_create(s, n_layers, n_kv, hd, capacity, err, windows)) {
+            std::printf("FAIL  sizes at %d: %s\n", capacity, err.c_str());
+            ++failures;
+            return;
+        }
+        const double ring_gb = (double) sk::session_bytes_at(s, s.capacity) / 1e9;
+        const double all_gb = (double) s.capacity * (double) sk::session_bytes_per_token(s) / 1e9;
+        char label[280];
+        std::snprintf(label, sizeof label,
+                      "45 layers at %d, one full block in four: %.3f GB with the ring, %.3f GB keeping every "
+                      "position", s.capacity, ring_gb, all_gb);
+        check(ring_gb < all_gb && (capacity < 32768 || ring_gb < all_gb * 0.32), label);
+        sk::session_destroy(s);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -444,6 +565,8 @@ int main() {
     permuted_page_case(40, 96, 8, 128, 0);
     permuted_page_case(37, 64, 8, 128, 16);
     long_prefix_case();
+    ring_case();
+    ring_sizes_case();
 
     if (failures) {
         std::printf("step35_kv_parity: %d check(s) failed\n", failures);

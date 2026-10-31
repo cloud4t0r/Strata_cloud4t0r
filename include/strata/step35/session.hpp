@@ -11,6 +11,13 @@
 // positions, 3.1 GB at 32768, 12.4 GB at 131072.  The same cache in fp32 would be 4.5x that, which does not fit
 // beside the experts on 32 GB of VRAM.
 //
+// WHY A RING ON THE SLIDING LAYERS.  Only one block in four attends over the whole prefix; the other 33 read a
+// window of 512 positions and never look further back, so the cells they keep past that window are written and
+// then read by nobody.  Those layers hold `window + kKvPassMax - 1` cells instead of `capacity`, and the page
+// table repeats every `cells / page_size` pages, so position p and p + cells land on the same physical page: the
+// kernel does not know the ring exists, it only follows the table.  At 131072 positions that takes the 33 sliding
+// layers from 9.1 GB to 0.11 GB, and the cache from 12.4 GB to 3.4 GB.
+//
 // THE ONE THING TO GET RIGHT.  `pos` is not an argument of the kernels: it lives in the device step buffer
 // (`qsa.hpp`'s kStepPos) that the append and the attention both read, so a captured graph stays valid across
 // tokens.  A caller writes it once per pass, through `session_append` / `session_attend` below, and never by hand.
@@ -29,6 +36,12 @@ namespace strata::step35::kernels {
 /// per cell - and the parity test runs a permuted table to prove the mapping cannot leak into the result.
 inline constexpr int kKvPageSize = 128;
 
+/// The most positions one pass writes.  A pass of `n` positions needs, for its earliest row, the cells from that
+/// row's first key to the last row's own: `window + n - 1` on a sliding block, `n` on a full one.  A sliding
+/// layer's ring is sized for one such pass, and `session_append` refuses a pass that would evict a cell an earlier
+/// row of the same pass still reads - silence there is a wrong answer, not a crash.
+inline constexpr int kKvPassMax = 1024;
+
 /// One layer's cache: K and V codes and their scales, `[page][kv_head][page_size][head_dim]` (head_dim fastest)
 /// for the codes and `[page][kv_head][page_size][head_dim / KV_Q8_GROUP]` for the scales, as kv_q8.hpp lays out.
 struct KvLayer {
@@ -36,6 +49,9 @@ struct KvLayer {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
+    int cells = 0;              ///< physical cells: `capacity`, or the ring's length on a sliding layer
+    int ring = 0;               ///< 0: this layer keeps every position; else the ring's length in cells
+    int32_t* table = nullptr;   ///< (capacity / page_size,) logical page -> physical page, per layer
 };
 
 /// A conversation's cache.  `page_size`, `n_head_kv` and `head_dim` are the artifact's geometry, not per block:
@@ -45,22 +61,31 @@ struct Session {
     int n_head_kv = 0;
     int head_dim = 0;
     int page_size = kKvPageSize;
-    int capacity = 0;    ///< cells the cache holds
+    int capacity = 0;    ///< cells the SEQUENCE may hold (the logical bound; a ring layer stores fewer)
     int n_cached = 0;    ///< cells written so far (the next free position; never used as an argument)
-    int32_t* page_table = nullptr;   ///< (n_pages,) i32, identity unless a caller permutes it for a test
-    int32_t* step = nullptr;         ///< (kStepCount,) i32 on device: what the kernels read the position from
-    int32_t* steps = nullptr;        ///< (capacity * kStepCount,) i32: one step buffer per prefilled position
-    std::vector<KvLayer> layers;     ///< one entry per layer, allocated on first use
+    std::vector<int> windows;   ///< per layer: the sliding window, 0 for a full-attention block
+    int32_t* step = nullptr;   ///< (kStepCount,) i32 on device: what the kernels read the position from
+    int32_t* steps = nullptr;   ///< (capacity * kStepCount,) i32: one step buffer per prefilled position
+    std::vector<KvLayer> layers;   ///< one entry per layer, allocated on first use
 };
 
 /// Bytes one cell costs, all layers included (the figure the doc quotes: ~95 KB per token for 45 layers).
 uint64_t session_bytes_per_token(const Session& s);
 /// Bytes currently allocated by the session, page table and step buffers included.
 uint64_t session_bytes(const Session& s);
+/// Bytes the session holds once `n_positions` are cached: what the engine prints, and the figure the ring moves.
+uint64_t session_bytes_at(const Session& s, int n_positions);
+/// Cells a layer actually allocates: `capacity`, or the ring's length when the layer has a window.
+int session_layer_cells(const Session& s, int layer);
 
-/// Allocates the page table (the identity mapping), the step buffers and the per-layer table; a layer's own
-/// buffers are allocated when it is first appended to, so `--layers 4` does not pay for 45.
-bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int capacity, std::string& err);
+/// Allocates the per-layer tables, the step buffers and the per-layer table; a layer's own buffers are allocated
+/// when it is first appended to, so `--layers 4` does not pay for 45.
+/// `per_layer_window` is one entry per layer - the sliding window, or 0 for a full-attention block - and empty
+/// means every layer keeps the whole sequence.  It comes from the file's own `attention.sliding_window_pattern`:
+/// a window this engine applies differently from the attention kernel would be a quiet difference between the two
+/// paths that are supposed to be the same arithmetic.
+bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int capacity, std::string& err,
+                    const std::vector<int>& per_layer_window = {});
 void session_destroy(Session& s);
 
 /// Takes the K and V of `n_tok` positions (already normed and rotated, exactly as the attention wants them),
