@@ -5,8 +5,8 @@ decoder plus a vision encoder. Both are 196B parameters with 11B active, and bot
 `step35`, so one engine path runs the two.
 
 This engine path is **new and incomplete on purpose**. What runs today is the whole model over a prompt of several
-positions, then decode steps that read the prompt's own K/V out of a quantized cache, with the experts read from
-the file. What does not run yet is listed at the end, and it is a real list.
+positions, then decode steps that read the prompt's own K/V out of a quantized cache, and greedy generation from
+that cache, with the experts read from the file. What does not run yet is listed at the end, and it is a real list.
 
 ## What the file says
 
@@ -105,6 +105,10 @@ outputs are the comparison:
 strata-step35 --gpu-chat <first shard> --tokens "0,671,6102,294,8760,344" --next "671" [--layers N] [--max-context N]
 ```
 
+`--max-new N` generates N tokens greedily after the prompt (and after any `--next` steps), each step's own top-1
+being the next step's token, and prints the per-token time and a summary. The head is opened once and kept
+resident - it is 363 MB of Q5_K, and re-uploading it per token would cost more than the pass.
+
 Add `--logits` to either GPU command and it also applies the file's `output_norm` and `output.weight` to the last
 position, printing the five tokens the model would answer with - the same line `--ref` prints, so the head is held
 to the reference the blocks are held to. `strata-step35 --gpu-seq` takes it too.
@@ -131,6 +135,8 @@ same file:
 | position 1599 of that prompt, cache against no cache | rms **-0.46%** (8.352877 against 8.391474) |
 | trunk head, 45 blocks, prompt `0,671,6102,294,8760,344` | `--ref` answers `11111(15.883) 260(13.809) 680(13.513) 17678(13.004) 957(12.724)`; the GPU (with or without the cache) answers the same first four, and the fifth is a near-tie: 12.79 for 270 without the cache, 12.73 for 764 with it |
 | the same 6 positions, CPU reference against GPU | 237.8 s against 4.25 s |
+| generation, 45 blocks, 16 tokens from a 6-token prompt | **1.063 s per token** (best 0.799, worst 1.461), 17.09 s for the sixteen; the first four average 0.895 |
+| what it generates | `11111 16 455 6102 …` - the same four `--gpu-mtp` prints as the trunk's own continuation |
 
 The residual difference is the Q8_1 quantization of the activations, which K-quant matvecs carry by design; it
 is not a difference of arithmetic. llama.cpp's own GPU (fp16) and CPU (f32) runs differ by 1.5e-02 to 3.0e-02 on
@@ -139,8 +145,10 @@ the same file, so a few 1e-3 per block is inside its spread.
 ## What does not work yet
 
 - **MTP drafts, but nothing uses them.** The three NextN blocks run (`--gpu-mtp`, and `--ref --mtp` on the CPU) and
-  propose tokens; what does not exist is the loop that would turn a draft into a speed-up: no sampler, no
-  acceptance, no generation. See the section below for what they answer.
+  propose tokens, and `--gpu-chat --max-new N` generates greedily. What is missing is the part that turns a draft
+  into a speed-up: no acceptance loop, and no sampler beyond the argmax. See the section below.
+- **Greedy only.** `--max-new` takes the top-1 every step: no temperature, no top-k/top-p, no repetition penalty,
+  no stop tokens. A sequence that never emits EOS simply runs to the count asked for.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
