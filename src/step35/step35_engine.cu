@@ -811,7 +811,6 @@ void usage() {
         "  strata-step35 --ref <first shard> --tokens <id,id,...> [--layers N]\n"
         "      Run the CPU reference over the blocks (default: all of them, 3 dense then 42 MoE) and print\n"
         "      what each one produced.  The reference a kernel is compared against; no GPU.\n"
-        "      produced.  The reference a kernel is compared against; it does not touch a GPU.\n"
         "\n"
         "  strata-step35 --gpu-chat <first shard> --tokens <id,id,...> [--next <id,id,...>] [--layers N]\n"
         "      [--max-context N]\n"
@@ -819,8 +818,9 @@ void usage() {
         "      the per-block sums and, per position, the rms and first four values --ref prints: the two outputs\n"
         "      are the comparison the cache is held to.\n"
         "\n"
-        "The forward pass is not in this build yet.  The flags it will take are strata's own (--model,\n"
-        "--max-context, --tokens, --max-new, --serve) plus --mtp for the NextN file.\n");
+        "There is no forward pass and nothing to serve in this build: --gpu-chat runs a prompt and its decode\n"
+        "steps, and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
+        "(--model, --max-context, --tokens, --max-new, --serve) plus --mtp for the NextN file.\n");
 }
 
 /// `--ref`: the CPU reference over the dense blocks, for a token sequence given by hand.
