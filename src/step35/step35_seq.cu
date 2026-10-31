@@ -248,7 +248,7 @@ bool mtp_block(const strata::GgufModel& mtp, int layer, int slot, int pos, int32
     }
 }
 
-bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err) {
+bool head_open(const strata::GgufModel& file, Head& head, std::string& err) {
     try {
         const int e = (int) file.meta().get("step35.embedding_length")->num();
         const strata::TensorInfo* tw = file.find("output.weight");
@@ -261,40 +261,63 @@ bool logits_last(const strata::GgufModel& file, const float* h, std::vector<floa
             err = "output.weight is not [n_embd, n_vocab]";
             return false;
         }
-        const int n_vocab = (int) tw->shape[1];
         const strata::MetaValue* eps_v = file.meta().get("step35.attention.layer_norm_rms_epsilon");
-        const float eps = eps_v ? (float) eps_v->num() : 1e-5f;
-
-        size_t wb = 0, nb = 0;
-        void* d_w = upload(file, "output.weight", wb);
-        void* d_n = upload(file, "output_norm.weight", nb);
-        float* d_h = nullptr;
-        float* d_lg = nullptr;
-        void* d_q8 = nullptr;
-        bool ok = cudaMalloc((void**) &d_h, (size_t) e * sizeof(float)) == cudaSuccess &&
-                  cudaMalloc((void**) &d_lg, (size_t) n_vocab * sizeof(float)) == cudaSuccess &&
-                  cudaMalloc(&d_q8, (size_t) kMaxCols * gemv_q8_bytes(e)) == cudaSuccess;
-        if (ok) ok = cudaMemcpy(d_h, h, (size_t) e * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
-        // rms_norm on ONE row of n_embd: the same kernel the blocks use for their input norm, then the head's matvec
-        if (ok) per_head_rms_norm(d_h, 1, e, (const float*) d_n, eps, nullptr);
-        if (ok) ok = gemv((ggml_type) tw->type, d_w, d_h, d_lg, e, n_vocab, d_q8, nullptr);
-        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
-        if (ok) {
-            logits.assign((size_t) n_vocab, 0.0f);
-            ok = cudaMemcpy(logits.data(), d_lg, (size_t) n_vocab * sizeof(float), cudaMemcpyDeviceToHost) ==
-                 cudaSuccess;
+        head.eps = eps_v ? (float) eps_v->num() : 1e-5f;
+        head.n_embd = e;
+        head.n_vocab = (int) tw->shape[1];
+        head.type = (int) tw->type;
+        size_t bytes = 0;
+        head.w = upload(file, "output.weight", bytes);
+        head.norm = (float*) upload(file, "output_norm.weight", bytes);
+        const bool ok = cudaMalloc((void**) &head.h, (size_t) e * sizeof(float)) == cudaSuccess &&
+                        cudaMalloc((void**) &head.logits, (size_t) head.n_vocab * sizeof(float)) == cudaSuccess &&
+                        cudaMalloc(&head.q8, (size_t) gemv_q8_bytes(e)) == cudaSuccess;
+        if (!ok) {
+            err = "out of device memory for the head";
+            head_close(head);
+            return false;
         }
-        if (!ok) err = "the head's matvec failed";
-        cudaFree(d_w);
-        cudaFree(d_n);
-        cudaFree(d_h);
-        cudaFree(d_lg);
-        cudaFree(d_q8);
-        return ok;
+        return true;
     } catch (const std::exception& ex) {
         err = ex.what();
         return false;
     }
+}
+
+bool head_apply(Head& head, const float* h, std::vector<float>& logits, std::string& err) {
+    if (head.w == nullptr) {
+        err = "the head is not open";
+        return false;
+    }
+    bool ok = cudaMemcpy(head.h, h, (size_t) head.n_embd * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+    // rms_norm on ONE row of n_embd: the same kernel the blocks use for their input norm, then the head's matvec
+    if (ok) per_head_rms_norm(head.h, 1, head.n_embd, head.norm, head.eps, nullptr);
+    if (ok) ok = gemv((ggml_type) head.type, head.w, head.h, head.logits, head.n_embd, head.n_vocab, head.q8, nullptr);
+    if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+    if (ok) {
+        logits.assign((size_t) head.n_vocab, 0.0f);
+        ok = cudaMemcpy(logits.data(), head.logits, (size_t) head.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) ==
+             cudaSuccess;
+    }
+    if (!ok) err = "the head's matvec failed";
+    return ok;
+}
+
+void head_close(Head& head) {
+    cudaFree(head.w);
+    cudaFree(head.norm);
+    cudaFree(head.h);
+    cudaFree(head.logits);
+    cudaFree(head.q8);
+    head = Head{};
+}
+
+bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err) {
+    Head head;
+    if (!head_open(file, head, err)) return false;
+    const bool ok = head_apply(head, h, logits, err);
+    head_close(head);
+    return ok;
 }
 
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,

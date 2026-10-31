@@ -104,6 +104,23 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
 /// not go through here.
 bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err);
 
+/// The trunk's head, OPEN across calls: `output.weight` is 363 MB of Q5_K, and a generation loop would spend half a
+/// second per token uploading it again.  Open once, apply per position, close.
+struct Head {
+    void* w = nullptr;      ///< output.weight, resident
+    float* norm = nullptr;  ///< output_norm.weight, resident
+    float* h = nullptr;     ///< one position's hidden state, device
+    float* logits = nullptr;///< n_vocab floats, device
+    void* q8 = nullptr;     ///< the q8_1 scratch the matvec needs
+    int n_embd = 0;
+    int n_vocab = 0;
+    int type = 0;           ///< output.weight's ggml type
+    float eps = 0;          ///< the model's layer_norm_rms_epsilon
+};
+bool head_open(const strata::GgufModel& file, Head& head, std::string& err);
+bool head_apply(Head& head, const float* h, std::vector<float>& logits, std::string& err);
+void head_close(Head& head);
+
 /// One MTP (NextN) block on the GPU: `ref::mtp_block`'s arithmetic, one position at a time.  `mtp` is the NextN
 /// file, `layer` one of its own blocks (45..47 for this model), `h` the previous step's hidden state on the HOST
 /// (n_embd floats - the trunk's for the first head), `token` the token whose embedding is concatenated with it, and

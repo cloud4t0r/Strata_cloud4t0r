@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -875,7 +876,7 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
 /// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
-             int max_ctx, bool want_logits) {
+             int max_ctx, bool want_logits, int max_new) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -984,6 +985,55 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             rows.insert(rows.end(), dout.begin(), dout.end());
             ++pos;
         }
+        // ---- greedy generation: each step's own top-1 is the next step's token, through the head kept open
+        int generated = 0;
+        double gen_s = 0, worst = 0, best = 1e9;
+        if (max_new > 0) {
+            const auto t_gen0 = std::chrono::steady_clock::now();
+            kernels::Head head;
+            if (!kernels::head_open(file, head, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                kernels::session_destroy(s);
+                return 1;
+            }
+            std::vector<float> h = std::vector<float>(rows.end() - n_embd, rows.end());
+            for (int g = 0; g < max_new; ++g) {
+                std::vector<float> lg;
+                if (!kernels::head_apply(head, h.data(), lg, err)) {
+                    std::printf("strata-step35: %s\n", err.c_str());
+                    kernels::head_close(head);
+                    kernels::session_destroy(s);
+                    return 1;
+                }
+                const int tok = argmax(lg);
+                const int at = pos;
+                const std::vector<int32_t> one(1, tok);
+                std::vector<float> dout;
+                std::vector<double> dsums;
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!kernels::run_prompt_dense(file, one, at, n_blocks, dout, dsums, err, &s)) {
+                    std::printf("strata-step35: %s\n", err.c_str());
+                    kernels::head_close(head);
+                    kernels::session_destroy(s);
+                    return 1;
+                }
+                const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                gen_s += dt;
+                worst = std::max(worst, dt);
+                best = std::min(best, dt);
+                ++generated;
+                std::printf("  generate %d: token %d (logit %.3f) at position %d, %.3f s\n", g, tok,
+                            lg[(size_t) tok], at, dt);
+                h.assign(dout.end() - n_embd, dout.end());
+                rows.insert(rows.end(), dout.begin(), dout.end());
+                ++pos;
+            }
+            kernels::head_close(head);
+            const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen0).count();
+            std::printf("strata-step35: %d token(s) generated in %.2f s (%.3f s/token, best %.3f, worst %.3f)\n",
+                        generated, total, generated ? gen_s / generated : 0.0, best, worst);
+        }
+
         for (size_t p = 0; p * (size_t) n_embd < rows.size(); ++p) {
             const float* h = rows.data() + p * (size_t) n_embd;
             double ss = 0;
@@ -1030,15 +1080,17 @@ void usage() {
         "      the trunk chose next: that comparison is what a draft is worth.\n"
         "\n"
         "  strata-step35 --gpu-chat <first shard> --tokens <id,id,...> [--next <id,id,...>] [--layers N]\n"
-        "      [--max-context N] [--logits]\n"
+        "      [--max-context N] [--logits] [--max-new N]\n"
         "      Prefill the prompt with the quantized K/V cache, then decode each --next token against it.  Prints\n"
         "      the per-block sums and, per position, the rms and first four values --ref prints: the two outputs\n"
         "      are the comparison the cache is held to.  `--logits` adds the file's own output_norm and output\n"
         "      applied to the last position, and the five tokens it would answer with - the figure `--ref`\n"
         "      prints, so the head is held to the reference the same way the blocks are.  --gpu-seq takes it too.\n"
+        "      --max-new N generates N tokens greedily after them, each step's own top-1 being the next step's\n"
+        "      token, and prints the per-token time.\n"
         "\n"
-        "There is no forward pass and nothing to serve in this build: --gpu-chat runs a prompt and its decode\n"
-        "steps, and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
+        "Nothing serves in this build: --gpu-chat runs a prompt, its --next steps and --max-new greedy tokens,\n"
+        "and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
         "(--model, --max-context, --tokens, --max-new, --serve) plus --mtp for the NextN file.\n");
 }
 
@@ -1179,7 +1231,7 @@ int run(int argc, char** argv) {
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
     bool want_chat = false, want_logits = false, want_gpu_mtp = false;
-    int64_t drafts = 3;
+    int64_t drafts = 3, max_new = 0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
         // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
@@ -1220,6 +1272,8 @@ int run(int argc, char** argv) {
             mtp = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0) {
             tokens = argv[++i];
+        } else if (std::strcmp(argv[i], "--max-new") == 0) {
+            max_new = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--drafts") == 0) {
             drafts = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--next") == 0) {
@@ -1244,7 +1298,7 @@ int run(int argc, char** argv) {
     }
     if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
     if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts);
-    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits);
+    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
