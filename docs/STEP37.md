@@ -105,6 +105,10 @@ outputs are the comparison:
 strata-step35 --gpu-chat <first shard> --tokens "0,671,6102,294,8760,344" --next "671" [--layers N] [--max-context N]
 ```
 
+Add `--logits` to either GPU command and it also applies the file's `output_norm` and `output.weight` to the last
+position, printing the five tokens the model would answer with - the same line `--ref` prints, so the head is held
+to the reference the blocks are held to. `strata-step35 --gpu-seq` takes it too.
+
 Omitting `--layers` runs every block, as the help says; it used to run none, and print the embedding as if it
 were the model's answer. `--gpu-seq` reads it the same way now.
 
@@ -125,6 +129,8 @@ same file:
 | prefill of 1600 positions, 45 blocks | **586 s** reading the cache, **653 s** reading the pass's fp32 K/V - same tokens, same blocks, page cache warm in both |
 | one decoded token at 1600 positions of context | **0.93 s** - three decodes cost 2.79 s on top of the same prefill |
 | position 1599 of that prompt, cache against no cache | rms **-0.46%** (8.352877 against 8.391474) |
+| trunk head, 45 blocks, prompt `0,671,6102,294,8760,344` | `--ref` answers `11111(15.883) 260(13.809) 680(13.513) 17678(13.004) 957(12.724)`; the GPU (with or without the cache) answers the same first four, and the fifth is a near-tie: 12.79 for 270 without the cache, 12.73 for 764 with it |
+| the same 6 positions, CPU reference against GPU | 237.8 s against 4.25 s |
 
 The residual difference is the Q8_1 quantization of the activations, which K-quant matvecs carry by design; it
 is not a difference of arithmetic. llama.cpp's own GPU (fp16) and CPU (f32) runs differ by 1.5e-02 to 3.0e-02 on
@@ -132,7 +138,10 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 ## What does not work yet
 
-- **No MTP.** The three NextN blocks are readable (`--inspect --mtp` checks them) but not run.
+- **No MTP.** The three NextN blocks are readable (`--inspect --mtp` checks them) but not run. The trunk's own head
+  does run now: `--logits` on `--gpu-seq` or `--gpu-chat` applies the file's `output_norm` and `output` to the last
+  position and prints the five tokens it would answer with, which is the figure `--ref` prints - and the two agree
+  on the first four at 45 blocks (see the table above). Whatever MTP is built on, it is built on that.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
   what makes it fit in 32 GB, and it is also why it is slow.
