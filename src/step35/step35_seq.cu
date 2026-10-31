@@ -150,9 +150,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     if (!embed_rows(file, tokens, n_embd, out, err)) return false;
 
     float* d_h = nullptr;
-    void* d_q8 = nullptr;
-    if (cudaMalloc(&d_h, out.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&d_q8, (size_t) kMaxCols * gemv_q8_bytes(e)) != cudaSuccess) {
+    if (cudaMalloc(&d_h, out.size() * sizeof(float)) != cudaSuccess) {
         err = "out of device memory";
         return false;
     }
@@ -163,11 +161,20 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         DenseBlock b;
         if (!upload_block(file, layer, b, err, !is_moe)) return false;
         const int hd = b.head_dim, nh = b.n_head, nkv = b.n_head_kv;
+        // The q8_1 scratch, for the WIDEST input this block quantizes - not for n_embd.  `proj` quantizes up to
+        // kMaxCols columns of an n_in-wide input and n_in is not always n_embd: the FFN down projection reads the
+        // 11264-wide activation and `wo` the attention output (8192 on a full block, 12288 on a sliding one).
+        // Sized by n_embd alone, this buffer was overrun by up to 96 KB on every prompt pass - heap corruption that
+        // answered correctly only while the scratch happened to sit in front of memory nobody was using yet, and
+        // that a 76-position pass turned into a GPU memory fault.
+        const int q8_in = std::max(e, std::max((int) b.ff, nh * hd));
+        void* d_q8 = nullptr;
         float *x = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *gt = nullptr, *res = nullptr;
         float *g = nullptr, *u = nullptr, *act = nullptr, *d = nullptr;
         int *dpq = nullptr, *dpk = nullptr;
         const size_t nq = (size_t) n_pos * nh * hd, nk = (size_t) n_pos * nkv * hd;
-        bool ok = cudaMalloc((void**) &x, (size_t) n_pos * e * sizeof(float)) == cudaSuccess &&
+        bool ok = cudaMalloc(&d_q8, (size_t) kMaxCols * gemv_q8_bytes(q8_in)) == cudaSuccess &&
+                  cudaMalloc((void**) &x, (size_t) n_pos * e * sizeof(float)) == cudaSuccess &&
                   cudaMalloc((void**) &q, nq * sizeof(float)) == cudaSuccess &&
                   cudaMalloc((void**) &k, nk * sizeof(float)) == cudaSuccess &&
                   cudaMalloc((void**) &v, nk * sizeof(float)) == cudaSuccess &&
@@ -331,7 +338,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
         if (!ok && err.empty()) err = "a kernel failed";
         for (void* p : {(void*) x, (void*) q, (void*) k, (void*) v, (void*) ao, (void*) gt, (void*) res,
-                        (void*) g, (void*) u, (void*) act, (void*) d, (void*) dpq, (void*) dpk})
+                        (void*) g, (void*) u, (void*) act, (void*) d, (void*) dpq, (void*) dpk, d_q8})
             if (p) cudaFree(p);
         release_block(b);
         if (!ok) return false;
@@ -345,7 +352,6 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     out.resize((size_t) n_pos * e);
     cudaMemcpy(out.data(), d_h, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(d_h);
-    cudaFree(d_q8);
     return true;
 }
 
