@@ -667,6 +667,14 @@ int gpu_all(const std::string& path, int32_t token, int pos) {
     }
 }
 
+/// The highest-logit token: what a draft head proposes, and what the next head is fed.
+int argmax(const std::vector<float>& lg) {
+    int best = 0;
+    for (int i = 1; i < (int) lg.size(); ++i)
+        if (lg[(size_t) i] > lg[(size_t) best]) best = i;
+    return best;
+}
+
 /// The five tokens of highest logit, in exactly the shape `--ref` prints them: the figure the CPU reference and the
 /// GPU paths are compared on.  A head that is merely mis-scaled still answers with plausible logits, so the ranking
 /// and the values have to come out together.
@@ -733,6 +741,129 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
             }
             print_top5(lg, "after " + std::to_string(n_blocks) + " block(s) on the GPU");
         }
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
+/// `--gpu-mtp`: the trunk over a prompt, greedy steps of its own to have something to check the draft against, then
+/// the NextN blocks as a chain of draft heads.  A draft is worth something only if it proposes what the trunk would
+/// have said, so each head is fed the token the trunk itself chose at that position and its top-1 is compared with
+/// the token the trunk chose next.
+int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
+            int drafts) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
+        std::vector<int32_t> prompt;
+        for (size_t i = 0; i < tokens_csv.size();) {
+            size_t j = tokens_csv.find(',', i);
+            if (j == std::string::npos) j = tokens_csv.size();
+            prompt.push_back((int32_t) std::strtol(tokens_csv.substr(i, j - i).c_str(), nullptr, 10));
+            i = j + 1;
+        }
+        if (prompt.empty()) {
+            std::printf("strata-step35: --gpu-mtp needs --tokens <id,id,...>\n");
+            return 2;
+        }
+        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
+        const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
+        const int n_mtp = (int) mtp.meta().get("step35.nextn_predict_layers")->num();
+        const int first = (int) mtp.meta().get("step35.block_count")->num() - n_mtp;
+        if (n_mtp <= 0) {
+            std::printf("strata-step35: %s declares no NextN block\n", mtp_path.c_str());
+            return 1;
+        }
+        const int want = std::min(drafts, n_mtp);
+        const int n_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
+        const int head_dim = (int) file.meta().get("step35.attention.key_length")->num();
+        const strata::MetaValue* swa = file.meta().get("step35.attention.sliding_window_pattern");
+        const strata::MetaValue* wv = file.meta().get("step35.attention.sliding_window");
+        const int window = wv ? (int) wv->num() : 512;
+        std::vector<int> windows((size_t) n_blocks, 0);
+        for (int l = 0; l < n_blocks; ++l)
+            if (swa && swa->type == strata::MetaType::ARRAY && (size_t) l < swa->items.size() &&
+                swa->items[(size_t) l].num() != 0)
+                windows[(size_t) l] = window;
+
+        // the trunk, over the prompt, with its cache: the same pass `--gpu-chat` makes
+        std::string err;
+        kernels::Session trunk;
+        const int capacity = (int) prompt.size() + want + 2;
+        if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, capacity, err, windows)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<float> out;
+        std::vector<double> sums;
+        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            kernels::session_destroy(trunk);
+            return 1;
+        }
+        // the trunk's own continuation, one greedy token at a time: the figure every draft is held to
+        std::vector<std::vector<float>> hidden;                       // hidden[k]: the trunk at prompt_len-1+k
+        std::vector<int> tok;                                         // tok[k]: the token it chose there
+        hidden.push_back(std::vector<float>(out.end() - n_embd, out.end()));
+        for (int k = 0; k <= want; ++k) {
+            std::vector<float> lg;
+            if (!kernels::logits_last(file, hidden[(size_t) k].data(), lg, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                kernels::session_destroy(trunk);
+                return 1;
+            }
+            tok.push_back(argmax(lg));
+            if (k == want) break;
+            const std::vector<int32_t> one(1, tok[(size_t) k]);
+            std::vector<float> dout;
+            std::vector<double> dsums;
+            if (!kernels::run_prompt_dense(file, one, (int) prompt.size() + k, n_blocks, dout, dsums, err, &trunk)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                kernels::session_destroy(trunk);
+                return 1;
+            }
+            hidden.push_back(std::vector<float>(dout.end() - n_embd, dout.end()));
+        }
+        std::printf("strata-step35: %zu token(s) through %d block(s); the trunk continues", prompt.size(), n_blocks);
+        for (int k = 0; k <= want; ++k) std::printf(" %d", tok[(size_t) k]);
+        std::printf("\n");
+
+        // the draft cache: one cell per NextN layer (mtp_block says why)
+        std::vector<int> kwindows((size_t) n_mtp, 0);
+        kernels::Session draft;
+        if (!kernels::session_create(draft, n_mtp, n_kv, head_dim, want, err, kwindows)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            kernels::session_destroy(trunk);
+            return 1;
+        }
+        int agree = 0;
+        std::vector<float> hh = hidden[0];
+        for (int k = 0; k < want; ++k) {
+            std::vector<float> hn, lg;
+            if (!kernels::mtp_block(mtp, first + k, k, (int) prompt.size() + k, tok[(size_t) k], hh.data(), &draft,
+                                    hn, lg, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                kernels::session_destroy(draft);
+                kernels::session_destroy(trunk);
+                return 1;
+            }
+            const int d = argmax(lg);
+            const int t = tok[(size_t) (k + 1)];
+            if (d == t) ++agree;
+            double ss = 0;
+            for (float v : hn) ss += (double) v * (double) v;
+            std::printf("  draft %d: block %d at position %d, fed token %d, h_nextn rms %.6f -> %d %s (trunk: %d)\n",
+                        k, first + k, (int) prompt.size() + k, tok[(size_t) k], std::sqrt(ss / (double) n_embd), d,
+                        d == t ? "AGREES" : "differs", t);
+            print_top5(lg, "draft " + std::to_string(k));
+            hh = hn;
+        }
+        kernels::session_destroy(draft);
+        kernels::session_destroy(trunk);
+        std::printf("strata-step35: the draft agreed with the trunk on %d of %d token(s)\n", agree, want);
         return 0;
     } catch (const std::exception& ex) {
         std::printf("strata-step35: %s\n", ex.what());
@@ -888,9 +1019,15 @@ void usage() {
         "  strata-step35 --gpu-block <first shard> --layer N --token <id> [--pos N]\n"
         "      One dense block on the GPU with the file's own weights, for one token.  Prints the output sum.\n"
         "\n"
-        "  strata-step35 --ref <first shard> --tokens <id,id,...> [--layers N]\n"
+        "  strata-step35 --ref <first shard> --tokens <id,id,...> [--layers N] [--mtp <nextn file>]\n"
         "      Run the CPU reference over the blocks (default: all of them, 3 dense then 42 MoE) and print\n"
-        "      what each one produced.  The reference a kernel is compared against; no GPU.\n"
+        "      what each one produced.  The reference a kernel is compared against; no GPU.  With --mtp it\n"
+        "      also runs the NextN draft heads, exactly as --gpu-mtp does, so the two can be compared.\n"
+        "\n"
+        "  strata-step35 --gpu-mtp <first shard> --mtp <nextn file> --tokens <id,id,...> [--layers N] [--drafts N]\n"
+        "      The trunk over the prompt, then its own greedy continuation, then the NextN blocks as a chain of\n"
+        "      draft heads.  Each head is fed the token the trunk chose and its top-1 is compared with the token\n"
+        "      the trunk chose next: that comparison is what a draft is worth.\n"
         "\n"
         "  strata-step35 --gpu-chat <first shard> --tokens <id,id,...> [--next <id,id,...>] [--layers N]\n"
         "      [--max-context N] [--logits]\n"
@@ -906,7 +1043,8 @@ void usage() {
 }
 
 /// `--ref`: the CPU reference over the dense blocks, for a token sequence given by hand.
-int reference(const std::string& path, const std::string& tokens_csv, int64_t layers, const std::string& dump) {
+int reference(const std::string& path, const std::string& tokens_csv, int64_t layers, const std::string& dump,
+              const std::string& mtp_path) {
     ref::Model m;
     std::string err;
     if (!ref::load(path, m, err)) {
@@ -969,6 +1107,68 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
     }
     // the five tokens the file itself would answer with, which is what the oracle can be compared on
     print_top5(lg, "after " + std::to_string((long long) layers) + " block(s)");
+    if (!mtp_path.empty()) {
+        ref::Model mm;
+        if (!ref::load(mtp_path, mm, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        const int64_t n_mtp = mm.n_layers - m.n_layers;
+        if (n_mtp <= 0) {
+            std::printf("strata-step35: %s declares no NextN block\n", mtp_path.c_str());
+            return 1;
+        }
+        // The trunk's own continuation, one greedy token at a time - the same figure --gpu-mtp compares against,
+        // and the same absolute positions, so the two runs are the same computation and not two opinions.
+        std::vector<int32_t> seq = ids;
+        std::vector<std::vector<float>> hidden;
+        std::vector<int> tok;
+        hidden.push_back(last);
+        for (int64_t k = 0; k <= n_mtp; ++k) {
+            std::vector<float> lg2;
+            if (!ref::logits(m, hidden[(size_t) k], lg2, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            tok.push_back(argmax(lg2));
+            if (k == n_mtp) break;
+            seq.push_back(tok[(size_t) k]);
+            std::vector<float> out2;
+            if (!ref::forward(m, seq, layers, out2, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            hidden.emplace_back(out2.end() - m.n_embd, out2.end());
+        }
+        std::printf("strata-step35: the trunk continues");
+        for (int k = 0; k <= (int) n_mtp; ++k) std::printf(" %d", tok[(size_t) k]);
+        std::printf("\n");
+        const size_t base = ids.size();
+        std::vector<std::vector<ref::PositionKv>> kv((size_t) n_mtp,
+                                                    std::vector<ref::PositionKv>(base + (size_t) n_mtp));
+        std::vector<float> hh = hidden[0], hn, lg2;
+        int agree = 0;
+        for (int64_t k = 0; k < n_mtp; ++k) {
+            if (!ref::mtp_block(mm, m.n_layers + k, (int64_t) base + k, tok[(size_t) k], hh, kv[(size_t) k], hn, lg2,
+                                err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            const int d = argmax(lg2);
+            const int t = tok[(size_t) (k + 1)];
+            if (d == t) ++agree;
+            double ss = 0;
+            for (float v : hn) ss += (double) v * (double) v;
+            std::printf("  draft %lld: block %lld at position %lld, fed token %d, h_nextn rms %.6f -> %d %s (trunk: "
+                        "%d)\n",
+                        (long long) k, (long long) (m.n_layers + k), (long long) (base + (size_t) k), tok[(size_t) k],
+                        std::sqrt(ss / (double) m.n_embd), d, d == t ? "AGREES" : "differs", t);
+            print_top5(lg2, "draft " + std::to_string((long long) k));
+            hh = hn;
+        }
+        std::printf("strata-step35: the draft agreed with the trunk on %d of %lld token(s)\n", agree,
+                    (long long) n_mtp);
+    }
     return 0;
 }
 
@@ -978,7 +1178,8 @@ int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump, next;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
-    bool want_chat = false, want_logits = false;
+    bool want_chat = false, want_logits = false, want_gpu_mtp = false;
+    int64_t drafts = 3;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
         // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
@@ -991,6 +1192,9 @@ int run(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--gpu-mtp") == 0) {
+            trunk = argv[++i];
+            want_gpu_mtp = true;
         } else if (std::strcmp(argv[i], "--gpu-chat") == 0) {
             trunk = argv[++i];
             want_chat = true;
@@ -1016,6 +1220,8 @@ int run(int argc, char** argv) {
             mtp = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0) {
             tokens = argv[++i];
+        } else if (std::strcmp(argv[i], "--drafts") == 0) {
+            drafts = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--next") == 0) {
             next = argv[++i];
         } else if (std::strcmp(argv[i], "--dump") == 0) {
@@ -1036,7 +1242,8 @@ int run(int argc, char** argv) {
         usage();
         return 2;
     }
-    if (want_ref) return reference(trunk, tokens, layers, dump);
+    if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
+    if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts);
     if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {

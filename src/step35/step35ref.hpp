@@ -50,4 +50,23 @@ bool forward(const Model& m, const std::vector<int32_t>& tokens, int64_t layers,
 /// The last position's logits over the vocabulary, through the file's own output tensor.
 bool logits(const Model& m, const std::vector<float>& hidden_last, std::vector<float>& out, std::string& err);
 
+/// One position's K and V for one block: `kv_heads * head_dim` floats each.  `forward` keeps one of these per
+/// position and block; an MTP chain keeps one per draft position, which is what makes the head attend over its own
+/// drafts and nothing else.
+struct PositionKv {
+    std::vector<float> k, v;
+};
+
+/// One MTP (NextN) block, the draft head's own decoder layer.  `m` is the MTP file's model - it declares the trunk's
+/// 45 blocks plus its own, so `layer` is 45, 46 or 47 - and `h_in` is the hidden state the previous step produced
+/// (the trunk's, for the first head).  The block concatenates `rms_norm(token_embd[token], enorm)` with
+/// `rms_norm(h_in, hnorm)`, projects it back to n_embd through `nextn.eh_proj`, runs its own attention and dense
+/// feed-forward at draft position `pos` (its K/V go into `kv[pos]`, earlier drafts are read from `kv`), and answers
+/// through `nextn.shared_head_norm` / `nextn.shared_head_head` - the layout llama.cpp's `graph_mtp` builds.
+///
+/// `h_nextn` is what the next head consumes, `logits` the vocabulary of this one.
+bool mtp_block(const Model& m, int64_t layer, int64_t pos, int64_t token, const std::vector<float>& h_in,
+               std::vector<PositionKv>& kv, std::vector<float>& h_nextn, std::vector<float>& logits,
+               std::string& err);
+
 }  // namespace strata::step35::ref

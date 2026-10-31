@@ -7,6 +7,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -153,9 +154,7 @@ void rope(float* v, int64_t head_dim, int64_t n_rot, int64_t pos, double base, c
     (void) head_dim;
 }
 
-struct Layer {
-    std::vector<float> k, v;   // [n_pos][kv_heads*head_dim]
-};
+using Layer = PositionKv;   // the trunk's per-position K/V and a draft chain's are the same thing
 
 }  // namespace
 
@@ -200,6 +199,225 @@ bool load(const std::string& path, Model& m, std::string& err) {
     }
 }
 
+/// One position through block `L`: the block's own attention (its head count, its rope, its window), its gate and
+/// its feed-forward - the mixture of experts when `moe`, the dense MLP otherwise.  `h` is the residual stream and is
+/// updated in place; `kv[p]` receives this position's K/V and the earlier positions are read from `kv`.  One
+/// function rather than two, so the trunk and an MTP block cannot run the same arithmetic two ways.
+void layer_step(const Model& m, const GgufModel& f, int64_t L, std::vector<Layer>& kv, int64_t p, bool moe,
+                int64_t window, std::vector<float>& h) {
+    const std::string b = "blk." + std::to_string(L) + ".";
+    const int64_t e = m.n_embd, nh = m.heads(L), nkv = m.kv_heads(L), hd = m.head_dim;
+    const int64_t rot = m.rot(L);
+    const double base = m.rope_base(L);
+    const auto attn_norm_w = vector_of(f, b + "attn_norm.weight");
+    const auto q_norm_w = vector_of(f, b + "attn_q_norm.weight");
+    const auto k_norm_w = vector_of(f, b + "attn_k_norm.weight");
+    const auto ffn_norm_w = vector_of(f, b + "ffn_norm.weight");
+    std::vector<float> hn = h;
+    rms_norm(hn, attn_norm_w, m.eps);
+    auto q = gemv(f, b + "attn_q.weight", hn);
+    auto k = gemv(f, b + "attn_k.weight", hn);
+    auto v = gemv(f, b + "attn_v.weight", hn);
+    auto per_head_norm = [&](std::vector<float>& v, int64_t heads_n, const std::vector<float>& w) {
+        for (int64_t hh = 0; hh < heads_n; ++hh) {
+            float* r = v.data() + hh * hd;
+            double ss = 0;
+            for (int64_t d = 0; d < hd; ++d) ss += (double) r[d] * (double) r[d];
+            const double sc = 1.0 / std::sqrt(ss / (double) hd + m.eps);
+            for (int64_t d = 0; d < hd; ++d) r[d] = (float) ((double) r[d] * sc * (double) w[(size_t) d]);
+        }
+    };
+    per_head_norm(q, nh, q_norm_w);
+    per_head_norm(k, nkv, k_norm_w);
+    // llama.cpp: the frequency factors go to the FULL-attention blocks and nowhere else
+    const std::vector<float>* ff = m.sliding(L) ? nullptr : &m.rope_freqs;
+    if (ff && ff->empty()) ff = nullptr;
+    for (int64_t hh = 0; hh < nh; ++hh) rope(q.data() + hh * hd, hd, rot, p, base, ff);
+    for (int64_t hh = 0; hh < nkv; ++hh) rope(k.data() + hh * hd, hd, rot, p, base, ff);
+    kv[(size_t) p].k = k;
+    kv[(size_t) p].v = v;
+    // attention: causal, and on a sliding block only the last `window` positions
+    for (int64_t hh = 0; hh < nh; ++hh) {
+        const int64_t g = hh / (nh / nkv ? (nh / nkv) : 1);
+        int64_t first = 0;
+        if (window > 0 && p - first + 1 > window) first = p - window + 1;
+        float* qh = q.data() + hh * hd;          // read as the query, then written with the result
+        std::vector<double> score((size_t) (p - first + 1));
+        double best = -1e30;
+        for (int64_t j = first; j <= p; ++j) {
+            const float* kj = kv[(size_t) j].k.data() + g * hd;
+            double acc = 0;
+            for (int64_t d = 0; d < hd; ++d) acc += (double) qh[d] * (double) kj[d];
+            acc /= std::sqrt((double) hd);
+            score[(size_t) (j - first)] = acc;
+            if (acc > best) best = acc;
+        }
+        double sum = 0;
+        for (double& s : score) {
+            s = std::exp(s - best);
+            sum += s;
+        }
+        std::vector<double> acc((size_t) hd, 0.0);
+        for (int64_t j = first; j <= p; ++j) {
+            const double w = score[(size_t) (j - first)] / sum;
+            const float* vj = kv[(size_t) j].v.data() + g * hd;
+            for (int64_t d = 0; d < hd; ++d) acc[(size_t) d] += w * (double) vj[d];
+        }
+        for (int64_t d = 0; d < hd; ++d) qh[d] = (float) acc[(size_t) d];
+    }
+    // the head-wise gate: attn *= sigmoid(g_proj(x)), one weight per head
+    auto gate = gemv(f, b + "attn_gate.weight", hn);
+    for (int64_t hh = 0; hh < nh; ++hh) {
+        const double sig = 1.0 / (1.0 + std::exp(-(double) gate[(size_t) hh]));
+        for (int64_t d = 0; d < hd; ++d) q[(size_t) (hh * hd + d)] = (float) ((double) q[(size_t) (hh * hd + d)] * sig);
+    }
+    auto attn = gemv(f, b + "attn_output.weight", q);
+    for (int64_t i = 0; i < e; ++i) h[(size_t) i] += attn[(size_t) i];
+    // the feed-forward: a dense MLP on the leading blocks, a mixture of experts on the rest
+    std::vector<float> fn = h;
+    rms_norm(fn, ffn_norm_w, m.eps);
+    const double clamp = m.clamp_exp.size() > (size_t) L ? m.clamp_exp[(size_t) L] : 0.0;
+    if (!moe) {
+        auto g_ = gemv(f, b + "ffn_gate.weight", fn);
+        auto u_ = gemv(f, b + "ffn_up.weight", fn);
+        std::vector<float> act((size_t) m.ff_dense);
+        for (int64_t i = 0; i < m.ff_dense; ++i) {
+            double gv = silu(g_[(size_t) i]), uv = u_[(size_t) i];
+            if (clamp > 1e-6) {           // llama.cpp's order: up clamped both ways, silu clamped above
+                if (uv > clamp) uv = clamp;
+                if (uv < -clamp) uv = -clamp;
+                if (gv > clamp) gv = clamp;
+            }
+            act[(size_t) i] = (float) (gv * uv);
+        }
+        auto down = gemv(f, b + "ffn_down.weight", act);
+        for (int64_t i = 0; i < e; ++i) h[(size_t) i] += down[(size_t) i];
+    } else {
+        // ---- the router: sigmoid probs, a selection bias that does NOT enter the weights, top-k,
+        // normalize the chosen probs, then scale (llama.cpp's build_moe_ffn, SIGMOID branch)
+        const auto logits = gemv(f, b + "ffn_gate_inp.weight", fn);
+        std::vector<float> bias;
+        if (f.find(b + "exp_probs_b.bias")) bias = vector_of(f, b + "exp_probs_b.bias");
+        std::vector<double> probs((size_t) m.n_expert);
+        for (int64_t i = 0; i < m.n_expert; ++i) {
+            probs[(size_t) i] = 1.0 / (1.0 + std::exp(-(double) logits[(size_t) i]));
+        }
+        // top-k, largest selection score first, TIES TO THE LOWEST INDEX - the same rule the device
+        // kernel follows, so the two can be compared exactly and two runs never differ
+        std::vector<int64_t> order;
+        std::vector<char> taken((size_t) m.n_expert, 0);
+        for (int64_t k = 0; k < m.top_k; ++k) {
+            int64_t best_i = -1;
+            double best = -1e300;
+            for (int64_t e = 0; e < m.n_expert; ++e) {
+                if (taken[(size_t) e]) continue;
+                const double sel = probs[(size_t) e] + (bias.empty() ? 0.0 : (double) bias[(size_t) e]);
+                if (sel > best || (sel == best && (best_i < 0 || e < best_i))) {
+                    best = sel;
+                    best_i = e;
+                }
+            }
+            if (best_i < 0) break;
+            taken[(size_t) best_i] = 1;
+            order.push_back(best_i);
+        }
+        std::vector<double> w((size_t) m.top_k);
+        double sum = 0;
+        for (int64_t k = 0; k < m.top_k; ++k) {
+            w[(size_t) k] = probs[(size_t) order[(size_t) k]];
+            sum += w[(size_t) k];
+        }
+        if (m.expert_norm) {
+            const double den = sum < 6.103515625e-5 ? 6.103515625e-5 : sum;   // llama.cpp's clamp
+            for (double& x2 : w) x2 /= den;
+        }
+        if (m.expert_scale != 0.0 && m.expert_scale != 1.0) {
+            for (double& x2 : w) x2 *= m.expert_scale;
+        }
+        const double clamp_sh = m.clamp_shexp.size() > (size_t) L ? m.clamp_shexp[(size_t) L] : 0.0;
+        std::vector<double> acc((size_t) e, 0.0);
+        std::vector<float> act((size_t) m.ff_expert);
+        for (int64_t k = 0; k < m.top_k; ++k) {
+            const int64_t ex = order[(size_t) k];
+            const auto ge = gemv_expert(f, b + "ffn_gate_exps.weight", fn, ex);
+            const auto ue = gemv_expert(f, b + "ffn_up_exps.weight", fn, ex);
+            for (int64_t i = 0; i < m.ff_expert; ++i) {
+                double gv = silu(ge[(size_t) i]), uv = ue[(size_t) i];
+                if (clamp > 1e-6) {
+                    if (uv > clamp) uv = clamp;
+                    if (uv < -clamp) uv = -clamp;
+                    if (gv > clamp) gv = clamp;
+                }
+                act[(size_t) i] = (float) (gv * uv);
+            }
+            const auto de = gemv_expert(f, b + "ffn_down_exps.weight", act, ex);
+            for (int64_t i = 0; i < e; ++i) acc[(size_t) i] += w[(size_t) k] * (double) de[(size_t) i];
+        }
+        // the shared expert: added, never weighted
+        const auto sg = gemv(f, b + "ffn_gate_shexp.weight", fn);
+        const auto su = gemv(f, b + "ffn_up_shexp.weight", fn);
+        std::vector<float> act_sh((size_t) m.ff_shexp);
+        for (int64_t i = 0; i < m.ff_shexp; ++i) {
+            double gv = silu(sg[(size_t) i]), uv = su[(size_t) i];
+            if (clamp_sh > 1e-6) {
+                if (uv > clamp_sh) uv = clamp_sh;
+                if (uv < -clamp_sh) uv = -clamp_sh;
+                if (gv > clamp_sh) gv = clamp_sh;
+            }
+            act_sh[(size_t) i] = (float) (gv * uv);
+        }
+        const auto sh = gemv(f, b + "ffn_down_shexp.weight", act_sh);
+        for (int64_t i = 0; i < e; ++i) acc[(size_t) i] += (double) sh[(size_t) i];
+        for (int64_t i = 0; i < e; ++i) h[(size_t) i] += (float) acc[(size_t) i];
+    }
+}
+
+bool mtp_block(const Model& m, int64_t layer, int64_t pos, int64_t token, const std::vector<float>& h_in,
+               std::vector<PositionKv>& kv, std::vector<float>& h_nextn, std::vector<float>& logits,
+               std::string& err) {
+    try {
+        const GgufModel& f = *m.file;
+        const int64_t e = m.n_embd;
+        if ((int64_t) h_in.size() != e)
+            throw std::runtime_error("mtp: the hidden state has " + std::to_string(h_in.size()) + " values, the model " +
+                                     std::to_string(e));
+        if (pos < 0 || (size_t) pos >= kv.size())
+            throw std::runtime_error("mtp: draft position " + std::to_string(pos) + " is outside the cache");
+        if (token < 0 || token >= m.n_vocab)
+            throw std::runtime_error("mtp: token " + std::to_string(token) + " is outside the vocabulary");
+        const std::string b = "blk." + std::to_string(layer) + ".";
+
+        // the two inputs: the token the draft continues, and the hidden state so far
+        std::vector<float> emb((size_t) e);
+        {
+            size_t shard = 0;
+            const TensorInfo& t = tensor(f, "token_embd.weight", shard);
+            row_f32(f, t, shard, token, e, emb.data());
+        }
+        std::vector<float> en = emb, hn = h_in;
+        rms_norm(en, vector_of(f, b + "nextn.enorm.weight"), m.eps);
+        rms_norm(hn, vector_of(f, b + "nextn.hnorm.weight"), m.eps);
+        std::vector<float> cat;
+        cat.reserve((size_t) (2 * e));
+        cat.insert(cat.end(), en.begin(), en.end());   // ggml_concat(e_norm, h_norm, dim 0): the embedding first
+        cat.insert(cat.end(), hn.begin(), hn.end());
+        std::vector<float> h = gemv(f, b + "nextn.eh_proj.weight", cat);
+        // ONE CELL, AND ONLY ITS OWN.  A NextN layer runs once per chain: it never had the prefix's K/V (the trunk
+        // never computed any for it), and no earlier draft of this chain went through it either, so its cache holds
+        // the cell this step writes and nothing else.  Reading a cell nobody wrote is what a window of 512 does
+        // here - on the first run it answered NaN.  The draft's information comes from h_nextn and the token.
+        layer_step(m, f, layer, kv, pos, false, 1, h);   // an MTP block's feed-forward is dense, never the mixture
+        h_nextn = h;
+        std::vector<float> hd = h;
+        rms_norm(hd, vector_of(f, b + "nextn.shared_head_norm.weight"), m.eps);
+        logits = gemv(f, b + "nextn.shared_head_head.weight", hd);
+        return true;
+    } catch (const std::exception& ex) {
+        err = ex.what();
+        return false;
+    }
+}
+
 bool forward(const Model& m, const std::vector<int32_t>& tokens, int64_t layers, std::vector<float>& out,
              std::string& err, std::vector<double>* trace) {
     try {
@@ -235,163 +453,7 @@ bool forward(const Model& m, const std::vector<int32_t>& tokens, int64_t layers,
             const double base = m.rope_base(L);
             for (int64_t p = 0; p < n_pos; ++p) {
                 std::vector<float> h(x.begin() + p * e, x.begin() + (p + 1) * e);
-                std::vector<float> hn = h;
-                rms_norm(hn, attn_norm_w, m.eps);
-                auto q = gemv(f, b + "attn_q.weight", hn);
-                auto k = gemv(f, b + "attn_k.weight", hn);
-                auto v = gemv(f, b + "attn_v.weight", hn);
-                auto per_head_norm = [&](std::vector<float>& v, int64_t heads_n, const std::vector<float>& w) {
-                    for (int64_t hh = 0; hh < heads_n; ++hh) {
-                        float* r = v.data() + hh * hd;
-                        double ss = 0;
-                        for (int64_t d = 0; d < hd; ++d) ss += (double) r[d] * (double) r[d];
-                        const double sc = 1.0 / std::sqrt(ss / (double) hd + m.eps);
-                        for (int64_t d = 0; d < hd; ++d) r[d] = (float) ((double) r[d] * sc * (double) w[(size_t) d]);
-                    }
-                };
-                per_head_norm(q, nh, q_norm_w);
-                per_head_norm(k, nkv, k_norm_w);
-                // llama.cpp: the frequency factors go to the FULL-attention blocks and nowhere else
-                const std::vector<float>* ff = m.sliding(L) ? nullptr : &m.rope_freqs;
-                if (ff && ff->empty()) ff = nullptr;
-                for (int64_t hh = 0; hh < nh; ++hh) rope(q.data() + hh * hd, hd, rot, p, base, ff);
-                for (int64_t hh = 0; hh < nkv; ++hh) rope(k.data() + hh * hd, hd, rot, p, base, ff);
-                kv[(size_t) L][(size_t) p].k = k;
-                kv[(size_t) L][(size_t) p].v = v;
-                // attention: causal, and on a sliding block only the last `window` positions
-                for (int64_t hh = 0; hh < nh; ++hh) {
-                    const int64_t g = hh / (nh / nkv ? (nh / nkv) : 1);
-                    int64_t first = 0;
-                    if (m.sliding(L) && p - first + 1 > m.window) first = p - m.window + 1;
-                    float* qh = q.data() + hh * hd;          // read as the query, then written with the result
-                    std::vector<double> score((size_t) (p - first + 1));
-                    double best = -1e30;
-                    for (int64_t j = first; j <= p; ++j) {
-                        const float* kj = kv[(size_t) L][(size_t) j].k.data() + g * hd;
-                        double acc = 0;
-                        for (int64_t d = 0; d < hd; ++d) acc += (double) qh[d] * (double) kj[d];
-                        acc /= std::sqrt((double) hd);
-                        score[(size_t) (j - first)] = acc;
-                        if (acc > best) best = acc;
-                    }
-                    double sum = 0;
-                    for (double& s : score) {
-                        s = std::exp(s - best);
-                        sum += s;
-                    }
-                    std::vector<double> acc((size_t) hd, 0.0);
-                    for (int64_t j = first; j <= p; ++j) {
-                        const double w = score[(size_t) (j - first)] / sum;
-                        const float* vj = kv[(size_t) L][(size_t) j].v.data() + g * hd;
-                        for (int64_t d = 0; d < hd; ++d) acc[(size_t) d] += w * (double) vj[d];
-                    }
-                    for (int64_t d = 0; d < hd; ++d) qh[d] = (float) acc[(size_t) d];
-                }
-                // the head-wise gate: attn *= sigmoid(g_proj(x)), one weight per head
-                auto gate = gemv(f, b + "attn_gate.weight", hn);
-                for (int64_t hh = 0; hh < nh; ++hh) {
-                    const double sig = 1.0 / (1.0 + std::exp(-(double) gate[(size_t) hh]));
-                    for (int64_t d = 0; d < hd; ++d) q[(size_t) (hh * hd + d)] = (float) ((double) q[(size_t) (hh * hd + d)] * sig);
-                }
-                auto attn = gemv(f, b + "attn_output.weight", q);
-                for (int64_t i = 0; i < e; ++i) h[(size_t) i] += attn[(size_t) i];
-                // the feed-forward: a dense MLP on the leading blocks, a mixture of experts on the rest
-                std::vector<float> fn = h;
-                rms_norm(fn, ffn_norm_w, m.eps);
-                const double clamp = m.clamp_exp.size() > (size_t) L ? m.clamp_exp[(size_t) L] : 0.0;
-                if (!m.moe(L)) {
-                    auto g_ = gemv(f, b + "ffn_gate.weight", fn);
-                    auto u_ = gemv(f, b + "ffn_up.weight", fn);
-                    std::vector<float> act((size_t) m.ff_dense);
-                    for (int64_t i = 0; i < m.ff_dense; ++i) {
-                        double gv = silu(g_[(size_t) i]), uv = u_[(size_t) i];
-                        if (clamp > 1e-6) {           // llama.cpp's order: up clamped both ways, silu clamped above
-                            if (uv > clamp) uv = clamp;
-                            if (uv < -clamp) uv = -clamp;
-                            if (gv > clamp) gv = clamp;
-                        }
-                        act[(size_t) i] = (float) (gv * uv);
-                    }
-                    auto down = gemv(f, b + "ffn_down.weight", act);
-                    for (int64_t i = 0; i < e; ++i) h[(size_t) i] += down[(size_t) i];
-                } else {
-                    // ---- the router: sigmoid probs, a selection bias that does NOT enter the weights, top-k,
-                    // normalize the chosen probs, then scale (llama.cpp's build_moe_ffn, SIGMOID branch)
-                    const auto logits = gemv(f, b + "ffn_gate_inp.weight", fn);
-                    std::vector<float> bias;
-                    if (f.find(b + "exp_probs_b.bias")) bias = vector_of(f, b + "exp_probs_b.bias");
-                    std::vector<double> probs((size_t) m.n_expert);
-                    for (int64_t i = 0; i < m.n_expert; ++i) {
-                        probs[(size_t) i] = 1.0 / (1.0 + std::exp(-(double) logits[(size_t) i]));
-                    }
-                    // top-k, largest selection score first, TIES TO THE LOWEST INDEX - the same rule the device
-                    // kernel follows, so the two can be compared exactly and two runs never differ
-                    std::vector<int64_t> order;
-                    std::vector<char> taken((size_t) m.n_expert, 0);
-                    for (int64_t k = 0; k < m.top_k; ++k) {
-                        int64_t best_i = -1;
-                        double best = -1e300;
-                        for (int64_t e = 0; e < m.n_expert; ++e) {
-                            if (taken[(size_t) e]) continue;
-                            const double sel = probs[(size_t) e] + (bias.empty() ? 0.0 : (double) bias[(size_t) e]);
-                            if (sel > best || (sel == best && (best_i < 0 || e < best_i))) {
-                                best = sel;
-                                best_i = e;
-                            }
-                        }
-                        if (best_i < 0) break;
-                        taken[(size_t) best_i] = 1;
-                        order.push_back(best_i);
-                    }
-                    std::vector<double> w((size_t) m.top_k);
-                    double sum = 0;
-                    for (int64_t k = 0; k < m.top_k; ++k) {
-                        w[(size_t) k] = probs[(size_t) order[(size_t) k]];
-                        sum += w[(size_t) k];
-                    }
-                    if (m.expert_norm) {
-                        const double den = sum < 6.103515625e-5 ? 6.103515625e-5 : sum;   // llama.cpp's clamp
-                        for (double& x2 : w) x2 /= den;
-                    }
-                    if (m.expert_scale != 0.0 && m.expert_scale != 1.0) {
-                        for (double& x2 : w) x2 *= m.expert_scale;
-                    }
-                    const double clamp_sh = m.clamp_shexp.size() > (size_t) L ? m.clamp_shexp[(size_t) L] : 0.0;
-                    std::vector<double> acc((size_t) e, 0.0);
-                    std::vector<float> act((size_t) m.ff_expert);
-                    for (int64_t k = 0; k < m.top_k; ++k) {
-                        const int64_t ex = order[(size_t) k];
-                        const auto ge = gemv_expert(f, b + "ffn_gate_exps.weight", fn, ex);
-                        const auto ue = gemv_expert(f, b + "ffn_up_exps.weight", fn, ex);
-                        for (int64_t i = 0; i < m.ff_expert; ++i) {
-                            double gv = silu(ge[(size_t) i]), uv = ue[(size_t) i];
-                            if (clamp > 1e-6) {
-                                if (uv > clamp) uv = clamp;
-                                if (uv < -clamp) uv = -clamp;
-                                if (gv > clamp) gv = clamp;
-                            }
-                            act[(size_t) i] = (float) (gv * uv);
-                        }
-                        const auto de = gemv_expert(f, b + "ffn_down_exps.weight", act, ex);
-                        for (int64_t i = 0; i < e; ++i) acc[(size_t) i] += w[(size_t) k] * (double) de[(size_t) i];
-                    }
-                    // the shared expert: added, never weighted
-                    const auto sg = gemv(f, b + "ffn_gate_shexp.weight", fn);
-                    const auto su = gemv(f, b + "ffn_up_shexp.weight", fn);
-                    std::vector<float> act_sh((size_t) m.ff_shexp);
-                    for (int64_t i = 0; i < m.ff_shexp; ++i) {
-                        double gv = silu(sg[(size_t) i]), uv = su[(size_t) i];
-                        if (clamp_sh > 1e-6) {
-                            if (uv > clamp_sh) uv = clamp_sh;
-                            if (uv < -clamp_sh) uv = -clamp_sh;
-                            if (gv > clamp_sh) gv = clamp_sh;
-                        }
-                        act_sh[(size_t) i] = (float) (gv * uv);
-                    }
-                    const auto sh = gemv(f, b + "ffn_down_shexp.weight", act_sh);
-                    for (int64_t i = 0; i < e; ++i) acc[(size_t) i] += (double) sh[(size_t) i];
-                    for (int64_t i = 0; i < e; ++i) h[(size_t) i] += (float) acc[(size_t) i];
-                }
+                layer_step(m, f, L, kv[(size_t) L], p, m.moe(L), m.sliding(L) ? m.window : 0, h);
                 std::memcpy(x.data() + p * e, h.data(), (size_t) e * sizeof(float));
             }
             if (trace) {   // what the block handed on, summed over every position: the oracle prints the same sum

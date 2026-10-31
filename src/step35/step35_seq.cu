@@ -128,6 +128,126 @@ std::vector<int> positions_for(int n_pos, int n_heads, int pos0) {
 
 }  // namespace
 
+bool mtp_block(const strata::GgufModel& mtp, int layer, int slot, int pos, int32_t token, const float* h,
+               Session* cache, std::vector<float>& h_nextn, std::vector<float>& logits, std::string& err) {
+    try {
+        const int e = (int) mtp.meta().get("step35.embedding_length")->num();
+        const float eps = (float) mtp.meta().get("step35.attention.layer_norm_rms_epsilon")->num();
+        DenseBlock b;
+        if (!upload_block(mtp, layer, b, err, true)) return false;
+        const int hd = b.head_dim, nh = b.n_head, nkv = b.n_head_kv;
+        const std::string pre = "blk." + std::to_string(layer) + ".";
+        size_t bytes = 0;
+        void* w_en = upload(mtp, pre + "nextn.enorm.weight", bytes);
+        void* w_hn = upload(mtp, pre + "nextn.hnorm.weight", bytes);
+        void* w_eh = upload(mtp, pre + "nextn.eh_proj.weight", bytes);
+        void* w_sn = upload(mtp, pre + "nextn.shared_head_norm.weight", bytes);
+        void* w_sh = upload(mtp, pre + "nextn.shared_head_head.weight", bytes);
+        const int t_eh = (int) mtp.find(pre + "nextn.eh_proj.weight")->type;
+        const int t_sh = (int) mtp.find(pre + "nextn.shared_head_head.weight")->type;
+        const int n_vocab = (int) mtp.find(pre + "nextn.shared_head_head.weight")->shape[1];
+
+        // the token's embedding, out of the NextN file's own table: the draft does not borrow the trunk's
+        std::vector<float> emb;
+        if (!embed_rows(mtp, {token}, e, emb, err)) {
+            release_block(b);
+            return false;
+        }
+
+        const int q8_in = std::max(std::max(e, 2 * e), std::max((int) b.ff, nh * hd));
+        void* d_q8 = nullptr;
+        float *en = nullptr, *hnd = nullptr, *cat = nullptr, *s = nullptr, *x = nullptr, *q = nullptr, *k = nullptr,
+              *v = nullptr, *ao = nullptr, *gt = nullptr, *res = nullptr, *g = nullptr, *u = nullptr, *act = nullptr,
+              *d = nullptr, *tmp = nullptr, *lg = nullptr;
+        int* dpos = nullptr;
+        bool ok = cudaMalloc(&d_q8, (size_t) kMaxCols * gemv_q8_bytes(q8_in)) == cudaSuccess &&
+                  cudaMalloc((void**) &en, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &hnd, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &cat, (size_t) 2 * e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &s, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &x, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &q, (size_t) nh * hd * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &k, (size_t) nkv * hd * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &v, (size_t) nkv * hd * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &ao, (size_t) nh * hd * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &gt, (size_t) nh * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &res, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &g, (size_t) b.ff * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &u, (size_t) b.ff * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &act, (size_t) b.ff * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &d, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &tmp, (size_t) e * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &lg, (size_t) n_vocab * sizeof(float)) == cudaSuccess &&
+                  cudaMalloc((void**) &dpos, (size_t) nh * sizeof(int)) == cudaSuccess;
+        if (!ok) {
+            err = "out of device memory";
+            release_block(b);
+            return false;
+        }
+        // the draft's two inputs, each RMSNorm'd with its own weight, concatenated embedding-first
+        ok = cudaMemcpy(hnd, h, (size_t) e * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(en, emb.data(), (size_t) e * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) per_head_rms_norm(hnd, 1, e, (const float*) w_hn, eps, nullptr);
+        if (ok) per_head_rms_norm(en, 1, e, (const float*) w_en, eps, nullptr);
+        if (ok) ok = cudaMemcpy(cat, en, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                     cudaMemcpy(cat + e, hnd, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) ok = gemv((ggml_type) t_eh, w_eh, cat, s, 2 * e, e, d_q8, nullptr);
+
+        const std::vector<int> posv((size_t) nh, pos);
+        if (ok) ok = cudaMemcpy(dpos, posv.data(), posv.size() * sizeof(int), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(x, s, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) per_head_rms_norm(x, 1, e, b.attn_norm, eps, nullptr);
+        if (ok) ok = proj((ggml_type) b.t_q, b.q, x, q, e, nh * hd, 1, d_q8, err) &&
+                     proj((ggml_type) b.t_k, b.k, x, k, e, nkv * hd, 1, d_q8, err) &&
+                     proj((ggml_type) b.t_v, b.v, x, v, e, nkv * hd, 1, d_q8, err);
+        if (ok) per_head_rms_norm(q, nh, hd, b.q_norm, eps, nullptr);
+        if (ok) per_head_rms_norm(k, nkv, hd, b.k_norm, eps, nullptr);
+        if (ok) rope_neox(q, nh, hd, b.n_rot, dpos, b.base, b.rope_ff, b.n_ff_rope, nullptr);
+        if (ok) rope_neox(k, nkv, hd, b.n_rot, dpos, b.base, b.rope_ff, b.n_ff_rope, nullptr);
+        if (ok) ok = session_append(*cache, slot, pos, 1, k, v, err);
+        // ONE CELL, AND ONLY ITS OWN - see ref::mtp_block: a NextN layer runs once per chain, so the cell it writes is
+        // the whole of its history.  A window of 512 there reads cells nothing ever wrote.
+        if (ok) ok = session_attend(*cache, slot, q, ao, pos, 1, nh, 1, err);
+        if (ok) ok = proj((ggml_type) b.t_gate, b.gate, x, gt, e, nh, 1, d_q8, err);
+        if (ok) k_gate_rows<<<nh, 128>>>(ao, gt, hd);
+        if (ok) ok = proj((ggml_type) b.t_wo, b.wo, ao, res, nh * hd, e, 1, d_q8, err);
+        if (ok) k_add_n<<<(e + 255) / 256, 256>>>(s, res, e);
+        if (ok) ok = cudaMemcpy(x, s, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) per_head_rms_norm(x, 1, e, b.ffn_norm, eps, nullptr);
+        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_gate, x, g, e, b.ff, 1, d_q8, err) &&
+                     proj((ggml_type) b.t_ffn, b.ffn_up, x, u, e, b.ff, 1, d_q8, err);
+        if (ok) ok = cudaMemcpy(act, g, (size_t) b.ff * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) k_silu_mul_n<<<(b.ff + 255) / 256, 256>>>(act, u, b.ff, 0.0f);
+        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_down, act, d, b.ff, e, 1, d_q8, err);
+        if (ok) k_add_n<<<(e + 255) / 256, 256>>>(s, d, e);
+        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+        if (ok) {
+            h_nextn.assign((size_t) e, 0.0f);
+            ok = cudaMemcpy(h_nextn.data(), s, (size_t) e * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        // the head: shared_head_norm, then shared_head_head, both the NextN file's own
+        if (ok) ok = cudaMemcpy(tmp, s, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+        if (ok) per_head_rms_norm(tmp, 1, e, (const float*) w_sn, eps, nullptr);
+        if (ok) ok = gemv((ggml_type) t_sh, w_sh, tmp, lg, e, n_vocab, d_q8, nullptr);
+        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+        if (ok) {
+            logits.assign((size_t) n_vocab, 0.0f);
+            ok = cudaMemcpy(logits.data(), lg, (size_t) n_vocab * sizeof(float), cudaMemcpyDeviceToHost) ==
+                 cudaSuccess;
+        }
+        if (!ok && err.empty()) err = "an MTP kernel failed";
+        for (void* p2 : {(void*) en, (void*) hnd, (void*) cat, (void*) s, (void*) x, (void*) q, (void*) k,
+                         (void*) v, (void*) ao, (void*) gt, (void*) res, (void*) g, (void*) u, (void*) act,
+                         (void*) d, (void*) tmp, (void*) lg, (void*) dpos, d_q8, w_en, w_hn, w_eh, w_sn, w_sh})
+            if (p2) cudaFree(p2);
+        release_block(b);
+        return ok;
+    } catch (const std::exception& ex) {
+        err = ex.what();
+        return false;
+    }
+}
+
 bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err) {
     try {
         const int e = (int) file.meta().get("step35.embedding_length")->num();

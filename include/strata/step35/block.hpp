@@ -104,6 +104,16 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
 /// not go through here.
 bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err);
 
+/// One MTP (NextN) block on the GPU: `ref::mtp_block`'s arithmetic, one position at a time.  `mtp` is the NextN
+/// file, `layer` one of its own blocks (45..47 for this model), `h` the previous step's hidden state on the HOST
+/// (n_embd floats - the trunk's for the first head), `token` the token whose embedding is concatenated with it, and
+/// `cache` the draft session.  This position's cells go into the cache and the attention reads the drafts already in
+/// it, so head after head a chain of drafts sees exactly what it wrote.
+/// `slot` is this head's layer in `cache` (0..n_mtp-1 - the draft session is built over the NextN file's own
+/// blocks only); the weights always come from block `layer` of the file.
+bool mtp_block(const strata::GgufModel& mtp, int layer, int slot, int pos, int32_t token, const float* h,
+               Session* cache, std::vector<float>& h_nextn, std::vector<float>& logits, std::string& err);
+
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
 /// mapping into three reused device buffers for each block.  Slow by design - it is what lets the whole model
