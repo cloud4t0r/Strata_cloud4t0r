@@ -517,6 +517,13 @@ void ring_case() {
                   "the row of position %d, after the ring lapped it, is the host's (rel_l2 %.1e)", n_pos - 1, rel);
     check(rel < 1e-5, label);
 
+    // a row whose window the ring has already handed to a newer position must be refused, not assembled from
+    // other tokens' cells
+    const bool recycled = !sk::session_attend(s, 0, d_q, d_o, 0, 1, n_head, window, err);
+    std::snprintf(label, sizeof label, "a row at position 0, whose cells the ring recycled, is refused: %s",
+                  recycled ? err.c_str() : "it was answered");
+    check(recycled && err.find("handed") != std::string::npos, label);
+
     // a pass that would lap the ring before its own last row is written must not be answered at all
     const bool refused = !sk::session_append(s, 0, 0, n_pos, d_k, d_v, err);
     std::snprintf(label, sizeof label, "a pass of %d positions into a %d-cell ring is refused: %s", n_pos, want,

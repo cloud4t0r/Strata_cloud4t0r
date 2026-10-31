@@ -231,6 +231,19 @@ bool session_attend(Session& s, int layer, const float* q, float* out, int pos0,
     if (!session_layer(s, layer, err)) return false;
     const KvLayer& l = s.layers[(size_t) layer];
 
+    // A ring layer can only answer for rows whose window is still in the pool: position p needs the cells from
+    // `p - window + 1`, and after `n_cached - cells` the ring has handed the oldest of those to a newer position.
+    // A caller walking back up the prefix gets an error here rather than a row assembled from other tokens' cells.
+    if (l.ring > 0 && s.n_cached > l.cells) {
+        const int w = window > 0 ? window : s.windows[(size_t) layer];
+        const int oldest = std::max(0, pos0 - w + 1);
+        if (oldest < s.n_cached - l.cells)
+            return set_err(err, "position " + std::to_string(pos0) + " needs cells from " + std::to_string(oldest) +
+                                    ", but the ring has already handed " + std::to_string(s.n_cached - l.cells) +
+                                    " of layer " + std::to_string(layer) + "'s " + std::to_string(l.cells) +
+                                    " cells to newer positions");
+    }
+
     // One writer for the position the attention reads: the last row's.  A per-row host scalar would freeze at the
     // first row in a captured graph, which is exactly the failure qsa.hpp's step buffer exists to prevent.
     const int32_t last = pos0 + n_tok - 1;
