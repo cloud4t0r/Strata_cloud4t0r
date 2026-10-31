@@ -182,6 +182,12 @@ sliding) the cache is, from `session_bytes_at` and checked by `step35_kv_parity`
 The 33 sliding layers drop from 9.1 GB to 0.11 GB at 131072; the 12 full ones keep their 3.32 GB, because a
 full-attention block really does read the whole prefix.
 
+Measured on this machine (2 × 16 GB AMD, IQ3_XXS), reading `rocm-smi` while the 45-block chat ran with
+`--max-context 131072`: **3.778 GB of VRAM at the peak, against 12.761 GB before the ring** - the cache plus the
+~0.35 GB of expert buffers and working tensors, both runs. The figures printed per position are identical in the
+two runs (position 6: rms 13.050220, first four -3.551789 5.127801 0.270378 -4.080585), which is what the ring is
+supposed to be: a different place to put the cells, not different cells.
+
 The price is one rule: **a pass writes at most `kKvPassMax` positions (1024)**. A pass writes all of its cells
 before any of its rows is attended, so a pass long enough to lap the ring would let its first row read cells its
 last row had already overwritten. `--gpu-chat` prefills in passes of 1024 positions and `session_append` refuses a
@@ -206,6 +212,21 @@ order as llama.cpp's own GPU-against-CPU spread of 1.5e-02 to 3.0e-02 quoted abo
 
 The comparison that isolates the cache is the one that does not run 45 blocks: over 4 blocks, prefill 6 positions
 then decode 1, the 7 positions land within 0.13% of `--ref --layers 4` on the same 7 tokens.
+
+The ring, on the real weights: 1600 positions through 4 blocks (block 0 full, 1-3 sliding, so the 1536-cell ring is
+lapped by 64 cells) against `--gpu-seq` on the same tokens, which reads the pass's fp32 K/V and keeps nothing:
+
+| | |
+|---|---|
+| position 1599, reading the ring | rms 0.285418, first four -0.127015 0.014492 0.046192 -0.025171 |
+| position 1599, `--gpu-seq` | rms 0.285613, first four -0.127171 0.014042 0.046040 -0.025360 |
+| difference | -0.07% on the rms - the int8 K/V, the same order the table above quotes |
+| prefill of the 1600 | 14.9 s with the cache, 17.0 s without (both warm page cache, 4 blocks) |
+
+That run also found an older defect, now fixed: `run_prompt_dense` sized its `q8_1` scratch for `n_embd` and handed
+it to projections 11264 and 12288 wide, overrunning it by up to 96 KB on every prompt pass. At 6 positions the
+bytes landed in memory the next allocation replaced; at 1600 they faulted the GPU inside `quantize_q8_1_kernel`.
+The scratch is now sized per block for the widest input it quantizes.
 
 ## Tests
 
