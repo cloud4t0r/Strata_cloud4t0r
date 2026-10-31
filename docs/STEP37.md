@@ -122,6 +122,9 @@ same file:
 | a prompt of 6 positions, 3 dense + 1 expert block | 3.3e-04 to 7.5e-04 |
 | speed | **1.39 s per token**, warm page cache (2.13 s cold) |
 | prompt of 6 positions, 45 blocks, then decodes | prefill **3.9 s** for the 6, then **0.96 s per decoded token** |
+| prefill of 1600 positions, 45 blocks | **586 s** reading the cache, **653 s** reading the pass's fp32 K/V - same tokens, same blocks, page cache warm in both |
+| one decoded token at 1600 positions of context | **0.93 s** - three decodes cost 2.79 s on top of the same prefill |
+| position 1599 of that prompt, cache against no cache | rms **-0.46%** (8.352877 against 8.391474) |
 
 The residual difference is the Q8_1 quantization of the activations, which K-quant matvecs carry by design; it
 is not a difference of arithmetic. llama.cpp's own GPU (fp16) and CPU (f32) runs differ by 1.5e-02 to 3.0e-02 on
@@ -193,6 +196,11 @@ before any of its rows is attended, so a pass long enough to lap the ring would 
 last row had already overwritten. `--gpu-chat` prefills in passes of 1024 positions and `session_append` refuses a
 longer one, naming the ring's size, rather than answering something plausible and wrong.
 
+The same rule applies to reading back: a row whose window the ring has already handed to a newer position is
+refused by `session_attend`, with the cell it wanted and the one the ring now holds named in the message. Decoding
+never asks for one - each token attends at the newest position - but a caller walking back up the prefix would
+otherwise get a row assembled from other tokens' cells.
+
 What the cache costs, measured on the same prompt (`0,671,6102,294,8760,344,671`, 45 blocks) by running it twice -
 once reading the cache, once reading the fp32 K/V of the pass:
 
@@ -251,6 +259,6 @@ Six tests, none of which needs the 76 GB download:
   the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; a decode row at
   position 1023, past the 512 the validation vehicle can hold; a **ring** on a sliding layer (window 8, 1152
   cells) lapped twice by 2048 positions, whose page table is read back and whose last row is still the host's; a
-  pass of 2048 positions into that ring **refused** with the ring's size in the message; and the 45-layer sizes at
-  8192, 32768 and 131072 - 0.315 / 0.938 / 3.431 GB with the ring against 0.779 / 3.114 / 12.457 GB keeping every
-  position.
+  row at position 0 whose cells that ring recycled **refused**; a pass of 2048 positions into the same ring
+  **refused** with the ring's size in the message; and the 45-layer sizes at 8192, 32768 and 131072 - 0.315 /
+  0.938 / 3.431 GB with the ring against 0.779 / 3.114 / 12.457 GB keeping every position.
