@@ -51,6 +51,7 @@ const char* type_name(ggml_type t) {
         case GGML_TYPE_Q4_K: return "Q4_K";
         case GGML_TYPE_IQ3_S: return "IQ3_S";
         case GGML_TYPE_Q5_K: return "Q5_K";
+        case GGML_TYPE_Q8_0: return "Q8_0";
         case GGML_TYPE_F32: return "F32";
         default: return "?";
     }
@@ -151,12 +152,13 @@ void gemv_case(ggml_type t, int n_in, int n_out) {
 int main() {
     // the shapes the release uses: hidden 4096, the dense FFN 11264, an expert's 1280, the router's 288
     for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_S, GGML_TYPE_Q5_K,
-                        GGML_TYPE_F32}) {
+                        GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
         gemv_case(t, 256, 64);
     }
     gemv_case(GGML_TYPE_IQ3_XXS, 4096, 64);    // a projection at the real hidden width
     gemv_case(GGML_TYPE_IQ3_XXS, 11264, 16);   // the dense FFN's down projection
     gemv_case(GGML_TYPE_IQ2_S, 4096, 16);      // q or k, IQ2_S in the release
+    gemv_case(GGML_TYPE_Q8_0, 4096, 64);       // every tensor of the MTP file is Q8_0, its head included
 
     if (failures) {
         std::printf("step35_gemv_parity: %d check(s) failed\n", failures);

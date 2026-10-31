@@ -667,8 +667,27 @@ int gpu_all(const std::string& path, int32_t token, int pos) {
     }
 }
 
+/// The five tokens of highest logit, in exactly the shape `--ref` prints them: the figure the CPU reference and the
+/// GPU paths are compared on.  A head that is merely mis-scaled still answers with plausible logits, so the ranking
+/// and the values have to come out together.
+void print_top5(const std::vector<float>& lg, const std::string& label) {
+    std::vector<int> top((size_t) 5, 0);
+    for (int32_t id = 0; id < (int32_t) lg.size(); ++id) {
+        for (int k = 0; k < 5; ++k) {
+            if (lg[(size_t) id] > lg[(size_t) top[(size_t) k]]) {
+                for (int j = 4; j > k; --j) top[(size_t) j] = top[(size_t) (j - 1)];
+                top[(size_t) k] = id;
+                break;
+            }
+        }
+    }
+    std::printf("  next-token top 5 %s:", label.c_str());
+    for (int k = 0; k < 5; ++k) std::printf(" %d(%.3f)", top[(size_t) k], lg[(size_t) top[(size_t) k]]);
+    std::printf("\n");
+}
+
 /// `--gpu-seq`: a PROMPT of several positions through the dense blocks on the GPU.
-int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks, int pos) {
+int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks, int pos, bool want_logits) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         std::vector<int32_t> ids;
@@ -706,6 +725,14 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
             for (int i = 0; i < 4; ++i) std::printf(" %.6f", h[i]);
             std::printf("\n");
         }
+        if (want_logits && n_embd > 0) {
+            std::vector<float> lg;
+            if (!kernels::logits_last(file, out.data() + (ids.size() - 1) * (size_t) n_embd, lg, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            print_top5(lg, "after " + std::to_string(n_blocks) + " block(s) on the GPU");
+        }
         return 0;
     } catch (const std::exception& ex) {
         std::printf("strata-step35: %s\n", ex.what());
@@ -717,7 +744,7 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
 /// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
-             int max_ctx) {
+             int max_ctx, bool want_logits) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -834,6 +861,15 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             for (int i = 0; i < 4; ++i) std::printf(" %.6f", h[i]);
             std::printf("\n");
         }
+        if (want_logits && n_embd > 0 && !rows.empty()) {
+            std::vector<float> lg;
+            const size_t last = rows.size() / (size_t) n_embd - 1;
+            if (!kernels::logits_last(file, rows.data() + last * (size_t) n_embd, lg, err)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
+            }
+            print_top5(lg, "after " + std::to_string(n_blocks) + " block(s) on the GPU, reading the cache");
+        }
         kernels::session_destroy(s);
         return 0;
     } catch (const std::exception& ex) {
@@ -857,10 +893,12 @@ void usage() {
         "      what each one produced.  The reference a kernel is compared against; no GPU.\n"
         "\n"
         "  strata-step35 --gpu-chat <first shard> --tokens <id,id,...> [--next <id,id,...>] [--layers N]\n"
-        "      [--max-context N]\n"
+        "      [--max-context N] [--logits]\n"
         "      Prefill the prompt with the quantized K/V cache, then decode each --next token against it.  Prints\n"
         "      the per-block sums and, per position, the rms and first four values --ref prints: the two outputs\n"
-        "      are the comparison the cache is held to.\n"
+        "      are the comparison the cache is held to.  `--logits` adds the file's own output_norm and output\n"
+        "      applied to the last position, and the five tokens it would answer with - the figure `--ref`\n"
+        "      prints, so the head is held to the reference the same way the blocks are.  --gpu-seq takes it too.\n"
         "\n"
         "There is no forward pass and nothing to serve in this build: --gpu-chat runs a prompt and its decode\n"
         "steps, and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
@@ -930,19 +968,7 @@ int reference(const std::string& path, const std::string& tokens_csv, int64_t la
                     (long long) m.n_embd, (long long) lg.size());
     }
     // the five tokens the file itself would answer with, which is what the oracle can be compared on
-    std::vector<int> top((size_t) 5, 0);
-    for (int32_t id = 0; id < (int32_t) lg.size(); ++id) {
-        for (int k = 0; k < 5; ++k) {
-            if (lg[(size_t) id] > lg[(size_t) top[(size_t) k]]) {
-                for (int m2 = 4; m2 > k; --m2) top[(size_t) m2] = top[(size_t) (m2 - 1)];
-                top[(size_t) k] = id;
-                break;
-            }
-        }
-    }
-    std::printf("  next-token top 5 after %lld block(s):", (long long) layers);
-    for (int k = 0; k < 5; ++k) std::printf(" %d(%.3f)", top[(size_t) k], lg[(size_t) top[(size_t) k]]);
-    std::printf("\n");
+    print_top5(lg, "after " + std::to_string((long long) layers) + " block(s)");
     return 0;
 }
 
@@ -952,9 +978,17 @@ int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump, next;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
-    bool want_chat = false;
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
+    bool want_chat = false, want_logits = false;
+    for (int i = 1; i < argc; ++i) {
+        // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
+        // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
+        if (std::strcmp(argv[i], "--logits") != 0 && i + 1 >= argc) {
+            std::printf("strata-step35: %s needs a value\n", argv[i]);
+            return 2;
+        }
+        if (std::strcmp(argv[i], "--logits") == 0) {
+            want_logits = true;
+        } else if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
         } else if (std::strcmp(argv[i], "--gpu-chat") == 0) {
@@ -1003,8 +1037,8 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump);
-    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx);
-    if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos);
+    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits);
+    if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
             std::printf("strata-step35: --gpu-all needs --token <id>\n");

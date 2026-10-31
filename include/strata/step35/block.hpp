@@ -95,6 +95,15 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                       std::vector<float>& out, std::vector<double>& sums, std::string& err,
                       Session* session = nullptr);
 
+/// The vocabulary logits of ONE position: `h` is one row of the last block's output on the HOST (n_embd floats),
+/// `logits` receives the file's `output.weight` applied to `rms_norm(h, output_norm)` - n_vocab floats, also on the
+/// host.  Same order as `ref::logits`, which is the point: the CPU reference and the GPU can then be held to each
+/// other on the token they would answer with, and not only on the hidden state's sum.
+///
+/// This is the trunk's own head.  An MTP draft head has its own shared_head_head inside the NextN file and does
+/// not go through here.
+bool logits_last(const strata::GgufModel& file, const float* h, std::vector<float>& logits, std::string& err);
+
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
 /// mapping into three reused device buffers for each block.  Slow by design - it is what lets the whole model
