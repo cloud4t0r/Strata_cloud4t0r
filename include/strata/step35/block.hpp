@@ -192,6 +192,8 @@ const DenseBlock* dense_cache_get(DenseCache& c, int layer, bool with_ffn, std::
 /// Releases the block only if it was uploaded for this call (a cached one stays).
 void dense_cache_done(DenseCache& c, int layer, DenseBlock& streamed);
 void dense_cache_close(DenseCache& c);
+/// The bytes the blocks' dense weights take on the card: what an "auto" budget has to know before it decides.
+uint64_t dense_layers_bytes(const strata::GgufModel& file, int n_layers, int dense_layers);
 
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the

@@ -86,6 +86,12 @@ size_t block_bytes(const strata::GgufModel& file, int layer, bool with_ffn) {
     return total;
 }
 
+uint64_t dense_layers_bytes(const strata::GgufModel& file, int n_layers, int dense_layers) {
+    uint64_t total = 0;
+    for (int l = 0; l < n_layers; ++l) total += block_bytes(file, l, l < dense_layers);
+    return total;
+}
+
 bool dense_cache_open(DenseCache& c, const strata::GgufModel& file, int n_layers, size_t budget, std::string& err) {
     if (n_layers <= 0) {
         err = "a dense cache needs layers";
@@ -113,7 +119,14 @@ const DenseBlock* dense_cache_get(DenseCache& c, int layer, bool with_ffn, std::
         ++c.streamed;
         return nullptr;
     }
-    if (!upload_block(*c.file, layer, c.blocks[(size_t) layer], err, with_ffn)) return nullptr;
+    if (!upload_block(*c.file, layer, c.blocks[(size_t) layer], err, with_ffn)) {
+        // the card is full: stream this block instead of failing the pass (its own ~45 MB will fit once the cache
+        // stops growing), and say nothing - the caller's copy is the same allocation, and it reports if that fails
+        err.clear();
+        c.blocks[(size_t) layer] = DenseBlock{};
+        ++c.streamed;
+        return nullptr;
+    }
     c.ready[(size_t) layer] = 1;
     c.used += bytes;
     ++c.kept;
