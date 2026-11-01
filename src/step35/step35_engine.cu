@@ -832,7 +832,15 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         for (int k = 0; k <= want; ++k) std::printf(" %d", tok[(size_t) k]);
         std::printf("\n");
 
-        // the draft cache: one cell per NextN layer (mtp_block says why)
+        // the NextN blocks and their heads, resident: a draft that re-uploads them costs four trunk steps
+        kernels::MtpContext dctx;
+        if (!kernels::mtp_open(mtp, dctx, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            kernels::session_destroy(trunk);
+            return 1;
+        }
+        const auto t_draft0 = std::chrono::steady_clock::now();
+        // the draft cache: one cell per NextN layer (mtp_step says why)
         std::vector<int> kwindows((size_t) n_mtp, 0);
         kernels::Session draft;
         if (!kernels::session_create(draft, n_mtp, n_kv, head_dim, want, err, kwindows)) {
@@ -844,9 +852,10 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         std::vector<float> hh = hidden[0];
         for (int k = 0; k < want; ++k) {
             std::vector<float> hn, lg;
-            if (!kernels::mtp_block(mtp, first + k, k, (int) prompt.size() + k, tok[(size_t) k], hh.data(), &draft,
-                                    hn, lg, err)) {
+            if (!kernels::mtp_step(dctx, k, k, (int) prompt.size() + k, tok[(size_t) k], hh.data(), &draft, hn, lg,
+                                   err)) {
                 std::printf("strata-step35: %s\n", err.c_str());
+                kernels::mtp_close(dctx);
                 kernels::session_destroy(draft);
                 kernels::session_destroy(trunk);
                 return 1;
@@ -862,9 +871,165 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
             print_top5(lg, "draft " + std::to_string(k));
             hh = hn;
         }
+        const double draft_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_draft0).count();
+        kernels::mtp_close(dctx);
         kernels::session_destroy(draft);
         kernels::session_destroy(trunk);
+        std::printf("strata-step35: %d draft(s) in %.3f s (%.3f s/draft)\n", want, draft_s,
+                    want ? draft_s / (double) want : 0.0);
         std::printf("strata-step35: the draft agreed with the trunk on %d of %d token(s)\n", agree, want);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
+/// `--gpu-spec`: the same prompt, generated one BLOCK at a time - the NextN heads draft K tokens, one trunk pass
+/// over K+1 positions checks them, and the longest matching prefix is kept.  The trunk's own token at the first
+/// rejection is the correction, so the answer is exactly what greedy would have produced: speculation here buys
+/// time, never different tokens.
+int gpu_spec(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
+             int max_new, int drafts) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
+        std::vector<int32_t> prompt;
+        for (size_t i = 0; i < tokens_csv.size();) {
+            size_t j = tokens_csv.find(',', i);
+            if (j == std::string::npos) j = tokens_csv.size();
+            prompt.push_back((int32_t) std::strtol(tokens_csv.substr(i, j - i).c_str(), nullptr, 10));
+            i = j + 1;
+        }
+        if (prompt.empty() || max_new <= 0) {
+            std::printf("strata-step35: --gpu-spec needs --tokens <id,id,...> and --max-new N\n");
+            return 2;
+        }
+        std::string err;
+        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
+        const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
+        const int n_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
+        const int head_dim = (int) file.meta().get("step35.attention.key_length")->num();
+        const strata::MetaValue* swa = file.meta().get("step35.attention.sliding_window_pattern");
+        const strata::MetaValue* wv = file.meta().get("step35.attention.sliding_window");
+        const int window = wv ? (int) wv->num() : 512;
+        std::vector<int> windows((size_t) n_blocks, 0);
+        for (int l = 0; l < n_blocks; ++l)
+            if (swa && swa->type == strata::MetaType::ARRAY && (size_t) l < swa->items.size() &&
+                swa->items[(size_t) l].num() != 0)
+                windows[(size_t) l] = window;
+
+        kernels::Session trunk;
+        if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim,
+                                     (int) prompt.size() + max_new + drafts + kernels::kKvPassMax, err, windows)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<float> out;
+        std::vector<double> sums;
+        const auto t_pre = std::chrono::steady_clock::now();
+        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            kernels::session_destroy(trunk);
+            return 1;
+        }
+        const double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pre).count();
+
+        kernels::Head head;
+        kernels::MtpContext dctx;
+        kernels::Session dk;
+        int n_mtp = 0;
+        if (kernels::head_open(file, head, err) && kernels::mtp_open(mtp, dctx, err)) n_mtp = dctx.n_mtp;
+        const int K = std::max(1, std::min(drafts, std::max(1, n_mtp)));
+        if (!kernels::session_create(dk, std::max(1, n_mtp), n_kv, head_dim, K + 1, err)) n_mtp = 0;
+        // `drafts` blocks of K tokens each: one cell per NextN layer per block is enough, the check pass reads none
+        // INVARIANT at the top of the loop: `pos` is what the cache holds, and `h` is the hidden state of the last
+        // position written, i.e. the one that predicts the token about to be emitted.  `pending` is a token the
+        // trunk already chose at the previous block's first rejection - it is emitted, not re-decided.
+        std::vector<float> h(out.end() - n_embd, out.end());
+        int pos = (int) prompt.size(), emitted = 0, accepted_total = 0, blocks = 0, passes = 0, pending = -1;
+        std::vector<int> emitted_tokens;
+        const auto t_gen = std::chrono::steady_clock::now();
+        while (emitted < max_new) {
+            int n0 = pending;
+            if (n0 < 0) {
+                std::vector<float> lg;
+                if (!kernels::head_apply(head, h.data(), lg, err)) {
+                    std::printf("strata-step35: %s\n", err.c_str());
+                    break;
+                }
+                n0 = argmax(lg);
+            }
+            pending = -1;
+            if (n0 == 128007) {   // the file's eos
+                std::printf("  eos after %d token(s)\n", emitted);
+                break;
+            }
+            // ---- the draft: K tokens, each head chained on the previous one's h_nextn
+            std::vector<int> d;
+            std::vector<float> hh = h;
+            int fed = n0;
+            for (int k = 0; k < K && n_mtp > 0; ++k) {
+                std::vector<float> hn, lg2;
+                if (!kernels::mtp_step(dctx, k, k, pos + k, fed, hh.data(), &dk, hn, lg2, err)) break;
+                d.push_back(argmax(lg2));
+                fed = d.back();
+                hh = hn;
+            }
+            // ---- verify: ONE pass over [n0, drafts...], then the trunk's own top-1 at every position
+            std::vector<int32_t> batch(1, n0);
+            batch.insert(batch.end(), d.begin(), d.end());
+            std::vector<float> vout;
+            std::vector<double> vsums;
+            if (!kernels::run_prompt_dense(file, batch, pos, n_blocks, vout, vsums, err, &trunk)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                break;
+            }
+            ++passes;
+            std::vector<int> t;
+            for (size_t i = 0; i < batch.size(); ++i) {
+                std::vector<float> lg2;
+                if (!kernels::head_apply(head, vout.data() + i * (size_t) n_embd, lg2, err)) break;
+                t.push_back(argmax(lg2));
+            }
+            if (t.size() != batch.size()) break;
+            // ---- the longest prefix of the draft the trunk agrees with
+            int a = 0;
+            while (a < (int) d.size() && d[(size_t) a] == t[(size_t) a]) ++a;
+            accepted_total += a;
+            ++blocks;
+            std::printf("  block %d at position %d: drafted", blocks, pos);
+            for (int x : d) std::printf(" %d", x);
+            std::printf(", the trunk accepts %d", a);
+            if (a < (int) d.size()) std::printf(", corrects with %d", t[(size_t) a]);
+            std::printf("\n");
+            emitted += 1 + a;
+            emitted_tokens.push_back(n0);
+            for (int i = 0; i < a; ++i) emitted_tokens.push_back(d[(size_t) i]);
+            if (a < (int) d.size()) pending = t[(size_t) a];   // decided here, fed at the next block
+            // the state is the hidden state of the last position emitted (row `a`), and nothing past it is kept
+            const int row = std::min(a, (int) batch.size() - 1);
+            h.assign(vout.begin() + (size_t) row * n_embd, vout.begin() + (size_t) (row + 1) * n_embd);
+            pos += a + 1;
+            trunk.n_cached = pos;
+        }
+        if (emitted > max_new) emitted = max_new;   // a block can overshoot by the tokens it emitted at once
+        const double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen).count();
+        std::printf("strata-step35: prefill %zu position(s) in %.2f s\n", prompt.size(), prefill_s);
+        std::printf("strata-step35: tokens:");
+        for (size_t i = 0; i < emitted_tokens.size() && (int) i < emitted; ++i)
+            std::printf(" %d", emitted_tokens[i]);
+        std::printf("\n");
+        std::printf("strata-step35: %d token(s) in %d block(s) and %d pass(es), %.2f s: %.3f s/token, "
+                    "%d draft(s) accepted of %d (%.0f%%)\n",
+                    emitted, blocks, passes, gen_s, emitted ? gen_s / emitted : 0.0, accepted_total,
+                    blocks * K, blocks * K ? 100.0 * (double) accepted_total / (double) (blocks * K) : 0.0);
+        kernels::session_destroy(dk);
+        kernels::mtp_close(dctx);
+        kernels::head_close(head);
+        kernels::session_destroy(trunk);
         return 0;
     } catch (const std::exception& ex) {
         std::printf("strata-step35: %s\n", ex.what());
@@ -948,6 +1113,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         // splitting the prompt moves no bit - the parity test appends in two chunks and compares the whole thing.
         std::vector<float> out;
         std::vector<double> sums;
+        const auto t_prefill = std::chrono::steady_clock::now();
         for (size_t off = 0; off < prompt.size(); off += (size_t) kernels::kKvPassMax) {
             const size_t n = std::min((size_t) kernels::kKvPassMax, prompt.size() - off);
             const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
@@ -964,7 +1130,11 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             }
             out.insert(out.end(), part.begin(), part.end());
         }
-        std::printf("strata-step35: prefill of %zu position(s) through %d block(s)\n", prompt.size(), n_blocks);
+        std::printf("strata-step35: prefill of %zu position(s) through %d block(s) in %.3f s (%.3f s/position)\n",
+                    prompt.size(), n_blocks,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prefill).count(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_prefill).count() /
+                        (double) prompt.size());
         for (size_t l = 0; l < sums.size(); ++l) std::printf("  block %2zu : sum %.6f\n", l, sums[l]);
         std::vector<float> rows = out;   // [position][n_embd], the figures --ref prints
 
@@ -1073,6 +1243,12 @@ void usage() {
         "      Run the CPU reference over the blocks (default: all of them, 3 dense then 42 MoE) and print\n"
         "      what each one produced.  The reference a kernel is compared against; no GPU.  With --mtp it\n"
         "      also runs the NextN draft heads, exactly as --gpu-mtp does, so the two can be compared.\n"
+        "\n"
+        "  strata-step35 --gpu-spec <first shard> --mtp <nextn file> --tokens <id,id,...> --max-new N [--drafts K]\n"
+        "      The same generation, one BLOCK at a time: the NextN heads draft K tokens, ONE trunk pass over K+1\n"
+        "      positions checks them, and the longest matching prefix is kept - the trunk's token at the first\n"
+        "      rejection is the correction.  The tokens are exactly greedy's; only the time changes.  Prints the\n"
+        "      acceptance rate and the seconds per token.\n"
         "\n"
         "  strata-step35 --gpu-mtp <first shard> --mtp <nextn file> --tokens <id,id,...> [--layers N] [--drafts N]\n"
         "      The trunk over the prompt, then its own greedy continuation, then the NextN blocks as a chain of\n"
@@ -1230,7 +1406,7 @@ int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump, next;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
-    bool want_chat = false, want_logits = false, want_gpu_mtp = false;
+    bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false;
     int64_t drafts = 3, max_new = 0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
@@ -1244,6 +1420,9 @@ int run(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--gpu-spec") == 0) {
+            trunk = argv[++i];
+            want_spec = true;
         } else if (std::strcmp(argv[i], "--gpu-mtp") == 0) {
             trunk = argv[++i];
             want_gpu_mtp = true;
@@ -1297,6 +1476,7 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
+    if (want_spec) return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts);
     if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts);
     if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);

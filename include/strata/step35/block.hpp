@@ -121,15 +121,54 @@ bool head_open(const strata::GgufModel& file, Head& head, std::string& err);
 bool head_apply(Head& head, const float* h, std::vector<float>& logits, std::string& err);
 void head_close(Head& head);
 
-/// One MTP (NextN) block on the GPU: `ref::mtp_block`'s arithmetic, one position at a time.  `mtp` is the NextN
-/// file, `layer` one of its own blocks (45..47 for this model), `h` the previous step's hidden state on the HOST
-/// (n_embd floats - the trunk's for the first head), `token` the token whose embedding is concatenated with it, and
-/// `cache` the draft session.  This position's cells go into the cache and the attention reads the drafts already in
-/// it, so head after head a chain of drafts sees exactly what it wrote.
-/// `slot` is this head's layer in `cache` (0..n_mtp-1 - the draft session is built over the NextN file's own
-/// blocks only); the weights always come from block `layer` of the file.
-bool mtp_block(const strata::GgufModel& mtp, int layer, int slot, int pos, int32_t token, const float* h,
-               Session* cache, std::vector<float>& h_nextn, std::vector<float>& logits, std::string& err);
+/// The NextN file's blocks, RESIDENT: three decoder layers plus three heads is 3.7 GB of weights, and a draft that
+/// re-uploads them per token (1.2 GB each) costs four times what a trunk step costs.  Open once, step per draft,
+/// close.
+struct MtpHead {
+    DenseBlock block;            ///< the NextN decoder layer's own tensors
+    void* eh = nullptr;          ///< nextn.eh_proj (2 * n_embd -> n_embd)
+    void* enorm = nullptr;       ///< nextn.enorm
+    void* hnorm = nullptr;       ///< nextn.hnorm
+    void* shnorm = nullptr;      ///< nextn.shared_head_norm
+    void* shead = nullptr;       ///< nextn.shared_head_head (n_embd -> n_vocab)
+    int t_eh = 0, t_sh = 0;
+};
+
+struct MtpContext {
+    const strata::GgufModel* file = nullptr;   ///< the NextN file, for the per-draft embedding row
+    std::vector<MtpHead> heads;
+    int first = 0;              ///< the file's first NextN block (45 for this model)
+    int n_mtp = 0;
+    int n_embd = 0, n_kv = 0, head_dim = 0, n_vocab = 0;
+    float eps = 0;
+    void* q8 = nullptr;         ///< the q8_1 scratch, sized for the widest input any of the steps quantizes
+    float* q = nullptr;
+    float* k = nullptr;
+    float* v = nullptr;
+    float* ao = nullptr;
+    float* gt = nullptr;
+    float* res = nullptr;
+    float* g = nullptr;
+    float* u = nullptr;
+    float* act = nullptr;
+    float* d = nullptr;
+    float* s = nullptr;
+    float* x = nullptr;
+    float* cat = nullptr;
+    float* eu = nullptr;
+    float* hu = nullptr;
+    float* lg = nullptr;        ///< n_vocab floats: the head's output, NOT the residual width
+    int* dpos = nullptr;
+};
+
+/// Uploads every NextN block and head.  `n_mtp` blocks are read from the file's own `nextn_predict_layers`.
+bool mtp_open(const strata::GgufModel& mtp, MtpContext& ctx, std::string& err);
+/// One draft step of head `k` (0-based, weights = block `first + k`) at absolute position `pos`, fed `h` and
+/// `token`, writing into `cache` and attending over the cell it writes alone.  `h_nextn` is what the next head
+/// consumes, `logits` its vocabulary.
+bool mtp_step(MtpContext& ctx, int k, int slot, int pos, int32_t token, const float* h, Session* cache,
+              std::vector<float>& h_nextn, std::vector<float>& logits, std::string& err);
+void mtp_close(MtpContext& ctx);
 
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
