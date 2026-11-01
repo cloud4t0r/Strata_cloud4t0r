@@ -626,7 +626,7 @@ exists: it is a second model in the same process, and it is the largest item lef
 ctest -R step35
 ```
 
-Seven tests, none of which needs the 76 GB download:
+Eight tests, none of which needs the 76 GB download:
 
 - `step35_metadata_test` - the family, the guard, and five files the guard must refuse (synthetic).
 - `step35_rope_parity` - NEOX pairing and the frequency factors, **bit for bit** against a float64 host; and a
@@ -638,6 +638,12 @@ Seven tests, none of which needs the 76 GB download:
 - `step35_attn_parity` - causal GQA with the sliding window, over both head counts, and two 520-position
   cases past the 512 keys the kernel used to hold in shared memory (they fail on the previous kernel:
   3.5e-04 and 4.5e-03).
+- `step35_mtp_parity` - the MTP block, on a **synthetic** NextN file (64 dims, 2 heads, 16 tokens, ~40 KB): one
+  block, a two-step chain - the second step feeds the reference's own `h_nextn` back, so the wiring (hnorm/enorm order,
+  `eh_proj`, the head, the position) shows even when the first row agrees. Same top-1 on both steps; the logits and
+  `h_nextn` match to the Q8_1 quantization (rel_l2 5.9e-04, 1.2e-03, 8.5e-04). Swapping `enorm` and `hnorm` makes it
+  fail at 1.2, which is the check that it is not passing vacuously. This is the test the page used to say could not
+  exist without the 76 GB file.
 - `step35_sample_test` - the sampler, against arithmetic and its own statistics (see above).
 - `step35_kv_parity` - the cache: the `int8` cell compared code by code and scale by scale with a host that
   applies kv_q8's rule; the attention over the dequantized cells at both head counts; a decode row **bit for bit**
