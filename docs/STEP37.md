@@ -150,7 +150,7 @@ the same file, so a few 1e-3 per block is inside its spread.
   `--repeat-penalty` and `--seed` work in the generation loop; the speculative one takes the top-1 because accepting
   a draft drawn from a distribution needs its own rejection rule, which is not written. `--gpu-spec` stops on the
   file's eos, `--max-new` runs to the count asked for. Serving samples, because it goes through the same loop.
-- **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
+
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
 - **The app shows it, and does not manage it yet.** The family appears in the app's model list (its entry is in
@@ -167,8 +167,11 @@ the same file, so a few 1e-3 per block is inside its spread.
   device-side router until everything above it is gone.
 - **No cache spill.** A K/V cache that outgrows VRAM has no host copy (`kv_stream.hpp` has one for the QSA layers);
   it matters above 131072 positions on a card that also wants the tier (6.7 GB at the model's 262144 maximum).
-- **One request at a time.** `--serve` answers one GEN at a time and the engine is single-device: the server's
-  slots and `--layer-split` are accepted and ignored, not implemented.
+- **One request at a time, deliberately.** `--serve` answers one GEN at a time and the engine is single-device; the
+  server's slots and `--layer-split` are accepted and ignored. Batching positions is measured 4.5x worse per position
+  than decoding them one at a time (above), so this is a measurement, not an omission.
+- **No vision, and it is a second model.** The `mmproj` is a 47-block ViT that has to be run in the same process with
+  the text model (see above); nothing of it exists here.
 
 ## The KV cache: what it is, and what it cost
 
@@ -570,6 +573,43 @@ The other half of the item, streaming the K/V cache to the host, is bounded by t
 gives: 12 full blocks at 2112 bytes per position plus a 0.11 GB ring, so 3.43 GB at 131072 and 6.7 GB at the model's
 maximum 262144. An 8 GB card holds the cache at 131072 without a tier; the spill would matter above that, or on a
 small card that wants the tier instead. Nothing is built for it, and nothing measured here would be improved by it.
+
+## Batching and multiple sequences: measured, and not worth building here
+
+The assumption that a pass over several positions is cheaper than several passes is false on this engine once the
+expert tier exists, and the measurement is unambiguous (45 blocks, `--dense-cache 2600 --expert-cache 12000`):
+
+| 24 positions | time | per position |
+|---|---|---|
+| in one pass | 21.52 s | **0.897 s** |
+| as 24 single-token passes | 4.88 s | **0.200 s** |
+
+**One pass is 4.5x worse per position.** The reason is the tier: the 24 positions of a batch route to
+24 x 8 x 42 = 8064 distinct (block, expert) pairs against 2089 resident slots, so nearly every fetch is a miss - 47 GB
+read in one pass - while 24 consecutive tokens re-use the same experts, because a conversation keeps routing to the
+same ones. Batch amortisation of the dense weights was worth something before `--dense-cache`; now that they are
+resident, all that is left of batching is a working set that does not fit.
+
+The same holds for several sequences at once: four sequences of one token each is four positions of different
+conversations, which is the same multiplied working set, and the server (`serve/server.py`) serialises requests
+through one engine pipe anyway. So concurrency here would make every user slower, and it is not built.
+
+## Vision: what the projector is, and what using it takes
+
+`mmproj-step3.7-flash-f16.gguf` (3.97 GB) is a complete ViT, read from the file rather than from the paper:
+
+| | |
+|---|---|
+| blocks | 47, hidden 1536, 16 attention heads, FFN 8960 |
+| patches | 14 x 14 pixels, 728 x 728 per tile (2704 patches) |
+| preprocessing | 3024 x 3024 source, `projector.scale_factor` 4 - the image is tiled, and the tiles are merged |
+| merger | `mm` projects 1536 to the text model's 4096 |
+| type | `clip.projector_type = step3vl` |
+
+Using it means four pieces this engine does not have: the image preprocessing (tile, resize, normalise), a ViT forward
+over 47 blocks and 2704 patches, the merger, and the text side - the `<im_patch>` token of the chat template, whose
+rows are replaced by the projected image embeddings before the first block. None of that is a kernel away from what
+exists: it is a second model in the same process, and it is the largest item left on this page.
 
 ## Tests
 
