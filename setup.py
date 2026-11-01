@@ -96,6 +96,7 @@ WIN = os.name == "nt"
 # day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops the
 # download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
+    "stepfun-ai/Step-3.7-Flash-GGUF": "0b69336d2fd2adfdef9c66e425f7778196c31482",                      # 2026-06-03
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
@@ -721,6 +722,12 @@ M2_KV_LABELS = {
             "to 72 and 85 - but the cache's rounding shows on a long generation (measured: a 64-token run kept FP16's "
             "tokens for 19, then wrote a full stop where FP16 wrote ', a city')",
 }
+# Step-3.7-Flash (GGUF architecture step35): stepfun-ai's release, IQ3_XXS.  Sizes and sha256 are the Hub's (the LFS
+# oids of the API's file list) and both match the copies on this machine.
+STEP35_FILES = {
+    "Step-3.7-flash-IQ3_XXS-00001-of-00002.gguf": (46645813024, "ce04c744be266f05a23ff683ab0086e20b8de8aee816f17aa5dd5738f675cc5d"),
+    "Step-3.7-flash-IQ3_XXS-00002-of-00002.gguf": (29112867936, "aeedcdaa32646f1bdf199309503a63bcd1f597940f5c73c9562923554a47e31d"),
+}
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -814,7 +821,31 @@ OWN_PATH_FAMILIES = {
                  "n_layers": M2_LAYERS, "layer_split": M2_LAYER_SPLIT,
                  "mtp": 0,
                  "low_ram": True,
-                 "vision": False, "state_gb": 0.0}
+                 "vision": False, "state_gb": 0.0},
+    "step35": {"title": "Step-3.7-Flash", "by": "StepFun", "arch": "step35",
+               "about": "196B mixture of experts with 11B active (288 experts, top-8), hybrid attention: one full block in "
+                        "four, a 512-position window on the other 33; the experts are read where they lie in the file, so "
+                        "the download is the disk's business and RAM is the page cache that makes it fast, not a "
+                        "requirement (measured here: 0.5 s per position in a prefix pass, 0.68 s per token with one "
+                        "draft token, 2.2 GB of RSS)",
+               "hf": hf("stepfun-ai/Step-3.7-Flash-GGUF") + "IQ3_XXS/",
+               "file": "Step-3.7-flash-IQ3_XXS-0000{i}-of-00002.gguf", "shards": 2, "tag": "step-3.7-flash-",
+               "name": "step-3.7-flash",
+               "license": "StepFun's model licence: https://huggingface.co/stepfun-ai/Step-3.7-Flash-GGUF",
+               # RAM: the engine keeps no copy of the experts (they stay in the GGUF and are read per position), so
+               # what RAM buys is the page cache - 24 GB keeps a third of the 75.8 GB file warm; the engine's own
+               # footprint was measured at 2.2 GB.
+               "models": {"IQ3_XXS": {"about": "3-bit i-quant, the release's only offering so far (75.8 GB)", "ram_gb": 24}},
+               "sha256": STEP35_FILES,
+               # the K/V cache: 2112 B per layer per position, 45 layers, but only the 12 full-attention blocks keep
+               # every position - the 33 sliding ones keep a 1536-cell ring, 0.11 GB whatever the context
+               # (docs/STEP37.md, measured: 0.315 GB at 8192, 0.938 GB at 32768).
+               "kv_bytes_per_token": 12 * 2112, "kv_fixed_gb": 0.107,
+               # nothing is copied to the card or to RAM: the expert tier (--expert-cache) only buys speed
+               "streams_experts": True,
+               # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
+               "mtp": 0,
+               "vision": False, "state_gb": 0.0},
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 

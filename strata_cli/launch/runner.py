@@ -1109,6 +1109,8 @@ class Runner:
                 return path
             self.emit("model", "The model already installed here is somewhere else than the folder you gave, so Strata uses the folder you gave "
                                "and points this launch at it.", 0)
+        if s.family == "step35":
+            return self.step35_config()
         title = f"{s.family} {s.model}"
         if sys.platform == "darwin" and not (cat.src / "strata_control" / "mac_fit.py").is_file():
             # a Terminal from before the Mac rules moved into strata_control/mac_fit.py: setup.py cannot install a Mac model in its Control
@@ -1325,6 +1327,66 @@ class Runner:
         self.emit("model", f"These files are DeepSeek-V4.1-Flash {model}; they are used where they are.", None)
         return True
 
+    def step35_files(self) -> bool:
+        """--model-path holds Step-3.7-Flash's pinned shards: they are that model wherever they sit (a folder, the folder
+        above the quant's own folder, or one shard), and there is nothing to download, prepare or install - the engine
+        reads the GGUF directly.  Sets s.family / s.model / s.model_path; a missing shard is said before anything runs."""
+        s = self.s
+        if not s.model_path:
+            return False
+        p = Path(s.model_path).expanduser()
+        folders = [p] if p.is_dir() else [p.parent]
+        if p.is_dir():
+            folders += [p / "IQ3_XXS", p.parent / "IQ3_XXS"]
+        try:
+            mod = self.catalog.strata.setup_module()
+            fam = (getattr(mod, "OWN_PATH_FAMILIES", None) or {}).get("step35")
+        except Exception:                                    # noqa: BLE001 - not step35's files: the usual check goes on
+            return False
+        if not fam:
+            return False
+        for folder in folders:
+            if (folder / "Step-3.7-flash-IQ3_XXS-00001-of-00002.gguf").exists():
+                if s.family and s.family != "step35":
+                    raise LaunchError(f"These are Step-3.7-Flash's files, not {s.family} {s.model}'s.",
+                                      "Leave --family out, or use --family step35.", 2)
+                missing = [n for n in fam["sha256"] if not (folder / n).exists()]
+                if missing:
+                    raise LaunchError(f"Step-3.7-Flash IQ3_XXS is in two parts and {len(missing)} of them are not in "
+                                      f"{folder} (first missing: {missing[0]}).",
+                                      "Put both parts in the folder. Nothing was downloaded or changed.", 5)
+                s.family, s.model, s.model_path = "step35", (s.model or "IQ3_XXS"), str(folder)
+                self.emit("model", "These are Step-3.7-Flash's files; the engine reads them where they are.", None)
+                return True
+        return False
+
+    def step35_config(self) -> Path:
+        """The run config for Step-3.7-Flash from files that are already on disk (strata_cli/launch/adopt.py): two
+        shards, the folder's tokenizer, the expert tier sized from the card. Nothing is downloaded or prepared."""
+        from strata_cli.launch import adopt
+        from strata_control import engine_component
+        s, cat = self.s, self.catalog
+        _models, families, _ctx, _src = cat.tables()
+        fam = families.get("step35", {})
+        tag = cat.tag_of("step35", s.model)
+        try:
+            backend = engine_component.detect_backend()[0]
+        except Exception:                                    # noqa: BLE001
+            backend = None
+        cfg, problems = adopt.plan(family="step35", model=s.model, model_dir=Path(s.model_path), data_dir=cat.data_dir(),
+                                   src=cat.src, context=s.context or 32768, kv=s.kv,
+                                   model_name=f"{fam.get('name', 'step-3.7-flash')}-{s.model.lower()}", family_def=fam,
+                                   log=launch_dir() / f"{self.name}.engine.log", backend=backend,
+                                   vram_gb=float(cat.computer().main_vram_gb or 0), notes=self.notices)
+        if cfg is None:
+            raise LaunchError("Step-3.7-Flash needs its files on disk and Strata cannot write the settings from what it "
+                              "found: " + "; ".join(problems) + ".",
+                              "Point --model-path at the folder that holds both shards and the tokenizer folder.", 5)
+        path = cat.root / f"strata-{tag}.json"
+        adopt.write(path, cfg)
+        self.emit("model", "Wrote the run settings for Step-3.7-Flash from your files (nothing was downloaded).", 100)
+        return path
+
     def check_own_files(self) -> None:
         """The person's own model files, looked at once: a path that is not there or holds no model is said in plain words first, and the
         files are matched to the catalog model (resolve_own_files). Nothing else is done with a path that was already checked."""
@@ -1342,6 +1404,8 @@ class Runner:
         if problem:                                          # before the engine or setup are touched, with the path as typed
             raise LaunchError(problem[0], problem[1], 2)
         if self.deepseek_files():
+            return
+        if self.step35_files():
             return
         given = bool(s.family and s.model)
         try:
@@ -2096,6 +2160,8 @@ class Runner:
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
+        if self.s.family == "step35":       # the NextN blocks run (--gpu-mtp) but nothing drafts with them in serving yet
+            return "Drafting: off (Step-3.7-Flash's NextN blocks are not used by the serving path yet)"
         if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
             if sys.platform == "darwin":
                 return "Drafting: off (DeepSeek's drafter was not faster on a Mac)"

@@ -138,26 +138,28 @@ class GpuFitInTheModelList(unittest.TestCase):
         self.addCleanup(self.home.__exit__, None, None, None)
 
     def sizes(self, hw):
+        # keyed by (family, model): two families may offer a quant of the same name (Step-3.7-Flash's IQ3_XXS is not
+        # Flash-Next's), and this test is about ONE of them - the engine that has two-card options
         from tests.terminal.launch_support import catalog
         table = catalog(hw).strata.model_table(hw)
-        return {s["model"]: s for f in table for s in f["sizes"]}
+        return {(f["family"], s["model"]): s for f in table for s in f["sizes"]}
 
     def test_two_cards_give_options_on_every_model(self):
         from tests.terminal.launch_support import HW_2X16
-        s = self.sizes(HW_2X16)["IQ3_XXS"]
+        s = self.sizes(HW_2X16)[("qwen", "IQ3_XXS")]
         res = s["gpu_options"]
         self.assertEqual([o["key"] for o in res["options"]][:2], ["single", "split"])
         self.assertEqual(res["recommended"], "single")
 
     def test_one_card_has_no_choice_to_show(self):
         from tests.terminal.launch_support import HW_12
-        self.assertIsNone(self.sizes(HW_12)["IQ3_XXS"]["gpu_options"])
+        self.assertIsNone(self.sizes(HW_12)[("qwen", "IQ3_XXS")]["gpu_options"])
 
     def test_an_integrated_chip_beside_one_card_is_no_choice(self):
         from tests.terminal.launch_support import HW_2X16
         hw = dict(HW_2X16)
         hw["gpus"] = [dict(HW_2X16["gpus"][0]), {"index": 1, "name": "AMD Radeon Graphics", "vram_gb": 16.0, "usable": False, "uma": True, "problem": "integrated graphics"}]
-        self.assertIsNone(self.sizes(hw)["IQ3_XXS"]["gpu_options"])
+        self.assertIsNone(self.sizes(hw)[("qwen", "IQ3_XXS")]["gpu_options"])
 
 
 if __name__ == "__main__":

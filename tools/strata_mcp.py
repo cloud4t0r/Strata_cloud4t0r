@@ -578,9 +578,13 @@ class Strata:
         if not d or model not in d["models"]:
             return None
         size_gb = sum(d["sha256"][f][0] for f in own_files(d, model)) / 1e9
+        # A family that streams its experts from the file keeps no copy of them: nothing is held in VRAM or in RAM, so
+        # the 93%-of-the-file arena the engine-path families report (setup.own_path_parallel_fits_all) would be a
+        # figure for a different engine.  Step-3.7-Flash is the one that says so.
+        streams = bool(d.get("streams_experts"))
         return {"about": d["models"][model]["about"], "download_gb": round(size_gb, 1), "ram_gb": d["models"][model]["ram_gb"],
-                # the routed experts are ~93% of the file (setup.own_path_parallel_fits_all); the dense part and buffers ~1 GB more
-                "arena_gb": round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
+                "arena_gb": 0.0 if streams else round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
+                "streams_experts": streams,
                 "engine": OWN_PATH_ENGINE, "families": (family,)}
 
     def sizes_of(self, models, family) -> list:
