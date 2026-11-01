@@ -220,6 +220,8 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
  /* The configuration a load starts the engine with (before its port and key): the saved model config, the user's choices and the resource profile. The tuner measures exactly this, so a saved tuning belongs to the same choices a load makes. */
  /* DeepSeek-V4.1-Flash runs on its own engine (strata-dsv41) that takes none of the Flash-Next options the app adds on its own (request slots, the RAM budget, the output clamp, the resource profile): a flag it does not know ends the start with "unknown option". */
  const ownEngine=config=>config?.arch==='deepseek41'||/strata-dsv41/i.test(String(config?.exe??''));
+ /* The Flash-Next engine's own additions - request slots, the RAM budget, the output clamp, the resource profile, taking `--vision` out - belong to that engine. Step-3.7-Flash runs on this Terminal's own path for it (`strata --serve`, arch step35): ONE request at a time and no --vision, so those additions are skipped for it exactly as they are for DeepSeek's engine. It is not DeepSeek's engine, so `ownEngine` above stays what it was for the DeepSeek-only settings. */
+ const flashNextOnly=config=>!ownEngine(config)&&String(config?.arch??'')!=='step35'&&!/strata-step35/i.test(String(config?.exe??''));
  /* The DeepSeek engine's version, read from the folder the run config names (engine-dsv41/<version>-<platform>-...). --experts exists from engine 0.1.50: an older engine ends the start with "unknown option", so the choice is offered and passed only for 0.1.50 or newer. */
  const DS_EXPERTS_MIN=[0,1,50];
  function dsEngineVersion(config){const m=/engine-dsv41[\\/](\d+(?:\.\d+)+)-/.exec(String(config?.exe??''))||/engine-dsv41[\\/](\d+(?:\.\d+)+)-/.exec(String((config?.lib_dirs??[])[0]??''));return m?m[1].split('.').map(Number):null;}
@@ -275,7 +277,7 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   const values0=args.values??{},cleared='vram_reserve_mib' in values0&&(values0.vram_reserve_mib===null||values0.vram_reserve_mib===''),base0=cleared?{...config,vram_reserve_mib:undefined,[USER_KEY]:setUserFlag(config[USER_KEY],'--vram-reserve-mib',null)}:config;
   let mine=captureUserArgs(base0);const asked=cleared?null:reserveChoice({...base0,[USER_KEY]:mine},snapshot.hardware,values0).asked;
   if(asked!==null)mine=setUserFlag(mine,'--vram-reserve-mib',asked);
-  const resources=args.resourceProfile&&!ownEngine(config)?resourceSettings({...base0,[USER_KEY]:mine,vision},snapshot.hardware,args.resourceProfile,modelArena(args.model),values0):null;
+  const resources=args.resourceProfile&&flashNextOnly(config)?resourceSettings({...base0,[USER_KEY]:mine,vision},snapshot.hardware,args.resourceProfile,modelArena(args.model),values0):null;
   const cfg={...config,...visionPreferences,...(resources?{...resources,ui_resource_profile:args.resourceProfile}:{}),host:'127.0.0.1',open_browser:false,...validateNativeSettings(args.values??{}),vision};
   /* The app's suggested cards only fill a gap: a model whose settings file already names its GPUs ("gpu": [1, 0], with "gpu_order": "as_given") keeps them (#3256). A card the person picked in the screen always wins. */
   const namedInFile=(Array.isArray(config.gpu)?config.gpu.length>0:config.gpu!==undefined&&config.gpu!==null&&config.gpu!=='')||!!config.gpu_roles;
@@ -288,13 +290,13 @@ return {summary:result.summary??'Deleted',removed:result.plan?.gb??null};}
   /* The model's own choices win over what setup wrote into the arguments: "Draft layer (MTP)" off leaves --mtp out of every start, and a picture reading that is off leaves --vision out (setup writes both again whenever it runs; the saved settings are applied here, on every load). */
   if((cfg.mtp===false||cfg.drafting==='off')&&Array.isArray(cfg.args))cfg.args=withoutDraftLayer(cfg.args);
   /* The Qwen engine's --vision stands alone, so it goes (with a picture word after it, if an older file has one). The DeepSeek engine's is a pair, `--vision on|off`, that setup wrote and the engine reads: it stays whole (taking out only the name left `off` behind: `--eos 1 off`, "unknown option off", #4358 #4359 #4505 #4507). */
-  if(!cfg.vision&&!ownEngine(config)&&Array.isArray(cfg.args))cfg.args=withoutVisionFlag(cfg.args);
+  if(!cfg.vision&&flashNextOnly(config)&&Array.isArray(cfg.args))cfg.args=withoutVisionFlag(cfg.args);
   for(const arg of cfg.args??[])if(arg.endsWith('.gguf')&&!existsSync(resolve(repo(),arg)))throw new Error('An engine argument names a missing GGUF. Restore the saved arguments or repair the files.');
   /* The app's own choice of request slots (4, fewer where the card has no room) is part of the configuration, so a tune measures the engine a load will start: slots take VRAM from the expert cache. */
-  const parallelChoice=packaged&&!ownEngine(config)?chooseParallel({config:cfg,values:args.values??{},hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
+  const parallelChoice=packaged&&flashNextOnly(config)?chooseParallel({config:cfg,values:args.values??{},hardware:snapshot.hardware?.gpus?.length?snapshot.hardware:{gpus:hardwareProbe()??[]}}):null;
   let parallelNote=null,dsNote='';
   /* The agent asks for long answers (a thinking model can use most of the window): let the engine clamp the output to what is left of the context instead of refusing the request. */
-  if(packaged&&!ownEngine(config)&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;
+  if(packaged&&flashNextOnly(config)&&cfg.fit_max_tokens===undefined)cfg.fit_max_tokens=true;
   if(parallelChoice){const applied=applyParallel(cfg,parallelChoice);for(const k of Object.keys(cfg))if(!(k in applied.cfg))delete cfg[k];Object.assign(cfg,applied.cfg);parallelNote=applied.note;}
   /* DeepSeek's Speed choice: the engine decides by itself (--experts auto: 5 when the cards total 16 GB or less, else 6), so nothing is passed unless the person chose 5 or 6. */
   if(ownEngine(config)){const list=[];const old=Array.isArray(cfg.args)?cfg.args:[];for(let i=0;i<old.length;i++){if(old[i]==='--experts'){i++;continue;}list.push(old[i]);}if(dsExpertsSupported(config)&&(cfg.ds_experts==='5'||cfg.ds_experts==='6'))list.push('--experts',cfg.ds_experts);else if(!dsExpertsSupported(config)&&old.includes('--experts'))list.splice(0,list.length,...old);cfg.args=list;delete cfg.ds_experts;
