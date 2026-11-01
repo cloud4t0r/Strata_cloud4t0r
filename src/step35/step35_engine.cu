@@ -15,6 +15,7 @@
 #include "strata/step35/block.hpp"
 #include "strata/step35/experts.hpp"
 #include "strata/step35/gemv.hpp"
+#include "strata/step35/sampler.hpp"
 #include "strata/step35/session.hpp"
 
 #include <ggml.h>
@@ -1105,7 +1106,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 /// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
-             int max_ctx, bool want_logits, int max_new, int tier_mib) {
+             int max_ctx, bool want_logits, int max_new, int tier_mib, const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1239,6 +1240,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
                 return 1;
             }
             std::vector<float> h = std::vector<float>(rows.end() - n_embd, rows.end());
+            std::vector<int> history = prompt;   // what the repetition penalty looks back at
+            Rng rng(samp.seed);
             for (int g = 0; g < max_new; ++g) {
                 std::vector<float> lg;
                 if (!kernels::head_apply(head, h.data(), lg, err)) {
@@ -1247,7 +1250,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
                     kernels::session_destroy(s);
                     return 1;
                 }
-                const int tok = argmax(lg);
+                const int tok = sample(lg, samp, history, rng);
+                history.push_back(tok);
                 const int at = pos;
                 const std::vector<int32_t> one(1, tok);
                 std::vector<float> dout;
@@ -1339,6 +1343,9 @@ void usage() {
         "      --max-new N generates N tokens greedily after them, each step's own top-1 being the next step's\n"
         "      token, and prints the per-token time.  --expert-cache MiB keeps that much of the routed experts in\n"
         "      VRAM and reads them from there; the answer is bit for bit the same, only the copies go away.\n"
+        "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
+        "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
+        "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
         "\n"
         "Nothing serves in this build: --gpu-chat runs a prompt, its --next steps and --max-new greedy tokens,\n"
         "and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
@@ -1482,7 +1489,8 @@ int run(int argc, char** argv) {
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
     bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false;
-    int64_t drafts = 3, max_new = 0, tier_mib = 0;
+    int64_t drafts = 3, max_new = 0, tier_mib = 0, top_k = 0, seed = 0;
+    double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
         // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
@@ -1526,6 +1534,16 @@ int run(int argc, char** argv) {
             mtp = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0) {
             tokens = argv[++i];
+        } else if (std::strcmp(argv[i], "--temperature") == 0) {
+            temperature = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--top-k") == 0) {
+            top_k = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--top-p") == 0) {
+            top_p = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--repeat-penalty") == 0) {
+            repeat_penalty = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--seed") == 0) {
+            seed = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--expert-cache") == 0) {
             tier_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--max-new") == 0) {
@@ -1553,12 +1571,20 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
+    // --gpu-spec stays greedy on purpose: it accepts a draft by comparing argmaxes, and drawing from a distribution
+    // would need its own rejection rule to keep the answer's distribution.  `samp` is not passed to it.
+    SamplerConfig samp;
+    samp.temperature = (float) temperature;
+    samp.top_k = (int) top_k;
+    samp.top_p = (float) top_p;
+    samp.repeat_penalty = (float) repeat_penalty;
+    samp.seed = (uint64_t) seed;
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib);
     if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
-                        (int) tier_mib);
+                        (int) tier_mib, samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
