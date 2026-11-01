@@ -25,8 +25,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -680,7 +686,8 @@ int argmax(const std::vector<float>& lg) {
 
 /// The VRAM-resident expert tier, sized from a MiB budget and the file's own expert shapes.  The shapes come from
 /// block 3 (the first mixture-of-experts block) because that is where the tensors exist.
-bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tier, std::string& err) {
+bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tier, std::string& err,
+               std::FILE* out = stdout) {
     if (mib <= 0) return true;
     const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
     size_t shard = 0;
@@ -701,10 +708,10 @@ bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tie
     }
     const int asked = n_slots;
     if (!kernels::expert_cache_open(tier, n_slots, gate_bytes, down_bytes, err)) return false;
-    std::printf("strata-step35: expert tier: %d slot(s) of %zu KB = %.2f GB of VRAM\n", tier.n_slots,
-                per_expert / 1024, (double) tier.n_slots * (double) per_expert / 1e9);
+    std::fprintf(out, "strata-step35: expert tier: %d slot(s) of %zu KB = %.2f GB of VRAM\n", tier.n_slots,
+                 per_expert / 1024, (double) tier.n_slots * (double) per_expert / 1e9);
     if (tier.n_slots < asked)   // the allocation stopped early and said why: fewer slots is still a tier
-        std::printf("strata-step35: expert tier: %s (asked for %d slot(s))\n", err.c_str(), asked);
+        std::fprintf(out, "strata-step35: expert tier: %s (asked for %d slot(s))\n", err.c_str(), asked);
     err.clear();
     return true;
 }
@@ -934,6 +941,240 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         return 0;
     } catch (const std::exception& ex) {
         std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
+/// `--serve`: the resident engine `serve/server.py` talks to.  The protocol is its own (`READY <ctx> stop`,
+/// `GEN <n> [key=value ...] <ids>`, `T <id>` per token, `PP <read> <total> <ms>` while a prompt is read, `DONE`,
+/// `STOP` to end a request early, `QUIT` to end the process), and this function speaks exactly that and nothing
+/// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
+/// prompt extends the one before decodes only what is new.
+int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib) {
+    (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        std::string err;
+        const int n_blocks = (int) file.meta().get("step35.block_count")->num();
+        const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
+        const int n_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
+        const int head_dim = (int) file.meta().get("step35.attention.key_length")->num();
+        const strata::MetaValue* swa = file.meta().get("step35.attention.sliding_window_pattern");
+        const strata::MetaValue* wv = file.meta().get("step35.attention.sliding_window");
+        const int window = wv ? (int) wv->num() : 512;
+        const strata::MetaValue* eos_v = file.meta().get("tokenizer.ggml.eos_token_id");
+        const int eos = eos_v ? (int) eos_v->num() : -1;
+        std::vector<int> windows((size_t) n_blocks, 0);
+        for (int l = 0; l < n_blocks; ++l)
+            if (swa && swa->type == strata::MetaType::ARRAY && (size_t) l < swa->items.size() &&
+                swa->items[(size_t) l].num() != 0)
+                windows[(size_t) l] = window;
+
+        kernels::ExpertCache tier;
+        if (!open_tier(file, tier_mib, tier, err, stderr)) {   // stderr: stdout is the protocol and nothing else
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
+        kernels::Session trunk;
+        if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, max_ctx, err, windows)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        kernels::Head head;
+        if (!kernels::head_open(file, head, err)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        std::printf("READY %d stop\n", max_ctx);
+        std::fflush(stdout);
+
+        // stdin on its own thread: a STOP (or a QUIT) behind a long answer must be seen while it is being written
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<std::string> queue;
+        std::atomic<bool> quit{false};
+        std::atomic<bool> stop{false};
+        std::thread reader([&] {
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (line.rfind("STOP", 0) == 0) {   // seen HERE, so a STOP during a request is not queued behind it
+                    stop = true;
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    queue.push_back(line);
+                }
+                cv.notify_one();
+            }
+            quit = true;
+            cv.notify_one();
+        });
+
+        std::vector<int32_t> cached;      // what the session holds, in order
+        std::vector<float> hidden((size_t) n_embd), out, sums;
+        std::vector<double> dsums;
+        std::vector<int32_t> prompt;
+        while (true) {
+            std::string line;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] { return !queue.empty() || quit; });
+                if (queue.empty()) break;   // EOF and nothing left
+                line = queue.front();
+                queue.pop_front();
+            }
+            if (line.rfind("QUIT", 0) == 0) break;
+            if (line.rfind("STOP", 0) == 0) {
+                stop = false;
+                continue;
+            }
+            if (line.rfind("GENI", 0) == 0) {
+                std::printf("ERR images are not supported by the step35 engine\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (line.rfind("GEN ", 0) != 0) {
+                std::printf("ERR unknown request: %s\n", line.substr(0, 40).c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            // GEN <n> [key=value ...] <id,id,...>
+            SamplerConfig samp;
+            int max_new = 0;
+            std::string field;
+            {
+                std::vector<std::string> parts;
+                size_t i = 4;
+                while (i < line.size()) {
+                    size_t j = line.find(' ', i);
+                    if (j == std::string::npos) j = line.size();
+                    parts.push_back(line.substr(i, j - i));
+                    i = j + 1;
+                }
+                size_t at = 0;
+                if (at < parts.size()) max_new = (int) std::strtol(parts[at++].c_str(), nullptr, 10);
+                for (; at + 1 < parts.size(); ++at) {
+                    const std::string& k = parts[at];
+                    if (k.find('=') == std::string::npos) break;   // the ids begin here
+                    const size_t eq = k.find('=');
+                    const std::string key = k.substr(0, eq), val = k.substr(eq + 1);
+                    if (key == "temperature") samp.temperature = (float) std::strtod(val.c_str(), nullptr);
+                    else if (key == "top_k") samp.top_k = (int) std::strtoll(val.c_str(), nullptr, 10);
+                    else if (key == "top_p") samp.top_p = (float) std::strtod(val.c_str(), nullptr);
+                    else if (key == "penalty_repeat") samp.repeat_penalty = (float) std::strtod(val.c_str(), nullptr);
+                    else if (key == "seed") samp.seed = (uint64_t) std::strtoull(val.c_str(), nullptr, 10);
+                    // every other key the server may send (min_p, frequency and presence penalties, logprobs) is
+                    // accepted and ignored: refusing one would fail a request over a knob this engine does not have
+                    if (samp.top_k > 64) samp.top_k = 64;
+                }
+                field = at < parts.size() ? parts[at] : std::string();
+            }
+            prompt.clear();
+            for (size_t i = 0; i < field.size();) {
+                size_t j = field.find(',', i);
+                if (j == std::string::npos) j = field.size();
+                prompt.push_back((int32_t) std::strtol(field.substr(i, j - i).c_str(), nullptr, 10));
+                i = j + 1;
+            }
+            if (prompt.empty()) {
+                std::printf("ERR a request needs at least one token\n");
+                std::fflush(stdout);
+                continue;
+            }
+            // the common prefix with what the session already holds: a chat turn usually appends
+            size_t keep = 0;
+            while (keep < cached.size() && keep < prompt.size() && cached[keep] == prompt[keep]) ++keep;
+            // The hidden state this function holds is the one of the LAST position it ran, which after a request is
+            // the last token it GENERATED - not the prompt's.  When the whole prompt is already cached, redo its
+            // last position so the answer is read from where it belongs; one position, not a prompt.
+            if (keep == prompt.size()) keep = prompt.size() - 1;
+            trunk.n_cached = (int) keep;   // whatever the session held past this is not part of any answer
+            cached.resize(keep);
+            const auto t0 = std::chrono::steady_clock::now();
+            bool ok = true;
+            if (keep < prompt.size()) {
+                std::printf("RESUME %zu\n", keep);   // the tokens the request reuses, before the first PP
+                std::fflush(stdout);
+                for (size_t off = keep; ok && off < prompt.size(); off += (size_t) kernels::kKvPassMax) {
+                    const size_t n = std::min((size_t) kernels::kKvPassMax, prompt.size() - off);
+                    const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
+                    std::vector<float> part;
+                    std::vector<double> csum;
+                    ok = kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &trunk, tierp);
+                    if (ok) out = part;
+                    if (ok) {
+                        const long long ms =
+                            (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+                        std::printf("PP %zu %zu %lld\n", off + n, prompt.size(), ms);
+                        std::fflush(stdout);
+                    }
+                }
+            }
+            if (!ok) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                // the cache's contents are now unknown: the next request starts from zero
+                trunk.n_cached = 0;
+                cached.clear();
+                continue;
+            }
+            hidden.assign(out.end() - n_embd, out.end());
+            cached = prompt;
+            int emitted = 0, pos = (int) prompt.size();
+            Rng rng(samp.seed);
+            std::vector<int> history = prompt;
+            while (ok && emitted < max_new) {
+                std::vector<float> lg;
+                if (!kernels::head_apply(head, hidden.data(), lg, err)) {
+                    ok = false;
+                    break;
+                }
+                const int tok = sample(lg, samp, history, rng);
+                if (eos >= 0 && tok == eos) break;
+                std::printf("T %d\n", tok);
+                std::fflush(stdout);
+                history.push_back(tok);
+                ++emitted;
+                if (stop.exchange(false)) break;
+                const std::vector<int32_t> one(1, tok);
+                std::vector<float> dout;
+                std::vector<double> one_sums;
+                if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, one_sums, err, &trunk, tierp)) {
+                    ok = false;
+                    break;
+                }
+                hidden.assign(dout.end() - n_embd, dout.end());
+                cached.push_back(tok);
+                ++pos;
+            }
+            if (!ok) {
+                std::printf("ERR %s\n", err.c_str());
+                trunk.n_cached = 0;
+                cached.clear();
+            } else {
+                std::printf("DONE\n");
+            }
+            std::fflush(stdout);
+        }
+        quit = true;
+        cv.notify_all();
+        if (reader.joinable()) reader.join();
+        if (tier.n_slots > 0)   // stderr again: the caller parses stdout
+            std::fprintf(stderr, "strata-step35: expert tier: %llu hit(s) of %llu fetch(es)\n",
+                         (unsigned long long) tier.hits, (unsigned long long) (tier.hits + tier.misses));
+        kernels::head_close(head);
+        kernels::session_destroy(trunk);
+        kernels::expert_cache_close(tier);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("ERR %s\n", ex.what());
+        std::fflush(stdout);
         return 1;
     }
 }
@@ -1311,6 +1552,11 @@ void usage() {
     std::printf(
         "strata-step35: the Step-3.7-Flash engine path (GGUF architecture step35)\n"
         "\n"
+        "  strata-step35 --serve --model <first shard> [--max-context N] [--expert-cache MiB]\n"
+        "      The resident engine serve/server.py speaks to: READY, then one GEN request per line on stdin, T per\n"
+        "      token, DONE at the end, STOP to end a request early, QUIT to exit.  Weights, cache, head and expert\n"
+        "      tier stay loaded; a request whose prompt extends the last one decodes only what is new.\n"
+        "\n"
         "  strata-step35 --inspect <first shard> [--mtp <nextn file>]\n"
         "      Read the file, print the geometry it declares and check every tensor against it.  No GPU.\n"
         "\n"
@@ -1488,7 +1734,7 @@ int run(int argc, char** argv) {
     std::string trunk, mtp, tokens, dump, next;
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
-    bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false;
+    bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false, want_serve = false;
     int64_t drafts = 3, max_new = 0, tier_mib = 0, top_k = 0, seed = 0;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
@@ -1503,6 +1749,10 @@ int run(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--inspect") == 0 || std::strcmp(argv[i], "--model") == 0 ||
             std::strcmp(argv[i], "--native") == 0) {
             trunk = argv[++i];
+        } else if (std::strcmp(argv[i], "--serve") == 0) {
+            want_serve = true;
+            // the server passes the model as a flag of its own, not as a mode: `--serve` takes no value
+            if (i + 1 < argc && argv[i + 1][0] != '-' && trunk.empty()) trunk = argv[++i];
         } else if (std::strcmp(argv[i], "--gpu-spec") == 0) {
             trunk = argv[++i];
             want_spec = true;
@@ -1581,6 +1831,7 @@ int run(int argc, char** argv) {
     samp.seed = (uint64_t) seed;
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib);
+    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib);
     if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
