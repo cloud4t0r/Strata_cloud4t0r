@@ -158,8 +158,8 @@ the same file, so a few 1e-3 per block is inside its spread.
   start needs an engine built from this branch. The app and the web page do not know the family yet either.
 - **Expert routing is host-side.** Every position of every block brings its eight expert ids back to the host, which
   copies the matrices: that round trip is what makes a CUDA graph impossible and what a device-side gather would
-  remove (measured: the copies a graph could save are 2.2-3.1% of a token, the round trip itself is inside those
-  1.97%). It is the one lever left on the per-token cost now that the tier takes the streaming.
+  remove. Measured, it is 1.97% of a token - the smallest of the three items this page has profiled, and not worth a
+  device-side router until everything above it is gone.
 - **No cache spill.** A K/V cache that outgrows VRAM has no host copy (`kv_stream.hpp` has one for the QSA layers);
   it matters above 131072 positions on a card that also wants the tier (6.7 GB at the model's 262144 maximum).
 - **One request at a time.** `--serve` answers one GEN at a time and the engine is single-device: the server's
@@ -489,6 +489,27 @@ The three remaining catalogue questions, for whoever picks this up:
    the list. The measured line for this machine is 0.68 s per token with one draft token and 12.6 GB of tier.
 3. `strata launch` offers `IQ3_XXS` for this family and for Qwen3.8-Flash-Next: quant names are not unique across
    families, so anything keyed by model name alone has to carry the family too (one test did, and said so).
+
+## The blocks' dense weights, resident: the larger half of a token
+
+`--dense-cache MiB` keeps each block's own attention and feed-forward tensors in VRAM instead of uploading and freeing
+them once per pass per block. It is the biggest single win measured on this engine, and the profile is what found it:
+with the expert tier holding the experts, **66% of a token was the dense weights being re-read**, not the experts.
+
+| flags | s/token | against the default |
+|---|---|---|
+| none | 0.818 | - |
+| `--dense-cache 2600` | **0.503** | **-39%** |
+| `--dense-cache 2600 --expert-cache 10000` | **0.264** | **-68%** |
+| the same with `--gpu-spec --drafts 1` | **0.258** | **-68%**, 4 of 5 drafts accepted |
+
+All 45 blocks fit: 1.88 GB, `45 block(s) resident, 0 streamed` (the budget is only a ceiling; a block that does not
+fit is streamed exactly as before). The tokens are identical in every row - `11111 16 455 6102 294 10322 ...` - so
+this is a place things live, not arithmetic.
+
+And speculation is now a rounding error: at 0.264 s per token a verify pass over two positions costs about as much
+as the token it saves (0.258 against 0.264, two rounds each). The 16% it measured before the caches existed came from
+the same pass overhead the dense cache has now removed.
 
 ## What a CUDA graph would be worth here, measured
 
