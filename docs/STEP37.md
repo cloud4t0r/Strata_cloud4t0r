@@ -147,9 +147,8 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **Speculation pays only at K=1.** The acceptance loop runs (`--gpu-spec`) and saves 16% with one draft token;
   two and three drafts cost more than they save, measured. See the section above.
 - **Greedy only, and no server.** `--max-new` and `--gpu-spec` both take the top-1 every step: no temperature, no
-  top-k/top-p, no repetition penalty, no stop tokens beyond the file's eos. Nothing serves requests.
-
-- **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
+  top-k/top-p, no repetition penalty; `--gpu-spec` stops on the file's eos, `--max-new` runs to the count asked for.
+  Nothing serves requests.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
   what makes it fit in 32 GB, and it is also why it is slow.

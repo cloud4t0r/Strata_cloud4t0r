@@ -937,6 +937,10 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
         }
         const double prefill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pre).count();
 
+        // the file's own end-of-sequence, not a number copied out of this prompt: a model that stops on nothing
+        // would run to --max-new every time
+        const strata::MetaValue* eos_v = file.meta().get("tokenizer.ggml.eos_token_id");
+        const int eos = eos_v ? (int) eos_v->num() : -1;
         kernels::Head head;
         kernels::MtpContext dctx;
         kernels::Session dk;
@@ -963,7 +967,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
                 n0 = argmax(lg);
             }
             pending = -1;
-            if (n0 == 128007) {   // the file's eos
+            if (eos >= 0 && n0 == eos) {
                 std::printf("  eos after %d token(s)\n", emitted);
                 break;
             }
