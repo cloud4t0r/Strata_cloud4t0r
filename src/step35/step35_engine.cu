@@ -1127,6 +1127,8 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
             hidden.assign(out.end() - n_embd, out.end());
             cached = prompt;
             int emitted = 0, pos = (int) prompt.size();
+            bool stopped = false;
+            const auto t_gen = std::chrono::steady_clock::now();
             Rng rng(samp.seed);
             std::vector<int> history = prompt;
             while (ok && emitted < max_new) {
@@ -1141,7 +1143,10 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 std::fflush(stdout);
                 history.push_back(tok);
                 ++emitted;
-                if (stop.exchange(false)) break;
+                if (stop.exchange(false)) {
+                    stopped = true;
+                    break;
+                }
                 const std::vector<int32_t> one(1, tok);
                 std::vector<float> dout;
                 std::vector<double> one_sums;
@@ -1158,7 +1163,14 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 trunk.n_cached = 0;
                 cached.clear();
             } else {
-                std::printf("DONE\n");
+                // DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <finish> - the five fields the server's
+                // _parse_done reads positionally; a bare DONE raises there and leaves the request waiting for ever
+                const long long pre_ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t_gen - t0).count();
+                const long long dec_ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_gen).count();
+                const char* finish = stopped ? "cancel" : (emitted >= max_new ? "length" : "stop");
+                std::printf("DONE %d %d %lld %lld %s\n", emitted, (int) prompt.size(), pre_ms, dec_ms, finish);
             }
             std::fflush(stdout);
         }
