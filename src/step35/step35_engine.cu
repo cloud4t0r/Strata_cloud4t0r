@@ -1750,9 +1750,10 @@ int run(int argc, char** argv) {
     int64_t drafts = 3, max_new = 0, tier_mib = 0, top_k = 0, seed = 0;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
-        // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
-        // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
-        if (std::strcmp(argv[i], "--logits") != 0 && i + 1 >= argc) {
+        // `--logits` is a switch; the flags this engine takes all take a value, so one with nothing after it is an
+        // error and not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
+        const bool is_flag = argv[i][0] == '-' && argv[i][1] != '\0';
+        if (is_flag && std::strcmp(argv[i], "--logits") != 0 && i + 1 >= argc) {
             std::printf("strata-step35: %s needs a value\n", argv[i]);
             return 2;
         }
@@ -1826,6 +1827,11 @@ int run(int argc, char** argv) {
             token = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--pos") == 0) {
             pos = std::strtoll(argv[++i], nullptr, 10);
+        } else if (is_flag && i + 1 < argc) {
+            // an option of another engine that the launcher passes anyway (--layer-split auto, --slots 2, --batch ...):
+            // skipped with its value rather than read as a model path or refused.  This engine is single-device, one
+            // request at a time, and says so in docs/STEP37.md instead of pretending otherwise.
+            ++i;
         }
     }
     if (trunk.empty()) {
