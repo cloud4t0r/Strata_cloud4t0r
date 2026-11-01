@@ -15,6 +15,7 @@
 #include "strata/step35/block.hpp"
 #include "strata/step35/experts.hpp"
 #include "strata/step35/gemv.hpp"
+#include "strata/step35/profile.hpp"
 #include "strata/step35/sampler.hpp"
 #include "strata/step35/session.hpp"
 
@@ -1531,6 +1532,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen0).count();
             std::printf("strata-step35: %d token(s) generated in %.2f s (%.3f s/token, best %.3f, worst %.3f)\n",
                         generated, total, generated ? gen_s / generated : 0.0, best, worst);
+            print_profile(total);
         }
 
         for (size_t p = 0; p * (size_t) n_embd < rows.size(); ++p) {

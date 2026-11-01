@@ -23,6 +23,7 @@
 #include "strata/step35/experts.hpp"
 #include "strata/step35/gemv.hpp"
 #include "strata/step35/kernels.hpp"
+#include "strata/step35/profile.hpp"
 #include "strata/step35/moe.hpp"
 #include "strata/step35/session.hpp"
 
@@ -537,8 +538,11 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 float* hp = d_h + (size_t) p * e;
                 ok = gemv(GGML_TYPE_F32, router, xp, logits, e, n_expert, d_q8, nullptr);
                 if (ok) moe_route(logits, sbias, 1, n_expert, top_k, exp_scale, exp_norm, ids, wts, nullptr);
-                if (ok) ok = cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess;
-                if (ok) ok = cudaMemcpy(h_w.data(), wts, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                {
+                    ProfileScope t(profile().router_calls, profile().router_ns);
+                    if (ok) ok = cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess;
+                    if (ok) ok = cudaMemcpy(h_w.data(), wts, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                }
                 if (ok) ok = cudaMemset(eacc, 0, (size_t) e * sizeof(float)) == cudaSuccess;
                 for (int k = 0; ok && k < top_k; ++k) {
                     const size_t ex = (size_t) h_ids[(size_t) k];
@@ -558,6 +562,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                         wu = slot->up;
                         wd = slot->down;
                     } else {
+                        ProfileScope t(profile().expert_calls, profile().expert_ns);
                         ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                         if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                         if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;

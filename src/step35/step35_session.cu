@@ -6,6 +6,8 @@
 // is only the ownership: one set of pools per layer, one page table per layer, and a count.
 #include "strata/step35/session.hpp"
 
+#include "strata/step35/profile.hpp"
+
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 
@@ -212,9 +214,12 @@ bool session_append(Session& s, int layer, int pos0, int n_tok, const float* kcu
         host[(size_t) j * kStepCount + kStepNKv] = pos + 1;
         host[(size_t) j * kStepCount + kStepWidth] = pos + 1;   // no selection here: the width is the prefix
     }
-    if (!cuda_ok(cudaMemcpy(s.steps, host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                 "upload positions", err))
-        return false;
+    {
+        ProfileScope t(profile().steps_calls, profile().steps_ns);
+        if (!cuda_ok(cudaMemcpy(s.steps, host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                     "upload positions", err))
+            return false;
+    }
     strata::kernels::kv_append_q8_steps(l.k_q, l.v_q, l.k_scale, l.v_scale, l.table, s.steps, kStepCount, kcur,
                                         vcur, s.n_head_kv * s.head_dim, n_tok, shapes_of(s), nullptr, nullptr);
     if (!cuda_ok(cudaGetLastError(), "append cells", err)) return false;
@@ -247,8 +252,11 @@ bool session_attend(Session& s, int layer, const float* q, float* out, int pos0,
     // One writer for the position the attention reads: the last row's.  A per-row host scalar would freeze at the
     // first row in a captured graph, which is exactly the failure qsa.hpp's step buffer exists to prevent.
     const int32_t last = pos0 + n_tok - 1;
-    if (!cuda_ok(cudaMemcpy(s.step, &last, sizeof(int32_t), cudaMemcpyHostToDevice), "upload position", err))
-        return false;
+    {
+        ProfileScope t(profile().position_calls, profile().position_ns);
+        if (!cuda_ok(cudaMemcpy(s.step, &last, sizeof(int32_t), cudaMemcpyHostToDevice), "upload position", err))
+            return false;
+    }
 
     KvQ8View kv;
     kv.k_q = l.k_q;
