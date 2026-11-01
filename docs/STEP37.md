@@ -149,17 +149,21 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **Sampling only in `--max-new`, only greedy in `--gpu-spec`.** `--temperature`, `--top-k`, `--top-p`,
   `--repeat-penalty` and `--seed` work in the generation loop; the speculative one takes the top-1 because accepting
   a draft drawn from a distribution needs its own rejection rule, which is not written. `--gpu-spec` stops on the
-  file's eos, `--max-new` runs to the count asked for. Nothing serves requests.
+  file's eos, `--max-new` runs to the count asked for. Serving samples, because it goes through the same loop.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
 - **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
   package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
   start needs an engine built from this branch. The app and the web page do not know the family yet either.
-- **The cache is not streamed and not captured.** A cache that outgrows VRAM has no host copy yet
-  (`kv_stream.hpp` has one for the QSA layers), and the position still crosses to the device as a 4-byte H2D copy,
-  so the pass is not a CUDA graph. A decode step is a full pass over 45 blocks - 0.96 s, most of it the
-experts streamed out of the file.
+- **Expert routing is host-side.** Every position of every block brings its eight expert ids back to the host, which
+  copies the matrices: that round trip is what makes a CUDA graph impossible and what a device-side gather would
+  remove (measured: the copies a graph could save are 2.2-3.1% of a token, the round trip itself is inside those
+  1.97%). It is the one lever left on the per-token cost now that the tier takes the streaming.
+- **No cache spill.** A K/V cache that outgrows VRAM has no host copy (`kv_stream.hpp` has one for the QSA layers);
+  it matters above 131072 positions on a card that also wants the tier (6.7 GB at the model's 262144 maximum).
+- **One request at a time.** `--serve` answers one GEN at a time and the engine is single-device: the server's
+  slots and `--layer-split` are accepted and ignored, not implemented.
 
 ## The KV cache: what it is, and what it cost
 
