@@ -144,11 +144,11 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 ## What does not work yet
 
-- **MTP drafts, but nothing uses them.** The three NextN blocks run (`--gpu-mtp`, and `--ref --mtp` on the CPU) and
-  propose tokens, and `--gpu-chat --max-new N` generates greedily. What is missing is the part that turns a draft
-  into a speed-up: no acceptance loop, and no sampler beyond the argmax. See the section below.
-- **Greedy only.** `--max-new` takes the top-1 every step: no temperature, no top-k/top-p, no repetition penalty,
-  no stop tokens. A sequence that never emits EOS simply runs to the count asked for.
+- **Speculation pays only at K=1.** The acceptance loop runs (`--gpu-spec`) and saves 16% with one draft token;
+  two and three drafts cost more than they save, measured. See the section above.
+- **Greedy only, and no server.** `--max-new` and `--gpu-spec` both take the top-1 every step: no temperature, no
+  top-k/top-p, no repetition penalty, no stop tokens beyond the file's eos. Nothing serves requests.
+
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
@@ -294,6 +294,39 @@ Against the CPU reference the two paths answer the **same top-1 on all three hea
 0.3% (2.5716 against 2.5731, 3.5184 against 3.5215, 3.3113 against 3.3220) and the third to fifth places swapping
 on near-ties - a Q8_0 file against a float32 host, which is the size of the difference the page quotes everywhere
 else.
+
+## Speculative decoding, and why K=1
+
+```sh
+strata-step35 --gpu-spec <first shard> --mtp <NextN file> --tokens "..." --max-new N [--drafts K]
+```
+
+One block at a time: the NextN heads draft K tokens, **one** trunk pass over the K+1 positions
+(`n0, d1 .. dK`) checks them, and the longest prefix the trunk agrees with is kept - the trunk's own token at the
+first rejection is the correction, and it opens the next block. The emitted tokens are **exactly greedy's**; only
+the time changes. The NextN weights are resident (their three blocks and three heads are 3.7 GB) because a draft
+that re-uploads them costs four trunk steps; with them open a draft is **4 ms**.
+
+Measured on this machine, 45 blocks, the prompt `0,671,6102,294,8760,344`, eight tokens, two rounds each:
+
+| | s/token | against greedy | drafts accepted |
+|---|---|---|---|
+| greedy (`--max-new`), round 1 / 2 | 0.811 / 0.809 | - | - |
+| `--drafts 1` | **0.680 / 0.679** | **-16%** | 4 of 5 (80%) |
+| `--drafts 2` | 1.029 | +27% | 4 of 10 (40%) |
+| `--drafts 3` | 1.277 | +57% | 4 of 15 (27%) |
+
+All four runs emit the same eight tokens, `11111 16 455 6102 294 10322 344 17575`. So speculation here is a
+**16% saving with one draft token and a loss beyond that**, and the arithmetic says why rather than the numbers
+merely showing it: a pass costs its position count (5.086 s for 10 positions, 0.509 s each) because every position
+re-reads the experts it routes to, while a block emits `1 + accepted` tokens for `K + 1` position-visits. K=1 pays
+when the first head is right more than about 13% of the time - it was right 80% here. K=3 would need the chained
+heads to carry their own weight, and they do not: block 45 answers 3 of 3, blocks 46 and 47 about 1 in 6 (see the
+table above), so the extra two positions per block buy a quarter of a token.
+
+Two limits, stated plainly: this is eight tokens on one prompt, so the 16% is the shape of the result and not a
+benchmark; and the saving is bounded by the trunk's per-position cost, which is the expert streaming, not the
+batch overhead. A VRAM expert cache would move that bound; nothing in the draft heads can.
 
 ## Tests
 
