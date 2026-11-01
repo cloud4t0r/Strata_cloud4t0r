@@ -300,6 +300,31 @@ Against the CPU reference the two paths answer the **same top-1 on all three hea
 on near-ties - a Q8_0 file against a float32 host, which is the size of the difference the page quotes everywhere
 else.
 
+## Which expert a full tier replaces
+
+`--tier-policy fifo|lru|lfu`, default **lru**. The tier evicts an expert when it fills; FIFO walks its ring, LRU takes
+the one fetched longest ago, LFU the one fetched least often. The routing is skewed, so the choice is worth a lot:
+same VRAM, same code, 24 tokens, prompt `0,671,6102,294,8760,344`.
+
+| tier | fifo | **lru** | lfu |
+|---|---|---|---|
+| 4 GB | 0.524 s/token, 37.2% of fetches served | **0.329 s/token, 41.7%** | 0.340 s/token, 39.2% |
+| 8 GB | 0.262 s/token, 57.6% | **0.220 s/token, 67.6%** | 0.238 s/token, 63.4% |
+
+LRU is 37% faster than FIFO at 4 GB and 16% at 8 GB, on the same hit-rate arithmetic - which is why it is the default
+and not an option. The choice is a linear scan over the slots on a miss, nothing beside the 5.9 MB copy it decides.
+
+The ladder it produces, all at 24 tokens:
+
+| flags | s/token | against the default |
+|---|---|---|
+| none | 0.798 | - |
+| `--dense-cache 2600` | 0.483 | -39% |
+| `+ --expert-cache 4000` | 0.330 | -59% |
+| `+ --expert-cache 8000` | 0.220 | -72% |
+| `+ --expert-cache 12000` | **0.200** | **-75%** |
+| `+ --expert-cache 10000 --gpu-spec --drafts 1` | 0.253 | -68% |
+
 ## Speculative decoding, and why K=1
 
 ```sh
@@ -507,9 +532,9 @@ All 45 blocks fit: 1.88 GB, `45 block(s) resident, 0 streamed` (the budget is on
 fit is streamed exactly as before). The tokens are identical in every row - `11111 16 455 6102 294 10322 ...` - so
 this is a place things live, not arithmetic.
 
-And speculation is now a rounding error: at 0.264 s per token a verify pass over two positions costs about as much
-as the token it saves (0.258 against 0.264, two rounds each). The 16% it measured before the caches existed came from
-the same pass overhead the dense cache has now removed.
+And speculation no longer pays at all: 0.253 s per token with one draft token against **0.200** for plain greedy with
+the same caches. The 16% it measured before the caches existed came from the pass overhead the dense cache removes,
+and once that is gone a verify pass over two positions costs more than the token it saves.
 
 ## What a CUDA graph would be worth here, measured
 
