@@ -150,8 +150,8 @@ the same file, so a few 1e-3 per block is inside its spread.
   top-k/top-p, no repetition penalty; `--gpu-spec` stops on the file's eos, `--max-new` runs to the count asked for.
   Nothing serves requests.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
-- **No streaming pool.** Every expert is copied per token into three reused buffers, with no VRAM cache: this is
-  what makes it fit in 32 GB, and it is also why it is slow.
+- **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
+  policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
 - **No integration.** `setup.py`, `strata launch --family step35`, the app and `serve` know nothing about the
   family yet. `strata` dispatches a `step35` file to `strata-step35`, and that is all.
 - **The cache is not streamed and not captured.** A cache that outgrows VRAM has no host copy yet
@@ -326,6 +326,43 @@ table above), so the extra two positions per block buy a quarter of a token.
 Two limits, stated plainly: this is eight tokens on one prompt, so the 16% is the shape of the result and not a
 benchmark; and the saving is bounded by the trunk's per-position cost, which is the expert streaming, not the
 batch overhead. A VRAM expert cache would move that bound; nothing in the draft heads can.
+
+## The VRAM expert tier
+
+```sh
+strata-step35 --gpu-chat <first shard> --tokens "..." --max-new N --expert-cache MiB
+strata-step35 --gpu-spec <first shard> --mtp <file> --tokens "..." --max-new N --expert-cache MiB
+```
+
+Every position copies the eight experts it routes to out of the file, for each of the 42 mixture-of-experts blocks:
+~2.2 GB of movement per position, and that is the whole cost of a token. `--expert-cache` keeps as many of those
+experts as the MiB allow in VRAM (`src/step35/step35_experts.cu`: a slot ring, one expert's gate/up/down per slot,
+and a residency table `(block, expert) -> slot`), so a position reads them where they are. Eviction is FIFO over
+the ring: with 45 blocks between two visits to the same block, an exact recency order costs more than it saves.
+
+A hit and a miss compute the same bits - the tier moves bytes, never numbers - and the measured renders are
+identical to the digit with the tier on and off (position 9: rms 14.219030, first four -5.773189 -4.102162 -5.326063
+-8.670106 either way).
+
+Measured on this machine (2 x 16 GB, IQ3_XXS: 5880 KB per expert, 45 blocks):
+
+| tier | generation, 9 tokens | hit rate | vs no tier |
+|---|---|---|---|
+| off | 0.811 s/token | - | - |
+| 4 GB | 0.684 s/token | 33.1% | -16% |
+| 8 GB | 0.605 s/token | 46.9% | -25% |
+| 12 GB | **0.559 s/token** | 55.0% | **-31%** |
+
+and on a 10-position pass, 0.509 s per position without the tier against **0.356** with 8 GB (44.3% of the fetches
+served). Combined with one draft token (`--gpu-spec --drafts 1 --expert-cache 12000`) the same nine tokens come out
+in **0.407 s/token**: **-50% against greedy without the tier**, same tokens, 54.6% of fetches served.
+
+The size is the whole of what it buys: 12.58 GB of a 17.16 GB card leaves room for a 0.3 GB cache at 8192 positions
+and the working buffers, and a request larger than the card holds stops early and says so
+(`out of device memory after 2723 expert slot(s)`), after which the session that needs the rest fails with a message
+that names the tier. Nothing about the policy is learned: no routing hint, no per-layer sizing, no promotion across
+two cards - the engine's other families carry all three (`include/strata/core/expert_cache.hpp`) and none of it is
+wired here yet.
 
 ## Tests
 
