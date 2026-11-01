@@ -153,6 +153,11 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
+- **The app shows it, and does not manage it yet.** The family appears in the app's model list (its entry is in
+  `setup.py`'s table, which the app reads through `tools/strata_mcp.py`), with the short name `Step-3.7 IQ3_XXS`. What
+  the app cannot do is start it: `--start` goes through the engine package from the update feed, which does not carry
+  this branch's `--serve` for step35 (see below), and the app's Flash-Next-only additions (request slots, the RAM
+  budget, the resource profile) are now skipped for it the way they are for DeepSeek's engine.
 - **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
   package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
   start needs an engine built from this branch. The app and the web page do not know the family yet either.
