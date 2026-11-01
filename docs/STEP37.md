@@ -153,9 +153,9 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
-- **No launcher, no app.** The engine speaks the serve protocol (`--serve`, above) and `strata` dispatches a
-  `step35` file to it, but `strata launch --family step35`, `setup.py`, the app and the web page know nothing about
-  the family, and a hand-written server config does not work (the server restarts the engine it just accepted).
+- **No launcher, no app.** The engine speaks the serve protocol (`--serve`, above) and answers `serve/server.py`
+  from a hand-written config, but `strata launch --family step35`, `setup.py`, the app and the web page know nothing
+  about the family, so nobody is offered it.
 - **The cache is not streamed and not captured.** A cache that outgrows VRAM has no host copy yet
   (`kv_stream.hpp` has one for the QSA layers), and the position still crosses to the device as a 4-byte H2D copy,
   so the pass is not a CUDA graph. A decode step is a full pass over 45 blocks - 0.96 s, most of it the
@@ -411,7 +411,7 @@ else on stdout:
 | `RESUME <n>` | per request: how many of its prompt tokens were already cached |
 | `PP <read> <total> <ms>` | after each prefill chunk of up to 1024 positions |
 | `T <id>` | one per generated token, flushed |
-| `DONE` | the request is finished (or stopped) |
+| `DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <finish>` | the request is finished; `finish` is `length`, `stop` or `cancel` - the five fields are positional and a bare `DONE` raises in the server, leaving the request waiting for ever (measured) |
 | `ERR <message>` | it could not be; the cache is dropped and the next request starts from zero |
 
 and on stdin: `GEN <n> [key=value ...] <id,id,...>` with the server's key names (`temperature`, `top_p`, `top_k`,
@@ -431,12 +431,23 @@ printf 'GEN 4 0,671,6102,294,8760,344\nGEN 3 0,671,6102,294,8760,344,11111\nQUIT
 
 and `GEN 40 ...` followed by `STOP` answers five tokens then `DONE`.
 
-**What does not work yet: pointing `serve/server.py` at it.** With a hand-written config (exe = `strata`, args =
-`--model ... --max-context 8192 --expert-cache 4000`) the server starts the engine, reads `READY`, and then starts
-it *again*, leaving the previous one holding its VRAM, until the allocation fails - the server restarts an engine it
-has just accepted. The supported path is a config that `strata launch` writes, with the capability flags the server
-probes for, and that launcher entry is the piece still missing: `strata launch --family step35`, `setup.py`, the app
-and the web page know nothing about this family.
+**It works end to end against `serve/server.py`.** With a config written by hand - `exe` = `strata`, `args` =
+`--model <first shard> --max-context 8192 --expert-cache 4000`, `tokenizer` = the model folder's `tokenizer/`,
+`arch` = `step35` - the server reaches `loaded: true` in 3 s and answers OpenAI-shaped requests:
+
+```
+POST /v1/chat/completions  {"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}
+-> HTTP 200 in 15.6 s, 16 completion tokens, finish "length"
+   reasoning_content: "Got it, let's see. The user just said \"Hello\". First I ..."
+```
+
+twice, the same text both times (greedy), the second in 10.9 s. The `content` is empty because this model answers in
+its reasoning block first, which the server routes to `reasoning_content` - that is the server's parsing, not a
+fault in this engine.
+
+What is still missing is the step before: a config **written by the launcher** rather than by hand, i.e.
+`strata launch --family step35`, `setup.py`, the app and the web page. Until then the family is served by pointing
+those four fields at the files yourself.
 
 ## Tests
 
