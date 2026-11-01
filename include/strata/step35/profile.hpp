@@ -18,6 +18,7 @@ struct Profile {
     uint64_t router_calls = 0, router_ns = 0;       ///< the routed ids and weights, D2H, per position per block
     uint64_t expert_calls = 0, expert_ns = 0;       ///< the three matrices of one expert, H2D (no tier)
     uint64_t steps_calls = 0, steps_ns = 0;         ///< a pass's positions, H2D, once per layer
+    uint64_t block_calls = 0, block_ns = 0;         ///< one block's dense weights, uploaded per pass and per layer
 };
 
 bool profiling();                        ///< STRATA_STEP35_PROFILE=1

@@ -359,7 +359,7 @@ bool logits_last(const strata::GgufModel& file, const float* h, std::vector<floa
 
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,
                       int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session, ExpertCache* experts) {
+                      Session* session, ExpertCache* experts, DenseCache* blocks) {
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
     const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
@@ -387,8 +387,20 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
 
     for (int layer = 0; layer < n_blocks; ++layer) {
         const bool is_moe = layer >= dense_layers;
+        // the dense weights: resident when the cache holds this block (2 GB buys the larger half of a pass), uploaded
+        // and freed here when it does not
         DenseBlock b;
-        if (!upload_block(file, layer, b, err, !is_moe)) return false;
+        bool own_block = true;
+        {
+            ProfileScope t(profile().block_calls, profile().block_ns);
+            const DenseBlock* kept = blocks ? dense_cache_get(*blocks, layer, !is_moe, err) : nullptr;
+            if (kept != nullptr) {
+                b = *kept;
+                own_block = false;
+            } else if (!upload_block(file, layer, b, err, !is_moe)) {
+                return false;
+            }
+        }
         const int hd = b.head_dim, nh = b.n_head, nkv = b.n_head_kv;
         // The q8_1 scratch, for the WIDEST input this block quantizes - not for n_embd.  `proj` quantizes up to
         // kMaxCols columns of an n_in-wide input and n_in is not always n_embd: the FFN down projection reads the
@@ -591,7 +603,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         for (void* p : {(void*) x, (void*) q, (void*) k, (void*) v, (void*) ao, (void*) gt, (void*) res,
                         (void*) g, (void*) u, (void*) act, (void*) d, (void*) dpq, (void*) dpk, d_q8})
             if (p) cudaFree(p);
-        release_block(b);
+        if (own_block) release_block(b);
         if (!ok) return false;
         // what this block handed on, summed over every position: the figure the reference prints
         std::vector<float> check((size_t) n_pos * e);

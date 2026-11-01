@@ -70,6 +70,72 @@ __global__ void k_add(float* x, const float* y, int n) {
 
 }  // namespace
 
+/// The bytes one block's tensors take on the card: the payloads `upload_block` copies, plus the norms and the rope
+/// table (small, and counted so the budget means something).
+size_t block_bytes(const strata::GgufModel& file, int layer, bool with_ffn) {
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    size_t total = 0;
+    for (const char* name : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_gate.weight",
+                             "attn_norm.weight", "ffn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                             "rope_freqs.weight"})
+        if (const strata::TensorInfo* t = file.find(pre + name)) total += strata::tensor_payload_bytes(*t);
+    if (with_ffn)
+        for (const char* name : {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+            if (const strata::TensorInfo* t = file.find(pre + name)) total += strata::tensor_payload_bytes(*t);
+    if (const strata::TensorInfo* t = file.find("rope_freqs.weight")) total += strata::tensor_payload_bytes(*t);
+    return total;
+}
+
+bool dense_cache_open(DenseCache& c, const strata::GgufModel& file, int n_layers, size_t budget, std::string& err) {
+    if (n_layers <= 0) {
+        err = "a dense cache needs layers";
+        return false;
+    }
+    c.file = &file;
+    c.blocks.assign((size_t) n_layers, DenseBlock{});
+    c.ready.assign((size_t) n_layers, 0);
+    c.budget = budget;
+    c.used = 0;
+    c.kept = c.streamed = 0;
+    (void) err;
+    return true;
+}
+
+const DenseBlock* dense_cache_get(DenseCache& c, int layer, bool with_ffn, std::string& err) {
+    if (layer < 0 || layer >= (int) c.blocks.size()) {
+        err = "a block outside the dense cache";
+        return nullptr;
+    }
+    if (c.ready[(size_t) layer]) return &c.blocks[(size_t) layer];
+    const size_t bytes = block_bytes(*c.file, layer, with_ffn);
+    // a block that would not fit is streamed: the caller uploads it itself and releases it after this layer
+    if (c.used + bytes > c.budget) {
+        ++c.streamed;
+        return nullptr;
+    }
+    if (!upload_block(*c.file, layer, c.blocks[(size_t) layer], err, with_ffn)) return nullptr;
+    c.ready[(size_t) layer] = 1;
+    c.used += bytes;
+    ++c.kept;
+    return &c.blocks[(size_t) layer];
+}
+
+void dense_cache_done(DenseCache& c, int layer, DenseBlock& streamed) {
+    (void) c;
+    (void) layer;
+    release_block(streamed);   // only ever called on a block this call uploaded itself
+}
+
+void dense_cache_close(DenseCache& c) {
+    for (size_t l = 0; l < c.blocks.size(); ++l)
+        if (c.ready[l]) release_block(c.blocks[(size_t) l]);
+    c.blocks.clear();
+    c.ready.clear();
+    c.used = 0;
+    c.kept = c.streamed = 0;
+    c.file = nullptr;
+}
+
 bool upload_block(const GgufModel& file, int layer, DenseBlock& b, std::string& err, bool with_ffn) {
     try {
         const std::string p = "step35.";

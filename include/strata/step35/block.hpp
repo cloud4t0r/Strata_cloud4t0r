@@ -24,6 +24,7 @@ namespace strata::step35::kernels {
 
 struct Session;     // the quantized K/V cache, session.hpp (forward: only a pointer crosses here)
 struct ExpertCache;  // the VRAM-resident expert tier, experts.hpp (same: a pointer)
+struct DenseCache;   // the blocks' resident dense weights, defined below (same: a pointer)
 
 /// The device buffers of one dense block, uploaded from the file.  Freed by release().
 struct DenseBlock {
@@ -96,7 +97,7 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n
 /// from it instead of copied out of the file.  A hit and a miss compute the same bits - only the copy goes away.
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
                       std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session = nullptr, ExpertCache* experts = nullptr);
+                      Session* session = nullptr, ExpertCache* experts = nullptr, DenseCache* blocks = nullptr);
 
 /// The vocabulary logits of ONE position: `h` is one row of the last block's output on the HOST (n_embd floats),
 /// `logits` receives the file's `output.weight` applied to `rms_norm(h, output_norm)` - n_vocab floats, also on the
@@ -172,6 +173,25 @@ bool mtp_open(const strata::GgufModel& mtp, MtpContext& ctx, std::string& err);
 bool mtp_step(MtpContext& ctx, int k, int slot, int pos, int32_t token, const float* h, Session* cache,
               std::vector<float>& h_nextn, std::vector<float>& logits, std::string& err);
 void mtp_close(MtpContext& ctx);
+
+/// The blocks' DENSE weights, resident.  A pass uploads and frees one block's attention and feed-forward tensors per
+/// layer, which the profile measures at 66% of a token once the expert tier holds the experts - the dense part is only
+/// ~2 GB for all 45 blocks, so keeping it costs little and removes the larger half of a pass.
+struct DenseCache {
+    const strata::GgufModel* file = nullptr;
+    std::vector<DenseBlock> blocks;
+    std::vector<char> ready;      ///< 1: `blocks[layer]` is uploaded and must not be released
+    size_t budget = 0, used = 0;  ///< bytes this cache may hold, and what it holds
+    int kept = 0, streamed = 0;   ///< layers resident, layers too big for the budget
+};
+
+/// Uploads a block into `cache` when it fits, up to `budget` bytes; a block that does not fit is streamed as before.
+bool dense_cache_open(DenseCache& c, const strata::GgufModel& file, int n_layers, size_t budget, std::string& err);
+/// The block's tensors: the cached copy when it fits, otherwise a freshly uploaded one that `dense_cache_done` releases.
+const DenseBlock* dense_cache_get(DenseCache& c, int layer, bool with_ffn, std::string& err);
+/// Releases the block only if it was uploaded for this call (a cached one stays).
+void dense_cache_done(DenseCache& c, int layer, DenseBlock& streamed);
+void dense_cache_close(DenseCache& c);
 
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the
