@@ -486,6 +486,36 @@ The three remaining catalogue questions, for whoever picks this up:
 3. `strata launch` offers `IQ3_XXS` for this family and for Qwen3.8-Flash-Next: quant names are not unique across
    families, so anything keyed by model name alone has to carry the family too (one test did, and said so).
 
+## What a CUDA graph would be worth here, measured
+
+The page used to say the pass is not a graph "because the position crosses as a 4-byte H2D copy". That is a reason it
+cannot be captured, and no reason at all that capturing it would be faster. `STRATA_STEP35_PROFILE=1` times the four
+kinds of copy a token makes, per layer and per position (six tokens, prompt `0,671,6102,294,8760,344`, 45 blocks):
+
+| what | calls | time | of the wall |
+|---|---|---|---|
+| the position, 4 bytes H2D (per block per pass) | 315 | 7.8 ms | **0.22%** |
+| the router's ids and weights, D2H (per block per position) | 504 | 69.3 ms | **1.97%** |
+| a pass's positions, H2D (per block per pass) | 315 | 32.1 ms | 0.91% |
+| the three matrices of one expert, H2D - with the tier off | 4032 | 5141.6 ms | 145% of 3.5 s... and 103% of the 4.97 s it took |
+
+Read the last line carefully: the expert copies are synchronous, so their time includes waiting for the kernels in
+front of them, and the sum can exceed the wall clock. What it says is not a precise figure but a direction: without
+the tier those copies *are* the token - with 12 GB of tier there are none left and a token goes from 0.817 s to
+0.577 s.
+
+So everything a graph could remove - the position, the router's round trip, the position array - is **2.2% to 3.1%**
+of a token, and the thing that costs is the expert streaming, which the tier already removes. A captured graph is
+also unreachable today for a reason that is not the 4-byte copy: **the router's ids come back to the host for every
+position of every block**, and the host chooses the eight experts to copy. Capture needs that decision on the device,
+which is the same work a device-side expert gather would need - and that, not the graph, is what would move the
+number.
+
+The other half of the item, streaming the K/V cache to the host, is bounded by the same arithmetic the page already
+gives: 12 full blocks at 2112 bytes per position plus a 0.11 GB ring, so 3.43 GB at 131072 and 6.7 GB at the model's
+maximum 262144. An 8 GB card holds the cache at 131072 without a tier; the spill would matter above that, or on a
+small card that wants the tier instead. Nothing is built for it, and nothing measured here would be improved by it.
+
 ## Tests
 
 ```sh
