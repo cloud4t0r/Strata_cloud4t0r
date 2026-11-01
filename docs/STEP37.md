@@ -146,9 +146,10 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 - **Speculation pays only at K=1.** The acceptance loop runs (`--gpu-spec`) and saves 16% with one draft token;
   two and three drafts cost more than they save, measured. See the section above.
-- **Greedy only, and no server.** `--max-new` and `--gpu-spec` both take the top-1 every step: no temperature, no
-  top-k/top-p, no repetition penalty; `--gpu-spec` stops on the file's eos, `--max-new` runs to the count asked for.
-  Nothing serves requests.
+- **Sampling only in `--max-new`, only greedy in `--gpu-spec`.** `--temperature`, `--top-k`, `--top-p`,
+  `--repeat-penalty` and `--seed` work in the generation loop; the speculative one takes the top-1 because accepting
+  a draft drawn from a distribution needs its own rejection rule, which is not written. `--gpu-spec` stops on the
+  file's eos, `--max-new` runs to the count asked for. Nothing serves requests.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
@@ -364,13 +365,42 @@ that names the tier. Nothing about the policy is learned: no routing hint, no pe
 two cards - the engine's other families carry all three (`include/strata/core/expert_cache.hpp`) and none of it is
 wired here yet.
 
+## Sampling
+
+```sh
+strata-step35 --gpu-chat <shard> --tokens "..." --max-new N --temperature 0.8 --top-p 0.9 --seed 1
+strata-step35 --gpu-chat <shard> --tokens "..." --max-new N --top-k 40 --repeat-penalty 1.1
+```
+
+`--temperature` defaults to 0, which is the argmax and ignores every other knob - so the default path is the one it
+was, and the sequence a command emitted before this exists is the sequence it emits now. The filters run in
+llama.cpp's order, which matters: repetition penalty over the last 64 tokens (a positive logit divided, a negative
+one multiplied, so the penalty always pushes a repeat down), then temperature, then top-k, then the nucleus, then
+the draw. A penalty applied after the filters would push mass back into tokens the filters had just removed.
+
+The arithmetic is host code (`src/step35/step35_sampler.cpp`) over the logits that were already copied back: a sort
+of 128 896 floats is about 10 ms, a little over 1% of a token here, and it keeps the sampler divisible and testable
+without a card.
+
+`step35_sample_test` (ctest, no GPU) holds it to arithmetic rather than to a mood: greedy answers the argmax even
+with `top_k`, `top_p` and a penalty set; `top_k 1` and a 100-logit lead are never lost to the draw; temperature 1 is
+the softmax to 0.0e+00; **60 000 draws** of a three-way distribution land within 1.7e-03 of it; `top_p 0.5` over
+logits `{1,3,2}` never draws the tail and renormalises to 1.000000; a penalty of 2 halves a repeated token
+(0.6652 -> 0.3072) and multiplies a negative one (0.0179 -> 0.0066); one seed gives one stream and another gives
+another.
+
+On the release, prompt `0,671,6102,294,8760,344`, eight tokens: greedy gives `11111 16 455 6102 294 10322 344 17575`;
+`--temperature 0.8 --top-p 0.9 --seed 1` gives `11111 603 671 6102 294 10322 344 17575`, the same command replayed
+gives it again, and `--seed 2` gives `11111 16 1884 850 1951 377 8760 14`. That is the sampler working and the
+stream reproducible, not a quality claim: eight tokens say nothing about whether those tokens are good.
+
 ## Tests
 
 ```sh
 ctest -R step35
 ```
 
-Six tests, none of which needs the 76 GB download:
+Seven tests, none of which needs the 76 GB download:
 
 - `step35_metadata_test` - the family, the guard, and five files the guard must refuse (synthetic).
 - `step35_rope_parity` - NEOX pairing and the frequency factors, **bit for bit** against a float64 host; and a
@@ -382,6 +412,7 @@ Six tests, none of which needs the 76 GB download:
 - `step35_attn_parity` - causal GQA with the sliding window, over both head counts, and two 520-position
   cases past the 512 keys the kernel used to hold in shared memory (they fail on the previous kernel:
   3.5e-04 and 4.5e-03).
+- `step35_sample_test` - the sampler, against arithmetic and its own statistics (see above).
 - `step35_kv_parity` - the cache: the `int8` cell compared code by code and scale by scale with a host that
   applies kv_q8's rule; the attention over the dequantized cells at both head counts; a decode row **bit for bit**
   the prefill's row; a **permuted** page table at 8 cells per page that changes nothing; a decode row at
