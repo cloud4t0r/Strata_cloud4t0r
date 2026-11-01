@@ -25,6 +25,7 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t do
     c.gate_bytes = gate_bytes;
     c.down_bytes = down_bytes;
     c.slots.assign((size_t) n_slots, ExpertSlot{});
+    c.fetches.assign((size_t) n_slots, 0);
     c.where.clear();
     c.where.reserve((size_t) n_slots * 2);
     for (int i = 0; i < n_slots; ++i) {
@@ -51,7 +52,16 @@ void expert_cache_close(ExpertCache& c) {
     }
     c.slots.clear();
     c.where.clear();
+    c.fetches.clear();
     c.n_slots = 0;
+}
+
+bool expert_cache_policy(ExpertCache& c, const std::string& name) {
+    if (name == "fifo") c.policy = TierPolicy::Fifo;
+    else if (name == "lru") c.policy = TierPolicy::Lru;
+    else if (name == "lfu") c.policy = TierPolicy::Lfu;
+    else return false;
+    return true;
 }
 
 ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint8_t* gate_src, const uint8_t* up_src,
@@ -70,9 +80,25 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
         hit = true;
         return &s;
     }
-    // a miss: take the ring's next slot, and forget whatever it held
+    // a miss: pick the slot to reuse.  FIFO walks the ring; LRU takes the least recently filled and LFU the least
+    // often filled (ties to the oldest).  The scan is over the slots, once per miss, and the routing is what it is
+    // worth optimising for: a linear pass over a few thousand slots is nothing beside the 5.9 MB copy that follows.
     ++c.misses;
     int idx = (int) (c.misses - 1) % c.n_slots;
+    if (c.policy != TierPolicy::Fifo) {
+        int best = 0;
+        for (int i = 0; i < c.n_slots; ++i) {
+            const ExpertSlot& s = c.slots[(size_t) i];
+            const ExpertSlot& b = c.slots[(size_t) best];
+            const bool better = c.policy == TierPolicy::Lru ? s.used < b.used
+                               : c.policy == TierPolicy::Lfu ? (c.fetches[(size_t) i] < c.fetches[(size_t) best] ||
+                                                                (c.fetches[(size_t) i] == c.fetches[(size_t) best] &&
+                                                                 s.used < b.used))
+                                                             : false;
+            if (better) best = i;
+        }
+        idx = best;
+    }
     ExpertSlot& s = c.slots[(size_t) idx];
     if (s.key >= 0) {
         c.where.erase(s.key);   // the key leaves with the bytes: a stale entry would send a fetch to a reused slot
@@ -88,6 +114,7 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
     }
     s.key = key;
     s.used = ++c.clock;
+    ++c.fetches[(size_t) idx];
     c.where[key] = idx;
     return &s;
 }

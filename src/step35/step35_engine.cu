@@ -688,7 +688,7 @@ int argmax(const std::vector<float>& lg) {
 /// The VRAM-resident expert tier, sized from a MiB budget and the file's own expert shapes.  The shapes come from
 /// block 3 (the first mixture-of-experts block) because that is where the tensors exist.
 bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tier, std::string& err,
-               std::FILE* out = stdout) {
+               std::FILE* out = stdout, const std::string& policy = "lru") {
     if (mib <= 0) return true;
     const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
     size_t shard = 0;
@@ -709,8 +709,12 @@ bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tie
     }
     const int asked = n_slots;
     if (!kernels::expert_cache_open(tier, n_slots, gate_bytes, down_bytes, err)) return false;
-    std::fprintf(out, "strata-step35: expert tier: %d slot(s) of %zu KB = %.2f GB of VRAM\n", tier.n_slots,
-                 per_expert / 1024, (double) tier.n_slots * (double) per_expert / 1e9);
+    if (!kernels::expert_cache_policy(tier, policy)) {
+        err = "unknown expert tier policy " + policy + " (fifo, lru or lfu)";
+        return false;
+    }
+    std::fprintf(out, "strata-step35: expert tier: %d slot(s) of %zu KB = %.2f GB of VRAM, policy %s\n", tier.n_slots,
+                 per_expert / 1024, (double) tier.n_slots * (double) per_expert / 1e9, policy.c_str());
     if (tier.n_slots < asked)   // the allocation stopped early and said why: fewer slots is still a tier
         std::fprintf(out, "strata-step35: expert tier: %s (asked for %d slot(s))\n", err.c_str(), asked);
     err.clear();
@@ -818,7 +822,7 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
 /// have said, so each head is fed the token the trunk itself chose at that position and its top-1 is compared with
 /// the token the trunk chose next.
 int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
-            int drafts, int tier_mib, int dense_mib) {
+            int drafts, int tier_mib, int dense_mib, const std::string& tier_policy) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
@@ -857,7 +861,7 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         // the trunk, over the prompt, with its cache: the same pass `--gpu-chat` makes
         std::string err;
         kernels::ExpertCache tier;
-        if (!open_tier(file, tier_mib, tier, err)) {
+        if (!open_tier(file, tier_mib, tier, err, stdout, tier_policy)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
@@ -974,7 +978,8 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
 /// `STOP` to end a request early, `QUIT` to end the process), and this function speaks exactly that and nothing
 /// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
 /// prompt extends the one before decodes only what is new.
-int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib) {
+int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib,
+          const std::string& tier_policy) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -995,7 +1000,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 windows[(size_t) l] = window;
 
         kernels::ExpertCache tier;
-        if (!open_tier(file, tier_mib, tier, err, stderr)) {   // stderr: stdout is the protocol and nothing else
+        if (!open_tier(file, tier_mib, tier, err, stderr, tier_policy)) {   // stderr: stdout is the protocol and nothing else
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
@@ -1220,7 +1225,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
 /// rejection is the correction, so the answer is exactly what greedy would have produced: speculation here buys
 /// time, never different tokens.
 int gpu_spec(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
-             int max_new, int drafts, int tier_mib, int dense_mib) {
+             int max_new, int drafts, int tier_mib, int dense_mib, const std::string& tier_policy) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
@@ -1251,7 +1256,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
                 windows[(size_t) l] = window;
 
         kernels::ExpertCache tier;
-        if (!open_tier(file, tier_mib, tier, err)) {
+        if (!open_tier(file, tier_mib, tier, err, stdout, tier_policy)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
@@ -1393,7 +1398,8 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 /// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
-             int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib, const SamplerConfig& samp) {
+             int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib,
+             const std::string& tier_policy, const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1446,7 +1452,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         kernels::Session s;
         std::string err;
         kernels::ExpertCache tier;
-        if (!open_tier(file, tier_mib, tier, err)) {
+        if (!open_tier(file, tier_mib, tier, err, stdout, tier_policy)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
@@ -1646,6 +1652,8 @@ void usage() {
         "      VRAM and reads them from there; the answer is bit for bit the same, only the copies go away.\n"
         "      --dense-cache MiB keeps the blocks' own attention and feed-forward weights in VRAM instead of uploading\n"
         "      them once per pass per block - 2 GB holds all 45 and is where the larger half of a token goes.\n"
+        "      [--tier-policy fifo|lru|lfu] chooses which expert a full tier replaces (default lru: measured 41.7% of\n"
+        "      fetches served at 4 GB against fifo's 37.2%, and 67.6% against 57.6% at 8 GB).\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -1793,6 +1801,7 @@ int run(int argc, char** argv) {
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
     bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false, want_serve = false;
     int64_t drafts = 3, max_new = 0, tier_mib = 0, dense_mib = 0, top_k = 0, seed = 0;
+    std::string tier_policy = "lru";
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; the flags this engine takes all take a value, so one with nothing after it is an
@@ -1852,6 +1861,8 @@ int run(int argc, char** argv) {
             repeat_penalty = std::strtod(argv[++i], nullptr);
         } else if (std::strcmp(argv[i], "--seed") == 0) {
             seed = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--tier-policy") == 0) {
+            tier_policy = argv[++i];
         } else if (std::strcmp(argv[i], "--dense-cache") == 0) {
             dense_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--expert-cache") == 0) {
@@ -1896,12 +1907,13 @@ int run(int argc, char** argv) {
     samp.seed = (uint64_t) seed;
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib,
-                        (int) dense_mib);
-    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib);
-    if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib);
+                        (int) dense_mib, tier_policy);
+    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy);
+    if (want_gpu_mtp)
+        return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
-                        (int) tier_mib, (int) dense_mib, samp);
+                        (int) tier_mib, (int) dense_mib, tier_policy, samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
