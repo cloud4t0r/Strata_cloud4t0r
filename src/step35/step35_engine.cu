@@ -13,6 +13,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/step35/block.hpp"
+#include "strata/step35/experts.hpp"
 #include "strata/step35/gemv.hpp"
 #include "strata/step35/session.hpp"
 
@@ -676,6 +677,46 @@ int argmax(const std::vector<float>& lg) {
     return best;
 }
 
+/// The VRAM-resident expert tier, sized from a MiB budget and the file's own expert shapes.  The shapes come from
+/// block 3 (the first mixture-of-experts block) because that is where the tensors exist.
+bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tier, std::string& err) {
+    if (mib <= 0) return true;
+    const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
+    size_t shard = 0;
+    const strata::TensorInfo* tg = file.find("blk." + std::to_string(dense) + ".ffn_gate_exps.weight", &shard);
+    const strata::TensorInfo* td = file.find("blk." + std::to_string(dense) + ".ffn_down_exps.weight", &shard);
+    if (!tg || !td) {
+        err = "cannot size the expert tier: no expert tensors";
+        return false;
+    }
+    const int n_expert = (int) file.meta().get("step35.expert_count")->num();
+    const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
+    const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
+    const size_t per_expert = 2 * gate_bytes + down_bytes;
+    const int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
+    if (n_slots <= 0) {
+        err = "the expert tier budget is smaller than one expert (" + std::to_string(per_expert / 1024) + " KB)";
+        return false;
+    }
+    const int asked = n_slots;
+    if (!kernels::expert_cache_open(tier, n_slots, gate_bytes, down_bytes, err)) return false;
+    std::printf("strata-step35: expert tier: %d slot(s) of %zu KB = %.2f GB of VRAM\n", tier.n_slots,
+                per_expert / 1024, (double) tier.n_slots * (double) per_expert / 1e9);
+    if (tier.n_slots < asked)   // the allocation stopped early and said why: fewer slots is still a tier
+        std::printf("strata-step35: expert tier: %s (asked for %d slot(s))\n", err.c_str(), asked);
+    err.clear();
+    return true;
+}
+
+/// What the tier bought, and what it did not: a hit rate with no time next to it would say nothing.
+void print_tier(const kernels::ExpertCache& tier, double seconds) {
+    if (tier.n_slots <= 0) return;
+    const double n = (double) (tier.hits + tier.misses);
+    std::printf("strata-step35: expert tier: %llu hit(s) of %llu fetch(es) (%.1f%%), %llu eviction(s), %.3f s\n",
+                (unsigned long long) tier.hits, (unsigned long long) (tier.hits + tier.misses),
+                n > 0 ? 100.0 * (double) tier.hits / n : 0.0, (unsigned long long) tier.evictions, seconds);
+}
+
 /// The five tokens of highest logit, in exactly the shape `--ref` prints them: the figure the CPU reference and the
 /// GPU paths are compared on.  A head that is merely mis-scaled still answers with plausible logits, so the ranking
 /// and the values have to come out together.
@@ -754,7 +795,7 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
 /// have said, so each head is fed the token the trunk itself chose at that position and its top-1 is compared with
 /// the token the trunk chose next.
 int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
-            int drafts) {
+            int drafts, int tier_mib) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
@@ -792,6 +833,12 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
 
         // the trunk, over the prompt, with its cache: the same pass `--gpu-chat` makes
         std::string err;
+        kernels::ExpertCache tier;
+        if (!open_tier(file, tier_mib, tier, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
         kernels::Session trunk;
         const int capacity = (int) prompt.size() + want + 2;
         if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, capacity, err, windows)) {
@@ -800,8 +847,9 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         }
         std::vector<float> out;
         std::vector<double> sums;
-        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk)) {
+        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk, tierp)) {
             std::printf("strata-step35: %s\n", err.c_str());
+            kernels::expert_cache_close(tier);
             kernels::session_destroy(trunk);
             return 1;
         }
@@ -821,7 +869,8 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
             const std::vector<int32_t> one(1, tok[(size_t) k]);
             std::vector<float> dout;
             std::vector<double> dsums;
-            if (!kernels::run_prompt_dense(file, one, (int) prompt.size() + k, n_blocks, dout, dsums, err, &trunk)) {
+            if (!kernels::run_prompt_dense(file, one, (int) prompt.size() + k, n_blocks, dout, dsums, err, &trunk,
+                                           tierp)) {
                 std::printf("strata-step35: %s\n", err.c_str());
                 kernels::session_destroy(trunk);
                 return 1;
@@ -876,6 +925,8 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
         kernels::mtp_close(dctx);
         kernels::session_destroy(draft);
         kernels::session_destroy(trunk);
+        print_tier(tier, 0.0);
+        kernels::expert_cache_close(tier);
         std::printf("strata-step35: %d draft(s) in %.3f s (%.3f s/draft)\n", want, draft_s,
                     want ? draft_s / (double) want : 0.0);
         std::printf("strata-step35: the draft agreed with the trunk on %d of %d token(s)\n", agree, want);
@@ -891,7 +942,7 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
 /// rejection is the correction, so the answer is exactly what greedy would have produced: speculation here buys
 /// time, never different tokens.
 int gpu_spec(const std::string& path, const std::string& mtp_path, const std::string& tokens_csv, int n_blocks,
-             int max_new, int drafts) {
+             int max_new, int drafts, int tier_mib) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         strata::GgufModel mtp = strata::GgufModel::open(mtp_path);
@@ -921,6 +972,12 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
                 swa->items[(size_t) l].num() != 0)
                 windows[(size_t) l] = window;
 
+        kernels::ExpertCache tier;
+        if (!open_tier(file, tier_mib, tier, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
         kernels::Session trunk;
         if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim,
                                      (int) prompt.size() + max_new + drafts + kernels::kKvPassMax, err, windows)) {
@@ -930,8 +987,9 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
         std::vector<float> out;
         std::vector<double> sums;
         const auto t_pre = std::chrono::steady_clock::now();
-        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk)) {
+        if (!kernels::run_prompt_dense(file, prompt, 0, n_blocks, out, sums, err, &trunk, tierp)) {
             std::printf("strata-step35: %s\n", err.c_str());
+            kernels::expert_cache_close(tier);
             kernels::session_destroy(trunk);
             return 1;
         }
@@ -987,7 +1045,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
             batch.insert(batch.end(), d.begin(), d.end());
             std::vector<float> vout;
             std::vector<double> vsums;
-            if (!kernels::run_prompt_dense(file, batch, pos, n_blocks, vout, vsums, err, &trunk)) {
+            if (!kernels::run_prompt_dense(file, batch, pos, n_blocks, vout, vsums, err, &trunk, tierp)) {
                 std::printf("strata-step35: %s\n", err.c_str());
                 break;
             }
@@ -1030,6 +1088,8 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
                     "%d draft(s) accepted of %d (%.0f%%)\n",
                     emitted, blocks, passes, gen_s, emitted ? gen_s / emitted : 0.0, accepted_total,
                     blocks * K, blocks * K ? 100.0 * (double) accepted_total / (double) (blocks * K) : 0.0);
+        print_tier(tier, gen_s);
+        kernels::expert_cache_close(tier);
         kernels::session_destroy(dk);
         kernels::mtp_close(dctx);
         kernels::head_close(head);
@@ -1045,7 +1105,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 /// per position are the ones `--ref` prints, so the two outputs are the comparison: prefill n positions, decode m,
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
-             int max_ctx, bool want_logits, int max_new) {
+             int max_ctx, bool want_logits, int max_new, int tier_mib) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1097,10 +1157,18 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
 
         kernels::Session s;
         std::string err;
-        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err, windows)) {
+        kernels::ExpertCache tier;
+        if (!open_tier(file, tier_mib, tier, err)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
+        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err, windows)) {
+            std::printf("strata-step35: %s%s\n", err.c_str(),
+                        tier.n_slots > 0 ? " - the expert tier is holding the card: lower --expert-cache" : "");
+            return 1;
+        }
+        // null when the tier is off: the default path must be exactly the one it was before the flag existed
+        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
         int n_full = 0, n_ring = 0, ring_cells = 0;
         for (int l = 0; l < n_blocks; ++l) {
             const int c = kernels::session_layer_cells(s, l);
@@ -1123,7 +1191,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
             std::vector<float> part;
             std::vector<double> csum;
-            if (!kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &s)) {
+            if (!kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &s, tierp)) {
                 std::printf("strata-step35: %s\n", err.c_str());
                 return 1;
             }
@@ -1148,7 +1216,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             std::vector<int32_t> one(1, next[d]);
             std::vector<float> dout;
             std::vector<double> dsums;
-            if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, dsums, err, &s)) {
+            if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, dsums, err, &s, tierp)) {
                 std::printf("strata-step35: decode %zu: %s\n", d, err.c_str());
                 return 1;
             }
@@ -1185,7 +1253,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
                 std::vector<float> dout;
                 std::vector<double> dsums;
                 const auto t0 = std::chrono::steady_clock::now();
-                if (!kernels::run_prompt_dense(file, one, at, n_blocks, dout, dsums, err, &s)) {
+                if (!kernels::run_prompt_dense(file, one, at, n_blocks, dout, dsums, err, &s, tierp)) {
                     std::printf("strata-step35: %s\n", err.c_str());
                     kernels::head_close(head);
                     kernels::session_destroy(s);
@@ -1225,6 +1293,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             }
             print_top5(lg, "after " + std::to_string(n_blocks) + " block(s) on the GPU, reading the cache");
         }
+        print_tier(tier, 0.0);
+        kernels::expert_cache_close(tier);
         kernels::session_destroy(s);
         return 0;
     } catch (const std::exception& ex) {
@@ -1267,7 +1337,8 @@ void usage() {
         "      applied to the last position, and the five tokens it would answer with - the figure `--ref`\n"
         "      prints, so the head is held to the reference the same way the blocks are.  --gpu-seq takes it too.\n"
         "      --max-new N generates N tokens greedily after them, each step's own top-1 being the next step's\n"
-        "      token, and prints the per-token time.\n"
+        "      token, and prints the per-token time.  --expert-cache MiB keeps that much of the routed experts in\n"
+        "      VRAM and reads them from there; the answer is bit for bit the same, only the copies go away.\n"
         "\n"
         "Nothing serves in this build: --gpu-chat runs a prompt, its --next steps and --max-new greedy tokens,\n"
         "and no process answers requests.  When the forward pass lands the flags will be strata's own\n"
@@ -1411,7 +1482,7 @@ int run(int argc, char** argv) {
     int64_t layers = 0, gpu_layer = -1, token = -1, pos = 0, max_ctx = 8192;
     bool want_ref = false, want_gpu = false, want_moe = false, want_chain = false, want_all = false, want_seq = false;
     bool want_chat = false, want_logits = false, want_gpu_mtp = false, want_spec = false;
-    int64_t drafts = 3, max_new = 0;
+    int64_t drafts = 3, max_new = 0, tier_mib = 0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; everything else takes a value, so a flag with nothing after it is an error and
         // not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
@@ -1455,6 +1526,8 @@ int run(int argc, char** argv) {
             mtp = argv[++i];
         } else if (std::strcmp(argv[i], "--tokens") == 0) {
             tokens = argv[++i];
+        } else if (std::strcmp(argv[i], "--expert-cache") == 0) {
+            tier_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--max-new") == 0) {
             max_new = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--drafts") == 0) {
@@ -1480,9 +1553,12 @@ int run(int argc, char** argv) {
         return 2;
     }
     if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
-    if (want_spec) return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts);
-    if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts);
-    if (want_chat) return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new);
+    if (want_spec)
+        return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib);
+    if (want_gpu_mtp) return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib);
+    if (want_chat)
+        return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
+                        (int) tier_mib);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {

@@ -20,6 +20,7 @@
 // fp32 tensors of this pass, which is the validation vehicle for the arithmetic.
 #include "strata/step35/attn.hpp"
 #include "strata/step35/block.hpp"
+#include "strata/step35/experts.hpp"
 #include "strata/step35/gemv.hpp"
 #include "strata/step35/kernels.hpp"
 #include "strata/step35/moe.hpp"
@@ -357,7 +358,7 @@ bool logits_last(const strata::GgufModel& file, const float* h, std::vector<floa
 
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,
                       int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session) {
+                      Session* session, ExpertCache* experts) {
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
     const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
@@ -541,14 +542,31 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 if (ok) ok = cudaMemset(eacc, 0, (size_t) e * sizeof(float)) == cudaSuccess;
                 for (int k = 0; ok && k < top_k; ++k) {
                     const size_t ex = (size_t) h_ids[(size_t) k];
-                    ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-                    if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-                    if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-                    if (ok) ok = gemv((ggml_type) tg->type, dg, xp, eg, e, n_ff_exp, d_q8, nullptr);
-                    if (ok) ok = gemv((ggml_type) tg->type, du, xp, eu, e, n_ff_exp, d_q8, nullptr);
+                    // WITH A TIER: the three matrices are already on the card, or they are filled once and stay.
+                    // Without one (the default) this is the same three copies it always was.
+                    const void *wg = dg, *wu = du, *wd = dd;
+                    if (experts != nullptr) {
+                        bool hit = false;
+                        ExpertSlot* slot = expert_cache_fetch(*experts, layer, (int) ex, base_g + ex * gate_bytes,
+                                                              base_u + ex * gate_bytes, base_d + ex * down_bytes, hit,
+                                                              err);
+                        if (slot == nullptr) {
+                            ok = false;
+                            break;
+                        }
+                        wg = slot->gate;
+                        wu = slot->up;
+                        wd = slot->down;
+                    } else {
+                        ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                        if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                        if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                    }
+                    if (ok) ok = gemv((ggml_type) tg->type, wg, xp, eg, e, n_ff_exp, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) tg->type, wu, xp, eu, e, n_ff_exp, d_q8, nullptr);
                     if (ok) ok = cudaMemcpy(eact, eg, (size_t) n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
                     if (ok) k_silu_mul_n<<<(n_ff_exp + 255) / 256, 256>>>(eact, eu, n_ff_exp, clamp_exp);
-                    if (ok) ok = gemv((ggml_type) tg->type, dd, eact, ed, n_ff_exp, e, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) tg->type, wd, eact, ed, n_ff_exp, e, d_q8, nullptr);
                     if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, h_w[(size_t) k], e);
                 }
                 if (ok) ok = gemv((ggml_type) t_sh, sg, xp, eg, e, n_ff_sh, d_q8, nullptr);

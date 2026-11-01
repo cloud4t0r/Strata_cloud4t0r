@@ -22,7 +22,8 @@
 
 namespace strata::step35::kernels {
 
-struct Session;   // the quantized K/V cache, in session.hpp (forward: only a pointer crosses here)
+struct Session;     // the quantized K/V cache, session.hpp (forward: only a pointer crosses here)
+struct ExpertCache;  // the VRAM-resident expert tier, experts.hpp (same: a pointer)
 
 /// The device buffers of one dense block, uploaded from the file.  Freed by release().
 struct DenseBlock {
@@ -91,9 +92,11 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n
 /// reads the cache in place (`session_attend`) instead of attenting over the tensors it just computed.  A decode
 /// step is this same call with one token at `pos0 = session.n_cached`, so prefill and decode cannot drift apart.
 /// With `session` null the attention is `attn_causal` over this pass's fp32 K/V - the validation path.
+/// `experts`, when given, is the VRAM-resident expert tier (`experts.hpp`): a position's routed experts are read
+/// from it instead of copied out of the file.  A hit and a miss compute the same bits - only the copy goes away.
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
                       std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session = nullptr);
+                      Session* session = nullptr, ExpertCache* experts = nullptr);
 
 /// The vocabulary logits of ONE position: `h` is one row of the last block's output on the HOST (n_embd floats),
 /// `logits` receives the file's `output.weight` applied to `rms_norm(h, output_norm)` - n_vocab floats, also on the
