@@ -153,10 +153,9 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No vision.** The `mmproj` projector (3.97 GB, llama.cpp's `PROJECTOR_TYPE_STEP3VL`) is not used.
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
-- **No launcher, no app.** The engine speaks the serve protocol (`--serve`, above) and answers `serve/server.py`
-  from a hand-written config, and `adopt.py` can now write that config for files already on disk - but the family is
-  not in `setup.py`'s catalogue, so `strata launch --family step35` answers that it does not know it, and nobody is
-  offered the family. The four things that would take are listed at the end of the serving section.
+- **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
+  package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
+  start needs an engine built from this branch. The app and the web page do not know the family yet either.
 - **The cache is not streamed and not captured.** A cache that outgrows VRAM has no host copy yet
   (`kv_stream.hpp` has one for the QSA layers), and the position still crosses to the device as a 4-byte H2D copy,
   so the pass is not a CUDA graph. A decode step is a full pass over 45 blocks - 0.96 s, most of it the
@@ -452,26 +451,40 @@ reading the GGUF directly, and an expert tier sized from what the card has left 
 figures are the measured ones of this page, reproduced by `adopt.step35_kv_gb` and checked in
 `tests/terminal/test_adopt_step35.py`.
 
-## What `strata launch --family step35` still needs
+## The launcher: what it does now, and the one thing left
 
-Verified, not guessed: the launcher answers `There is no model family called 'step35'`, because the catalogue is
-`setup.py`'s tables and those have no entry. Four things follow, and only the first is mechanical:
+`strata launch --family step35 --model-path <folder> --plan` works, and says true things:
 
-1. a `FAMILIES` entry - title, author, Hugging Face repository, file pattern, tag, name, licence. The file list is
-   pinned and was read from the Hub: `stepfun-ai/Step-3.7-Flash-GGUF`, `IQ3_XXS/Step-3.7-flash-IQ3_XXS-0000{1,2}-of-00002.gguf`,
-   46 645 813 024 and 29 112 867 936 bytes, sha256 `ce04c744…cc5d` and `aeedcdaa…e31d` (both match the copies on this machine).
-2. a model row. `MODELS` is keyed by quant name across families, and its numbers (`download_gb`, `ram_gb`,
-   `arena_gb`) describe an engine that prepares a pack; this one reads the GGUF and streams its experts, so a row
-   that reuses them would be a claim nobody measured. It needs its own row and its own fit rule.
-3. `fitOn` (`apps/host/src/lib/native-fit.ts`, ported into `catalog.py`) would report that pack arithmetic for this
-   family too. It has to learn this engine's shape - K/V cache from the formula above, expert tier from what is
-   free, ~0.35 GB of working buffers - or the launch list would tell people their card holds something it does not.
-4. the config the launcher writes is the four fields of the section above; `adopt.py` now writes them, so this part
-   is a call, not a design.
+```
+  model     step35 IQ3_XXS   (your files in .../step-3.7-flash-IQ3_XXS/IQ3_XXS)
+  context   64K    pictures off    parallel fit to your card
+  download  Nothing to download: your model files are used where they are. ...
+  drafting  off (Step-3.7-Flash's NextN blocks are not used by the serving path yet)
+```
 
-Stopping here is deliberate: everything above point 4 is a claim about hardware this page has not measured for this
-engine, and the repository's rule is no claim without a measurement. The family is servable today; it is not yet
-*offered*.
+The family has a catalogue entry (`setup.py` `OWN_PATH_FAMILIES["step35"]`), the model table reports it as an engine
+that *streams* its experts (no VRAM or RAM arena, whatever the size of the file), and the launch writes its run
+config from the files on disk (`adopt.py`), with the expert tier sized out of the card and the K/V cache. That config,
+pointed at an engine that carries this family, is what serves: `serve/server.py` reached `loaded` in 3 s and answered
+`HTTP 200 in 4.4 s` with the twelve tokens asked for.
+
+**The one thing left is the engine binary, not the launcher.** `strata launch --start` resolves
+`component:strata-engine` to the engine package the update feed installs - 0.1.55 here - and that release does not
+contain this fork's `--serve` for step35, so the start failed with the engine's own usage text. On this machine the
+family is served by pointing the config's `exe` at the build that has it (`build-hip/strata`); for anyone else it is
+served once a release carries the family. Nothing else in the launch path is missing.
+
+The three remaining catalogue questions, for whoever picks this up:
+
+1. The file list is pinned (title, author, repository, pattern, tag, licence, and both shards with the Hub API's own
+   sizes and sha256: 46 645 813 024 / `ce04c744…cc5d` and 29 112 867 936 / `aeedcdaa…e31d`, both matching the copies
+   here), at the revision `0b69336d…c31482` (2026-06-03). Only IQ3_XXS is offered: the repository also carries
+   IQ4_XS, Q3_K_L, Q3_K_M, Q4_K_S, Q8_0 and BF16, and none of them has been run here.
+2. The fit words for this family are the ones `own_size` reports (`streams_experts`: no arena), which is a claim
+   about *memory*, not about speed: the launch list will say a card can run it, and the speed the tier buys is not in
+   the list. The measured line for this machine is 0.68 s per token with one draft token and 12.6 GB of tier.
+3. `strata launch` offers `IQ3_XXS` for this family and for Qwen3.8-Flash-Next: quant names are not unique across
+   families, so anything keyed by model name alone has to carry the family too (one test did, and said so).
 
 ## Tests
 
