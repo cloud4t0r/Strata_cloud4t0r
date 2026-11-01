@@ -115,6 +115,15 @@ bool embed_rows(const strata::GgufModel& file, const std::vector<int32_t>& token
             err = "negative token id";
             return false;
         }
+        if (t->type == GGML_TYPE_F32) {   // a plain tensor has no dequantizer: the bytes ARE the values
+            std::memcpy(out.data() + p * (size_t) n_embd, base + (size_t) tokens[p] * row_bytes,
+                        (size_t) n_embd * sizeof(float));
+            continue;
+        }
+        if (tr == nullptr || tr->to_float == nullptr) {
+            err = "no dequantizer for " + t->name;
+            return false;
+        }
         tr->to_float(base + (size_t) tokens[p] * row_bytes, out.data() + p * (size_t) n_embd, n_embd);
     }
     return true;

@@ -52,7 +52,22 @@ struct Tensor {
     std::vector<uint64_t> shape;   ///< GGUF order: dim 0 varies fastest
     uint32_t type = 0;
     uint8_t seed = 1;              ///< payload byte i is (seed * 131 + i * 7 + i / 4093) & 0xff
+    /// Used INSTEAD of the pattern when it is not empty, and it must hold the tensor's whole payload: the pattern is
+    /// random bytes, which is fine for a loader test and useless for an arithmetic one (random F32 bits are NaN).
+    std::vector<uint8_t> payload;
 };
+
+/// Little floats in [-amp, amp] for an F32 tensor, from a seed: the arithmetic tests need values a softmax survives.
+inline std::vector<uint8_t> f32_payload(uint64_t count, uint32_t seed, float amp = 0.05f) {
+    std::vector<uint8_t> out(count * sizeof(float));
+    uint32_t x = seed * 2654435761u + 12345u;
+    for (uint64_t i = 0; i < count; ++i) {
+        x = x * 1664525u + 1013904223u;
+        const float v = (((float) (x >> 8) / (float) (1u << 24)) * 2.0f - 1.0f) * amp;
+        std::memcpy(out.data() + i * sizeof(float), &v, sizeof(float));
+    }
+    return out;
+}
 
 inline uint8_t pattern(uint8_t seed, uint64_t i) { return (uint8_t) ((seed * 131u + i * 7u + i / 4093u) & 0xffu); }
 
@@ -118,6 +133,14 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
     b.resize((size_t) w.data_start, 0);
     for (size_t i = 0; i < ts.size(); ++i) {
         b.resize((size_t) (w.data_start + w.offsets[i]), 0);
+        if (!ts[i].payload.empty()) {
+            if (ts[i].payload.size() != bytes[i])
+                throw std::runtime_error("fixture: " + ts[i].name + " payload is " +
+                                         std::to_string(ts[i].payload.size()) + " bytes, the tensor " +
+                                         std::to_string(bytes[i]));
+            b.insert(b.end(), ts[i].payload.begin(), ts[i].payload.end());
+            continue;
+        }
         for (uint64_t j = 0; j < bytes[i]; ++j) b.push_back(pattern(ts[i].seed, j));
     }
     if (cut > b.size()) cut = b.size();
