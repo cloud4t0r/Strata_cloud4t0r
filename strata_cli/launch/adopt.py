@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 SHARD = re.compile(r"^(?P<stem>.+)-(?P<i>\d{5})-of-(?P<n>\d{5})\.gguf$")
-FAMILIES = ("qwen", "swift", "coder", "gyro")      # the catalog offers Gyro-S / Gyro-M on an Arc card too (round 8, N11)
+FAMILIES = ("qwen", "swift", "coder", "gyro", "step35")   # step35: the files carry everything, there is no pack to prepare
 UNSUPPORTED = ("no nvidia gpu found", "no amd gpu", "nvidia gpu", "not supported", "cannot be used")
 
 
@@ -63,9 +63,13 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     """(config, problems): the config to write, or None with plain-words problems (what is missing). `pack_name`: the pack folder under
     packs/ (default the model's name in lower case; Gyro's is its tag, gyro-gyro-s)."""
     problems: list[str] = []
+    if family == "step35":
+        return _plan_step35(model_dir=model_dir, context=context, model_name=model_name, log=log, backend=backend,
+                            vram_gb=vram_gb, notes=notes)
     if family not in FAMILIES:
         # no full stop: the caller joins the problems with "; " and ends the sentence (a "gyro.." came out of the old text, round 8, N11)
-        return None, [f"Strata can write the settings itself only for the Qwen3.8-Flash-Next, Swift, Coder and Gyro files, not for {family}"]
+        return None, [f"Strata can write the settings itself only for the Qwen3.8-Flash-Next, Swift, Coder, Gyro and "
+                      f"Step-3.7-Flash files, not for {family}"]
     shards = find_single(model_dir) if family == "gyro" else find_shards(model_dir)
     if not shards:
         problems.append(f"the model file is not in {model_dir}" if family == "gyro" else
@@ -118,6 +122,60 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
         cfg["env"] = {"STRATA_METAL_STREAM": "1"}
     if backend:
         cfg["backend"] = backend
+    return cfg, []
+
+
+# ---------------------------------------------------------------------------------- Step-3.7-Flash (engine src/step35)
+# The K/V cache's own arithmetic, measured on the release (`docs/STEP37.md`): 2112 bytes per layer per position, 45
+# layers of which 12 keep every position and 33 keep a 1536-cell ring.  At 8192 that is 0.315 GB, at 32768 0.938 -
+# the formula below reproduces both, and it is what the expert tier's budget has to stay out of.
+STEP35_KV_FULL_LAYERS = 12
+STEP35_KV_RING_CELLS = 1536
+STEP35_KV_SLIDING_LAYERS = 33
+STEP35_CELL_BYTES = 2112
+
+
+def step35_kv_gb(context: int) -> float:
+    """The K/V cache of a Step-3.7-Flash run at `context` positions, in GB: the 12 full blocks keep every position,
+    the 33 sliding ones keep their ring."""
+    full = STEP35_KV_FULL_LAYERS * context * STEP35_CELL_BYTES
+    ring = STEP35_KV_SLIDING_LAYERS * STEP35_KV_RING_CELLS * STEP35_CELL_BYTES
+    return (full + ring) / 1e9
+
+
+def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, backend: str | None, vram_gb: float,
+                 notes: list | None) -> tuple[dict | None, list[str]]:
+    """The run config for a Step-3.7-Flash folder that is already on disk: two shards, the folder's own tokenizer,
+    and the engine reading the GGUF directly - no prepared pack, no expert profile, nothing to download."""
+    problems: list[str] = []
+    shards = find_shards(model_dir)
+    if not shards:
+        problems.append(f"the model files are not all in {model_dir} (every -0000N-of-0000N.gguf shard is needed)")
+    tokenizer = Path(model_dir) / "tokenizer"
+    if not tokenizer.exists():                      # a folder laid out as models/<name>/<quant>/: the files one level up
+        tokenizer = Path(model_dir).parent / "tokenizer"
+    if not tokenizer.exists():
+        problems.append(f"the tokenizer folder is not beside the model files (looked in {Path(model_dir)} and {Path(model_dir).parent})")
+    if problems:
+        return None, problems
+    # The expert tier gets what the card has left after the K/V cache and 1 GB of working buffers (the head alone is
+    # 363 MB, and the engine's own buffers were measured at ~0.35 GB beside a 0.3 GB cache).
+    tier_mib = 0
+    if vram_gb:
+        free = float(vram_gb) - step35_kv_gb(context) - 1.0
+        tier_mib = max(0, int(free * 1024 * 0.9)) if free > 0 else 0
+    args = ["--model", str(shards[0]), "--max-context", str(int(context))]
+    if tier_mib >= 1024:                            # below a GB it would hold a few dozen experts and only churn
+        args += ["--expert-cache", str(tier_mib)]
+    cfg = {"exe": "component:strata-engine", "args": args, "cwd": str(Path(model_dir)), "tokenizer": str(tokenizer),
+           "model_name": model_name, "arch": "step35", "log": str(log), "lib_dirs": [], "port": 8080}
+    if backend == "metal":
+        cfg["env"] = {"STRATA_METAL_STREAM": "1"}
+    if backend:
+        cfg["backend"] = backend
+    if notes is not None and tier_mib:
+        notes.append(f"Step-3.7-Flash: {step35_kv_gb(context):.2f} GB of K/V cache at {int(context)} positions, and "
+                     f"{tier_mib} MiB of the card left for experts.")
     return cfg, []
 
 
