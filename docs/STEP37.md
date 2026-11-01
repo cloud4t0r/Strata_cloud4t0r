@@ -332,6 +332,7 @@ The ladder it produces, all at 24 tokens:
 | `+ --expert-cache 8000` | 0.220 | -72% |
 | `+ --expert-cache 12000` | **0.200** | **-75%** |
 | `+ --expert-cache 10000 --gpu-spec --drafts 1` | 0.253 | -68% |
+| `--dense-cache auto --expert-cache auto` | **0.218** (200 tokens) | **-73%** |
 
 ## Speculative decoding, and why K=1
 
@@ -409,6 +410,10 @@ wired here yet.
 strata-step35 --gpu-chat <shard> --tokens "..." --max-new N --temperature 0.8 --top-p 0.9 --seed 1
 strata-step35 --gpu-chat <shard> --tokens "..." --max-new N --top-k 40 --repeat-penalty 1.1
 ```
+
+`--max-new` stops on the file's own end token (`tokenizer.ggml.eos_token_id`) as `--gpu-spec` and the server do,
+and says so: `end token after N token(s)`. It is the same check in all three places, so a chat turn cannot run past
+its end however many tokens were asked for.
 
 `--temperature` defaults to 0, which is the argmax and ignores every other knob - so the default path is the one it
 was, and the sequence a command emitted before this exists is the sequence it emits now. The filters run in
@@ -537,7 +542,11 @@ with the expert tier holding the experts, **66% of a token was the dense weights
 | the same with `--gpu-spec --drafts 1` | **0.258** | **-68%**, 4 of 5 drafts accepted |
 
 All 45 blocks fit: 1.88 GB, `45 block(s) resident, 0 streamed` (the budget is only a ceiling; a block that does not
-fit is streamed exactly as before). The tokens are identical in every row - `11111 16 455 6102 294 10322 ...` - so
+fit is streamed exactly as before). Both caches take **`auto`**: what the card has left once the K/V cache and 1.5 GB
+of reserve (the head is 363 MB, the working buffers ~250 MB, the rest is slack) are out of the way - the blocks first,
+the tier with the rest. On this machine that is `dense 1794 MiB, tier 12561 MiB` at 8192 positions, 45 of 45 blocks
+resident, and 200 tokens at **0.218 s/token** with an 82% tier hit rate. The reserve is 1.5 GB and not 1 GB because a
+1 GB reserve let the head's own 363 MB allocation fail at the end of a load. The tokens are identical in every row - `11111 16 455 6102 294 10322 ...` - so
 this is a place things live, not arithmetic.
 
 And speculation no longer pays at all: 0.253 s per token with one draft token against **0.200** for plain greedy with
