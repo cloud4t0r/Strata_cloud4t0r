@@ -84,6 +84,11 @@ bool upload_moe_block(const strata::GgufModel& file, int layer, MoeBlock& b, std
 void release_moe_block(MoeBlock& b);
 bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n_scratch, std::string& err);
 
+/// The token embeddings of a sequence, n_embd floats each, through the file's own dequantizer: what the first block
+/// starts from, and what `--dump-embeddings` writes so that the picture path can be held to it.
+bool embed_rows(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int64_t n_embd,
+                std::vector<float>& out, std::string& err);
+
 /// The whole model over a prompt of several positions, DENSE blocks then the mixture-of-experts ones: every
 /// position goes through each block at once (see src/step35/step35_seq.cu).  `sums` receives, per block, the hidden
 /// state summed over every position - the figure `--ref` prints - and `out` the last block's output,
@@ -93,11 +98,16 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* scratch_q8, int n
 /// reads the cache in place (`session_attend`) instead of attenting over the tensors it just computed.  A decode
 /// step is this same call with one token at `pos0 = session.n_cached`, so prefill and decode cannot drift apart.
 /// With `session` null the attention is `attn_causal` over this pass's fp32 K/V - the validation path.
+/// `image_row`, when given, is one entry per token: `>= 0` means this position's row comes from `image_rows`
+/// (n_embd floats each) instead of the token's own embedding - how a picture's cells reach the trunk.  The
+/// `--serve` GENI path fills them from the encoder's file.
+///
 /// `experts`, when given, is the VRAM-resident expert tier (`experts.hpp`): a position's routed experts are read
 /// from it instead of copied out of the file.  A hit and a miss compute the same bits - only the copy goes away.
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
                       std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session = nullptr, ExpertCache* experts = nullptr, DenseCache* blocks = nullptr);
+                      Session* session = nullptr, ExpertCache* experts = nullptr, DenseCache* blocks = nullptr,
+                      const std::vector<float>* image_rows = nullptr, const std::vector<int32_t>* image_row = nullptr);
 
 /// The vocabulary logits of ONE position: `h` is one row of the last block's output on the HOST (n_embd floats),
 /// `logits` receives the file's `output.weight` applied to `rms_norm(h, output_norm)` - n_vocab floats, also on the

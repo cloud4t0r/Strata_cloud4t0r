@@ -1000,13 +1000,96 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
     }
 }
 
+/// A strata-vision file: records of `int32 magic('SVE1'), n, nx, ny, n_embd`, then `n * n_embd` floats, in prompt
+/// order.  The same format `strata-vision` writes for every family; read here, never written.
+bool read_embeddings(const std::string& path, int n_embd, std::vector<float>& rows, int& n_records, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        err = "cannot open the image embeddings file " + path;
+        return false;
+    }
+    rows.clear();
+    n_records = 0;
+    std::vector<int32_t> hdr(5);
+    while (true) {
+        const size_t got = std::fread(hdr.data(), sizeof(int32_t), 5, f);
+        if (got == 0) break;
+        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != n_embd) {
+            std::fclose(f);
+            err = "bad image embeddings file: expected SVE1 records of width " + std::to_string(n_embd);
+            return false;
+        }
+        const size_t count = (size_t) hdr[1] * (size_t) hdr[4];
+        const size_t at = rows.size();
+        rows.resize(at + count);
+        if (std::fread(rows.data() + at, sizeof(float), count, f) != count) {
+            std::fclose(f);
+            err = "the image embeddings file is short";
+            return false;
+        }
+        ++n_records;
+    }
+    std::fclose(f);
+    return true;
+}
+
+/// The id of the prompt's picture token.  It cannot be looked up in the file: the reader keeps a SAMPLE of the first
+/// 64 entries of `tokenizer.ggml.tokens`, and `<im_patch>` is 128001 in this release.  So it is a number with a flag
+/// over it (`--image-token`, default 128001 - the id printed by reading the vocabulary out of band), the way the other
+/// engines of this Terminal carry their own pad token as a constant.
+constexpr int kStep35ImageToken = 128001;
+
+/// `--dump-embeddings <file> --tokens <ids>`: this token sequence's own embedding rows, written as an SVE file - the
+/// same format `strata-vision` writes and `GENI` reads.  It exists so that feeding a prompt's own rows back through the
+/// picture path must answer exactly what the text path answers: the check that the injection lands where it should.
+int dump_embeddings(const std::string& path, const std::string& tokens_csv, const std::string& out) {
+    try {
+        strata::GgufModel file = strata::GgufModel::open(path);
+        const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
+        std::vector<int32_t> ids;
+        for (size_t i = 0; i < tokens_csv.size();) {
+            size_t j = tokens_csv.find(',', i);
+            if (j == std::string::npos) j = tokens_csv.size();
+            ids.push_back((int32_t) std::strtol(tokens_csv.substr(i, j - i).c_str(), nullptr, 10));
+            i = j + 1;
+        }
+        if (ids.empty() || out.empty()) {
+            std::printf("strata-step35: --dump-embeddings needs --tokens <ids> and a file to write\n");
+            return 2;
+        }
+        std::vector<float> rows;
+        std::string err;
+        if (!kernels::embed_rows(file, ids, n_embd, rows, err)) {
+            std::printf("strata-step35: %s\n", err.c_str());
+            return 1;
+        }
+        std::FILE* f = std::fopen(out.c_str(), "wb");
+        if (f == nullptr) {
+            std::printf("strata-step35: cannot write %s\n", out.c_str());
+            return 1;
+        }
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int32_t hdr[5] = {0x31455653, 1, 1, 1, n_embd};
+            std::fwrite(hdr, sizeof(int32_t), 5, f);
+            std::fwrite(rows.data() + i * (size_t) n_embd, sizeof(float), (size_t) n_embd, f);
+        }
+        std::fclose(f);
+        std::printf("strata-step35: wrote %zu row(s) of %d to %s\n", ids.size(), n_embd, out.c_str());
+        return 0;
+    } catch (const std::exception& ex) {
+        std::printf("strata-step35: %s\n", ex.what());
+        return 1;
+    }
+}
+
 /// `--serve`: the resident engine `serve/server.py` talks to.  The protocol is its own (`READY <ctx> stop`,
 /// `GEN <n> [key=value ...] <ids>`, `T <id>` per token, `PP <read> <total> <ms>` while a prompt is read, `DONE`,
 /// `STOP` to end a request early, `QUIT` to end the process), and this function speaks exactly that and nothing
 /// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
 /// prompt extends the one before decodes only what is new.
 int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib,
-          const std::string& tier_policy, bool kv_host) {
+          const std::string& tier_policy, bool kv_host, int image_token) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -1089,23 +1172,20 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 stop = false;
                 continue;
             }
-            if (line.rfind("GENI", 0) == 0) {
-                std::printf("ERR images are not supported by the step35 engine\n");
-                std::fflush(stdout);
-                continue;
-            }
-            if (line.rfind("GEN ", 0) != 0) {
+
+            const bool geni = line.rfind("GENI ", 0) == 0;
+            if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR unknown request: %s\n", line.substr(0, 40).c_str());
                 std::fflush(stdout);
                 continue;
             }
-            // GEN <n> [key=value ...] <id,id,...>
+            // GEN <n> [key=value ...] <id,id,...>   |   GENI <n> [key=value ...] <file> <id,id,...>
             SamplerConfig samp;
             int max_new = 0;
-            std::string field;
+            std::string field, emb_path;
             {
                 std::vector<std::string> parts;
-                size_t i = 4;
+                size_t i = geni ? 5 : 4;
                 while (i < line.size()) {
                     size_t j = line.find(' ', i);
                     if (j == std::string::npos) j = line.size();
@@ -1128,6 +1208,11 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                     // accepted and ignored: refusing one would fail a request over a knob this engine does not have
                     if (samp.top_k > 64) samp.top_k = 64;
                 }
+                // GENI carries the embeddings file between the keys and the ids
+                if (geni) {
+                    emb_path = at < parts.size() ? parts[at] : std::string();
+                    ++at;
+                }
                 field = at < parts.size() ? parts[at] : std::string();
             }
             prompt.clear();
@@ -1142,6 +1227,40 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 std::fflush(stdout);
                 continue;
             }
+            // ---- a picture's cells: the <im_patch> positions take the encoder's rows, one per position in order
+            std::vector<float> image_rows;
+            std::vector<int32_t> image_row;
+            if (geni) {
+                int n_records = 0;
+                if (!read_embeddings(emb_path, n_embd, image_rows, n_records, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                const int pad = image_token;
+                if (pad < 0) {
+                    std::printf("ERR the file has no <im_patch> token\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                image_row.assign(prompt.size(), -1);
+                size_t row = 0;
+                for (size_t i = 0; i < prompt.size(); ++i) {
+                    if (prompt[i] == pad) image_row[i] = (int32_t) row++;
+                }
+                const size_t have = image_rows.size() / (size_t) n_embd;
+                if (row == 0) {
+                    std::printf("ERR the prompt has no <im_patch> token for %d picture(s)\n", n_records);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (row != have) {
+                    std::printf("ERR the prompt has %zu <im_patch> cell(s), the embeddings file %zu row(s)\n", row, have);
+                    std::fflush(stdout);
+                    continue;
+                }
+            }
+
             // the common prefix with what the session already holds: a chat turn usually appends
             size_t keep = 0;
             while (keep < cached.size() && keep < prompt.size() && cached[keep] == prompt[keep]) ++keep;
@@ -1161,7 +1280,9 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                     const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
                     std::vector<float> part;
                     std::vector<double> csum;
-                    ok = kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &trunk, tierp);
+                    ok = kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &trunk, tierp,
+                                                   nullptr,
+                                                   geni ? &image_rows : nullptr, geni ? &image_row : nullptr);
                     if (ok) out = part;
                     if (ok) {
                         const long long ms =
@@ -1844,7 +1965,9 @@ int run(int argc, char** argv) {
     int64_t drafts = 3, max_new = 0, tier_mib = 0, dense_mib = 0, top_k = 0, seed = 0;
     // -1 means "auto": what the card has left once the K/V cache and a reserve are out of the way
     std::string tier_policy = "lru";
-    bool kv_host = false;
+    bool kv_host = false, want_dump_emb = false;
+    int64_t image_token = kStep35ImageToken;
+    std::string dump_emb;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; the flags this engine takes all take a value, so one with nothing after it is an
@@ -1907,6 +2030,11 @@ int run(int argc, char** argv) {
             seed = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--kv-host") == 0) {
             kv_host = true;
+        } else if (std::strcmp(argv[i], "--image-token") == 0) {
+            image_token = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--dump-embeddings") == 0) {
+            dump_emb = argv[++i];
+            want_dump_emb = true;
         } else if (std::strcmp(argv[i], "--tier-policy") == 0) {
             tier_policy = argv[++i];
         } else if (std::strcmp(argv[i], "--dense-cache") == 0) {
@@ -1944,6 +2072,7 @@ int run(int argc, char** argv) {
         usage();
         return 2;
     }
+    if (want_dump_emb) return dump_embeddings(trunk, tokens, dump_emb);
     if (want_ref) return reference(trunk, tokens, layers, dump, mtp);
     // --gpu-spec stays greedy on purpose: it accepts a draft by comparing argmaxes, and drawing from a distribution
     // would need its own rejection rule to keep the answer's distribution.  `samp` is not passed to it.
@@ -1956,7 +2085,7 @@ int run(int argc, char** argv) {
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib,
                         (int) dense_mib, tier_policy);
-    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy, kv_host);
+    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy, kv_host, (int) image_token);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)

@@ -97,7 +97,17 @@ __global__ void k_silu_mul_n(float* act, const float* up, int n, float clamp) {
     act[i] = g * u;
 }
 
-/// One row of a quantized embedding table, as f32.
+/// Device positions: row r of the Q side sits at pos0 + r / n_head.
+std::vector<int> positions_for(int n_pos, int n_heads, int pos0) {
+    std::vector<int> pos((size_t) n_pos * n_heads);
+    for (int p = 0; p < n_pos; ++p)
+        for (int h = 0; h < n_heads; ++h) pos[(size_t) p * n_heads + h] = pos0 + p;
+    return pos;
+}
+
+}  // namespace
+
+/// One row of a quantized embedding table, as f32 (declared in block.hpp: the picture path is held to it).
 bool embed_rows(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int64_t n_embd,
                 std::vector<float>& out, std::string& err) {
     size_t shard = 0;
@@ -128,16 +138,6 @@ bool embed_rows(const strata::GgufModel& file, const std::vector<int32_t>& token
     }
     return true;
 }
-
-/// Device positions: row r of the Q side sits at pos0 + r / n_head.
-std::vector<int> positions_for(int n_pos, int n_heads, int pos0) {
-    std::vector<int> pos((size_t) n_pos * n_heads);
-    for (int p = 0; p < n_pos; ++p)
-        for (int h = 0; h < n_heads; ++h) pos[(size_t) p * n_heads + h] = pos0 + p;
-    return pos;
-}
-
-}  // namespace
 
 bool mtp_open(const strata::GgufModel& mtp, MtpContext& ctx, std::string& err) {
     try {
@@ -368,7 +368,8 @@ bool logits_last(const strata::GgufModel& file, const float* h, std::vector<floa
 
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,
                       int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err,
-                      Session* session, ExpertCache* experts, DenseCache* blocks) {
+                      Session* session, ExpertCache* experts, DenseCache* blocks, const std::vector<float>* image_rows,
+                      const std::vector<int32_t>* image_row) {
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
     const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
@@ -386,6 +387,21 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     const bool exp_norm = normv && normv->type == strata::MetaType::BOOL && normv->u != 0;
     const int e = (int) n_embd;
     if (!embed_rows(file, tokens, n_embd, out, err)) return false;
+    // A picture's cells: their rows replace the <im_patch> token's own embedding, in place, before any block runs.
+    if (image_rows != nullptr && image_row != nullptr) {
+        for (size_t p = 0; p < tokens.size(); ++p) {
+            if (p >= image_row->size()) break;
+            const int32_t row = (*image_row)[p];
+            if (row < 0) continue;
+            const size_t need = ((size_t) row + 1) * (size_t) n_embd;
+            if (need > image_rows->size()) {
+                err = "the image embeddings hold no row " + std::to_string(row);
+                return false;
+            }
+            std::memcpy(out.data() + p * (size_t) n_embd, image_rows->data() + (size_t) row * (size_t) n_embd,
+                        (size_t) n_embd * sizeof(float));
+        }
+    }
 
     float* d_h = nullptr;
     if (cudaMalloc(&d_h, out.size() * sizeof(float)) != cudaSuccess) {
