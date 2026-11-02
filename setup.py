@@ -851,6 +851,7 @@ OWN_PATH_FAMILIES = {
                # third_party/llama.cpp); the engine takes the encoder's rows in a GENI request (docs/STEP37.md)
                "vision": True,
                "mmproj": "mmproj-step3.7-flash-f16.gguf",
+               "mmproj_hf": hf("stepfun-ai/Step-3.7-Flash-GGUF"),      # the reader is at the repository root, not in IQ3_XXS/
                # What the engine is given on top of --native/--max-context, and why (docs/STEP37.md, measured on the
                # IQ3_XXS release): the blocks' dense weights kept in VRAM (0.80 -> 0.48 s/token), the MoE blocks' router
                # and shared expert with them (0.48 -> 0.20), and the expert tier with what is left (0.20 -> 0.12).
