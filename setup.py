@@ -830,6 +830,8 @@ OWN_PATH_FAMILIES = {
                         "the download is the disk's business and RAM is the page cache that makes it fast, not a "
                         "requirement (measured here: 0.5 s per position in a prefix pass, 0.68 s per token with one "
                         "draft token, 2.2 GB of RSS)",
+               # the Hub keeps each size in a folder of its own (IQ3_XXS/), which `hf` carries; `file` is the bare name,
+               # as for every other family (the install's folder is models/<tag><model>/ and the shards sit in it)
                "hf": hf("stepfun-ai/Step-3.7-Flash-GGUF") + "IQ3_XXS/",
                "file": "Step-3.7-flash-IQ3_XXS-0000{i}-of-00002.gguf", "shards": 2, "tag": "step-3.7-flash-",
                "name": "step-3.7-flash",
@@ -849,9 +851,14 @@ OWN_PATH_FAMILIES = {
                # third_party/llama.cpp); the engine takes the encoder's rows in a GENI request (docs/STEP37.md)
                "vision": True,
                "mmproj": "mmproj-step3.7-flash-f16.gguf",
+               # What the engine is given on top of --native/--max-context, and why (docs/STEP37.md, measured on the
+               # IQ3_XXS release): the blocks' dense weights kept in VRAM (0.80 -> 0.48 s/token), the MoE blocks' router
+               # and shared expert with them (0.48 -> 0.20), and the expert tier with what is left (0.20 -> 0.12).
+               # "auto" sizes each from the card: the blocks first, the tier with the rest.
+               "engine_args": ["--dense-cache", "auto", "--expert-cache", "auto"],
                # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
                "mtp": 0,
-               "vision": False, "state_gb": 0.0},
+               "state_gb": 0.0},
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
@@ -8731,6 +8738,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    # a family whose engine has options of its own: written after the common ones, from the family's entry
+    args += [str(x) for x in fam.get("engine_args", [])]
     if fam.get("kv_used"):                          # the K / V cache's element (--m2-kv; int8 unless asked otherwise)
         args += ["--kv", fam["kv_used"]]
     if fam.get("low_ram") and low_ram:

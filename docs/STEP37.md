@@ -730,6 +730,34 @@ to say anything about.
 
 Build cost: `strata-vision` (CPU, from `tools/vision`) takes two minutes and needs no model - it reads the mmproj.
 
+### What `setup.py` writes, and what it took to get there
+
+Run for real (`--family step35 --model IQ3_XXS --gguf-dir <the shards> --vision yes --yes --no-start`), it: compiles the
+engine **from this source tree** into `engine/strata` (incremental, two minutes), verifies the two shards against their
+pinned sizes and sha256 without downloading, builds the CPU picture reader into `engine/strata-vision`, extracts the
+tokenizer, and writes `strata-step-3.7-flash-iq3_xxs.json` plus `run-step-3.7-flash-iq3_xxs.sh`. The config it ends with:
+
+```json
+"args": ["--native", "<first shard>", "--max-context", "32768", "--prefill", "auto", "--mtp", "0",
+         "--dense-cache", "auto", "--expert-cache", "auto", "--vision"],
+"vision": {"exe": "engine/strata-vision", "mmproj": "...mmproj-step3.7-flash-f16.gguf", "gpu": false, ...}
+```
+
+Three things had to be fixed for that to be true, and the first two were mine:
+
+- the family's `file` must be a **bare name**: setup looks the pinned sha256 up by file name in two places, so a
+  template carrying the Hub's `IQ3_XXS/` folder crashed it. The folder belongs in `hf` (as for every other family), and
+  `--gguf-dir` is what takes files that are already on disk - with the mmproj beside them.
+- the family declared `vision` **twice** (a template's `False` came last and won): pictures were off whatever the entry
+  said.
+- setup had no way to write an engine's own options. It now reads an `engine_args` list from the family entry, which is
+  how `--dense-cache auto --expert-cache auto` reach the config - the difference between 0.80 and 0.12 s per token.
+
+What is still not a release: the engine **package** the app and `strata launch` install comes from the signed update
+feed (`component:strata-engine`), and the feed's 0.1.55 was built before this branch. A source checkout compiles the
+engine itself and is fine; a downloaded Strata would offer the family and then fail to serve it until a release built
+from a tree with it is published.
+
 ## Tests
 
 ```sh
