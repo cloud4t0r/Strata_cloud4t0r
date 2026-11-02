@@ -49,6 +49,7 @@ struct KvLayer {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
+    void* k_q_host = nullptr;   ///< the pinned allocation behind k_q/v_q/k_scale/v_scale when they live on the host
     int cells = 0;              ///< physical cells: `capacity`, or the ring's length on a sliding layer
     int ring = 0;               ///< 0: this layer keeps every position; else the ring's length in cells
     int32_t* table = nullptr;   ///< (capacity / page_size,) logical page -> physical page, per layer
@@ -63,6 +64,9 @@ struct Session {
     int page_size = kKvPageSize;
     int capacity = 0;    ///< cells the SEQUENCE may hold (the logical bound; a ring layer stores fewer)
     int n_cached = 0;    ///< cells written so far (the next free position; never used as an argument)
+    /// The pools live in PINNED, DEVICE-MAPPED HOST memory instead of VRAM: the cache then costs no VRAM at all, at
+    /// the price of reading it over the bus.  It is what lets a context bigger than the card run at all.
+    bool host_pools = false;
     std::vector<int> windows;   ///< per layer: the sliding window, 0 for a full-attention block
     int32_t* step = nullptr;   ///< (kStepCount,) i32 on device: what the kernels read the position from
     int32_t* steps = nullptr;   ///< (capacity * kStepCount,) i32: one step buffer per prefilled position
@@ -85,7 +89,7 @@ int session_layer_cells(const Session& s, int layer);
 /// a window this engine applies differently from the attention kernel would be a quiet difference between the two
 /// paths that are supposed to be the same arithmetic.
 bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int capacity, std::string& err,
-                    const std::vector<int>& per_layer_window = {});
+                    const std::vector<int>& per_layer_window = {}, bool host_pools = false);
 void session_destroy(Session& s);
 
 /// Takes the K and V of `n_tok` positions (already normed and rotated, exactly as the attention wants them),

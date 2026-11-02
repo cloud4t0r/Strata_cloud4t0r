@@ -78,7 +78,24 @@ bool session_layer(Session& s, int layer, std::string& err) {
     const size_t codes = cells * (size_t) s.n_head_kv * s.head_dim;
     const size_t scales = cells * (size_t) s.n_head_kv * (s.head_dim / KV_Q8_GROUP);
     const std::string what = "allocate layer " + std::to_string(layer);
-    if (!cuda_ok(cudaMalloc((void**) &l.k_q, codes), what, err) ||
+    // One allocation per layer when the pools live on the host: four cudaHostAlloc calls of a few MB each would cost
+    // four sets of pinned pages for what is one block of memory.  The kernels get the DEVICE view of it.
+    if (s.host_pools) {
+        const size_t need = codes * 2 + scales * sizeof(uint16_t) * 2;
+        void* host = nullptr;
+        if (!cuda_ok(cudaHostAlloc(&host, need, cudaHostAllocMapped), what, err)) return false;
+        void* dev = nullptr;
+        if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
+            cudaFreeHost(host);
+            return set_err(err, "the pinned K/V allocation is not device-addressable (" + what + ")");
+        }
+        uint8_t* base = (uint8_t*) dev;
+        l.k_q = (int8_t*) base;
+        l.v_q = (int8_t*) (base + codes);
+        l.k_scale = (uint16_t*) (base + 2 * codes);
+        l.v_scale = (uint16_t*) (base + 2 * codes + scales * sizeof(uint16_t));
+        l.k_q_host = host;
+    } else if (!cuda_ok(cudaMalloc((void**) &l.k_q, codes), what, err) ||
         !cuda_ok(cudaMalloc((void**) &l.v_q, codes), what, err) ||
         !cuda_ok(cudaMalloc((void**) &l.k_scale, scales * sizeof(uint16_t)), what, err) ||
         !cuda_ok(cudaMalloc((void**) &l.v_scale, scales * sizeof(uint16_t)), what, err)) {
@@ -92,7 +109,9 @@ bool session_layer(Session& s, int layer, std::string& err) {
     if (!cuda_ok(cudaMalloc((void**) &l.table, table.size() * sizeof(int32_t)), what, err) ||
         !cuda_ok(cudaMemcpy(l.table, table.data(), table.size() * sizeof(int32_t), cudaMemcpyHostToDevice), what,
                  err)) {
-        cudaFree(l.k_q); cudaFree(l.v_q); cudaFree(l.k_scale); cudaFree(l.v_scale); cudaFree(l.table);
+        if (l.k_q_host) cudaFreeHost(l.k_q_host);
+        else { cudaFree(l.k_q); cudaFree(l.v_q); cudaFree(l.k_scale); cudaFree(l.v_scale); }
+        cudaFree(l.table);
         l = KvLayer{};
         return false;
     }
@@ -135,7 +154,7 @@ uint64_t session_bytes(const Session& s) {
 }
 
 bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int capacity, std::string& err,
-                    const std::vector<int>& per_layer_window) {
+                    const std::vector<int>& per_layer_window, bool host_pools) {
     if (n_layers <= 0 || n_head_kv <= 0 || head_dim <= 0 || capacity <= 0)
         return set_err(err, "a cache needs layers, KV heads, a head width and a capacity");
     if (head_dim % KV_Q8_GROUP != 0)
@@ -151,6 +170,7 @@ bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int c
     // not a multiple of the granule would be a bound the pools do not really have.
     s.capacity = ((capacity + s.page_size - 1) / s.page_size) * s.page_size;
     s.n_cached = 0;
+    s.host_pools = host_pools;
     s.windows = per_layer_window.empty() ? std::vector<int>((size_t) n_layers, 0) : per_layer_window;
     s.layers.assign((size_t) n_layers, KvLayer{});
 
@@ -167,10 +187,14 @@ bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int c
 
 void session_destroy(Session& s) {
     for (KvLayer& l : s.layers) {
-        cudaFree(l.k_q);
-        cudaFree(l.v_q);
-        cudaFree(l.k_scale);
-        cudaFree(l.v_scale);
+        if (l.k_q_host) {
+            cudaFreeHost(l.k_q_host);   // one allocation holds all four pools when they are pinned
+        } else {
+            cudaFree(l.k_q);
+            cudaFree(l.v_q);
+            cudaFree(l.k_scale);
+            cudaFree(l.v_scale);
+        }
         cudaFree(l.table);
         l = KvLayer{};
     }

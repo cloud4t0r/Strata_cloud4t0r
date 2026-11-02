@@ -725,7 +725,7 @@ bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tie
 /// and the working buffers are out of the way.  The blocks come first - 1.9 GB buys the larger half of a token - and the
 /// tier takes the rest.  `tier_mib` / `dense_mib` are -1 for auto on the command line; both are replaced in place.
 void auto_budgets(const strata::GgufModel& file, int n_blocks, int dense_layers, const kernels::Session& session,
-                  int& tier_mib, int& dense_mib) {
+                  int& tier_mib, int& dense_mib, bool kv_host) {
     if (tier_mib >= 0 && dense_mib >= 0) return;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b == 0) return;
@@ -733,7 +733,8 @@ void auto_budgets(const strata::GgufModel& file, int n_blocks, int dense_layers,
     // streamed) another ~250 MB with the dense cache in place, and the residency tables and step buffers grow with the
     // context.  1.5 GB is what keeps the LAST allocation of a load from failing: measured, 1 GB let the head fail.
     const uint64_t reserve = 3ull << 29;
-    const uint64_t kv = kernels::session_bytes_at(session, session.capacity);
+    // a cache in pinned host memory costs the card nothing: that VRAM goes to the experts instead
+    const uint64_t kv = kv_host ? 0 : kernels::session_bytes_at(session, session.capacity);
     const uint64_t room = free_b > kv + reserve ? (uint64_t) free_b - kv - reserve : 0;
     const uint64_t dense_need = kernels::dense_layers_bytes(file, n_blocks, dense_layers);
     // rounded UP: a budget a byte short of the blocks streams the last one for ever
@@ -1003,7 +1004,7 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
 /// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
 /// prompt extends the one before decodes only what is new.
 int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib,
-          const std::string& tier_policy) {
+          const std::string& tier_policy, bool kv_host) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -1031,7 +1032,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
         }
         kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
         kernels::Session trunk;
-        if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, max_ctx, err, windows)) {
+        if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, max_ctx, err, windows, kv_host)) {
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
@@ -1423,7 +1424,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
              int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib,
-             const std::string& tier_policy, const SamplerConfig& samp) {
+             const std::string& tier_policy, bool kv_host, const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1475,12 +1476,15 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
 
         kernels::Session s;
         std::string err;
-        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err, windows)) {
+        if (!kernels::session_create(s, n_blocks, n_head_kv, head_dim, capacity, err, windows, kv_host)) {
             std::printf("strata-step35: %s\n", err.c_str());
             return 1;
         }
+        if (kv_host)
+            std::printf("strata-step35: the K/V cache lives in pinned host memory (device-mapped): it costs no VRAM, "
+                        "and every attention reads it over the bus\n");
         auto_budgets(file, n_blocks, (int) file.meta().get("step35.leading_dense_block_count")->num(), s, tier_mib,
-                     dense_mib);
+                     dense_mib, kv_host);
         kernels::ExpertCache tier;
         if (!open_tier(file, tier_mib, tier, err, stdout, tier_policy)) {
             std::printf("strata-step35: %s\n", err.c_str());
@@ -1687,6 +1691,8 @@ void usage() {
         "      fetches served at 4 GB against fifo's 37.2%, and 67.6% against 57.6% at 8 GB).  Both caches take\n"
         "      `auto`: what the card has left once the K/V cache and 1.5 GB of reserve are out of the way, the blocks\n"
         "      first and the tier with the rest.  --max-new stops on the file's own end token.\n"
+        "      --kv-host puts the K/V cache in pinned, device-mapped host memory: it costs no VRAM at all, at the price\n"
+        "      of reading it over the bus - what lets a context bigger than the card run at all.\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -1836,12 +1842,14 @@ int run(int argc, char** argv) {
     int64_t drafts = 3, max_new = 0, tier_mib = 0, dense_mib = 0, top_k = 0, seed = 0;
     // -1 means "auto": what the card has left once the K/V cache and a reserve are out of the way
     std::string tier_policy = "lru";
+    bool kv_host = false;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
     for (int i = 1; i < argc; ++i) {
         // `--logits` is a switch; the flags this engine takes all take a value, so one with nothing after it is an
         // error and not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
         const bool is_flag = argv[i][0] == '-' && argv[i][1] != '\0';
-        if (is_flag && std::strcmp(argv[i], "--logits") != 0 && i + 1 >= argc) {
+        const bool is_switch = std::strcmp(argv[i], "--logits") == 0 || std::strcmp(argv[i], "--kv-host") == 0;
+        if (is_flag && !is_switch && i + 1 >= argc) {
             std::printf("strata-step35: %s needs a value\n", argv[i]);
             return 2;
         }
@@ -1895,6 +1903,8 @@ int run(int argc, char** argv) {
             repeat_penalty = std::strtod(argv[++i], nullptr);
         } else if (std::strcmp(argv[i], "--seed") == 0) {
             seed = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--kv-host") == 0) {
+            kv_host = true;
         } else if (std::strcmp(argv[i], "--tier-policy") == 0) {
             tier_policy = argv[++i];
         } else if (std::strcmp(argv[i], "--dense-cache") == 0) {
@@ -1944,12 +1954,12 @@ int run(int argc, char** argv) {
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib,
                         (int) dense_mib, tier_policy);
-    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy);
+    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy, kv_host);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
-                        (int) tier_mib, (int) dense_mib, tier_policy, samp);
+                        (int) tier_mib, (int) dense_mib, tier_policy, kv_host, samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
