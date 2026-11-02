@@ -727,6 +727,8 @@ M2_KV_LABELS = {
 STEP35_FILES = {
     "Step-3.7-flash-IQ3_XXS-00001-of-00002.gguf": (46645813024, "ce04c744be266f05a23ff683ab0086e20b8de8aee816f17aa5dd5738f675cc5d"),
     "Step-3.7-flash-IQ3_XXS-00002-of-00002.gguf": (29112867936, "aeedcdaa32646f1bdf199309503a63bcd1f597940f5c73c9562923554a47e31d"),
+    # the picture reader (a 47-block ViT, projector_type step3vl), read by strata-vision (llama.cpp's mtmd)
+    "mmproj-step3.7-flash-f16.gguf": (3972828768, "5f25d11f92235c69682ca820af5f4cb125ae1142c8c33c018d0b3c9000a2ec1c"),
 }
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
@@ -843,6 +845,10 @@ OWN_PATH_FAMILIES = {
                "kv_bytes_per_token": 12 * 2112, "kv_fixed_gb": 0.107,
                # nothing is copied to the card or to RAM: the expert tier (--expert-cache) only buys speed
                "streams_experts": True,
+               # pictures: the mmproj above through strata-vision (llama.cpp mtmd, whose step3vl clip graph is in
+               # third_party/llama.cpp); the engine takes the encoder's rows in a GENI request (docs/STEP37.md)
+               "vision": True,
+               "mmproj": "mmproj-step3.7-flash-f16.gguf",
                # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
                "mtp": 0,
                "vision": False, "state_gb": 0.0},

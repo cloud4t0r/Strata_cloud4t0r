@@ -309,10 +309,26 @@ int main(int argc, char** argv) {
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
-            const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            // The grid: mtmd knows it exactly (nx/ny are deprecated but the only exact source).  The decoder
+            // positions are a fallback for the projectors that lay a picture out on a 2-D grid of positions - the
+            // M-RoPE families.  Step-3.7-Flash's step3vl is not one: its positions are 1-D, so the arithmetic
+            // answered "169 tokens, not rectangular" for a perfectly square grid.
+            size_t gnx = 0, gny = 0;
+            {
+                const size_t wx = mtmd_image_tokens_get_nx(it), wy = mtmd_image_tokens_get_ny(it);
+                if (wx > 0 && wy > 0 && wx * wy == (size_t) n) {
+                    gnx = wx;
+                    gny = wy;
+                }
+            }
+            if (gnx == 0) {
+                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
+                gnx = (size_t) last.x + 1;
+                gny = (size_t) last.y + 1;
+            }
+            const int nx = (int) gnx, ny = (int) gny;
+            if ((size_t) nx * (size_t) ny != (size_t) n)
+                err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
             if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
                 err = "the picture became " + std::to_string(n) + " image tokens, over the limit of " + std::to_string(max_tokens) +

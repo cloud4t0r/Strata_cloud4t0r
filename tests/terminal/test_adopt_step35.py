@@ -55,6 +55,28 @@ def test_the_cache_grows_with_the_context_and_the_tier_shrinks(tmp_path):
            int(small["args"][small["args"].index("--expert-cache") + 1])
 
 
+def test_pictures_are_on_when_the_mmproj_is_beside_the_model(tmp_path):
+    quant = _folder(tmp_path)
+    cfg, problems = _plan(tmp_path, quant)
+    assert problems == []
+    assert cfg.get("vision") if "vision" in cfg else "vision" not in cfg   # no mmproj here: off, and no key
+    assert "mmproj" not in cfg
+
+    (tmp_path / "mmproj-step3.7-flash-f16.gguf").write_bytes(b"")
+    cfg, problems = _plan(tmp_path, quant, notes=[])
+    assert problems == []
+    assert cfg["vision"] is True
+    assert cfg["mmproj"] == str(tmp_path / "mmproj-step3.7-flash-f16.gguf")
+
+
+def test_a_missing_mmproj_is_said_not_silent(tmp_path):
+    quant = _folder(tmp_path)
+    notes = []
+    cfg, _ = _plan(tmp_path, quant, notes=notes)
+    assert "vision" not in cfg
+    assert any("pictures stay off" in n for n in notes)
+
+
 def test_a_missing_shard_is_named(tmp_path):
     quant = _folder(tmp_path)
     (quant / "Step-3.7-flash-IQ3_XXS-00002-of-00002.gguf").unlink()

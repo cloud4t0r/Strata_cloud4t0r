@@ -703,9 +703,32 @@ an unreadable file.
 entries of `tokenizer.ggml.tokens`, so the token cannot be found at runtime - the other engines of this Terminal carry
 their pad token the same way.
 
-What is still missing is not in this engine: build `strata-vision` here (llama.cpp's mtmd is in the tree but not
-built), ship the mmproj with the family (`setup.py` does not list it), and turn `vision` back on in the catalogue -
-then a real picture can be tried. The estimate for that is a day, not weeks.
+### And it runs on a real picture
+
+The rest is wired:
+
+- `setup.py`: the mmproj is pinned with the shards (3 972 828 768 bytes, sha256 `5f25d11f…2ec1c`, from the Hub's own
+  file list) and the family declares `vision: True` with its `mmproj` name.
+- `strata_cli/launch/adopt.py`: a step35 config turns pictures on when the mmproj is beside the shards (or one folder
+  up, as the tokenizer is), and says so in a note when it is not.
+- the engine accepts `--vision` and ignores it: the encoder is `strata-vision`'s, the pictures arrive as `GENI`.
+- `tools/vision`: the grid came from the decoder positions, which is right for the M-RoPE families and wrong for
+  `step3vl` (its positions are 1-D: a square 169-token picture was read as "not rectangular"). It now asks mtmd for
+  `nx`/`ny` first and falls back to the positions.
+
+Measured end to end on this machine, a 96x96 PNG (a red disc on a blue field):
+
+```
+strata-vision --mmproj ... --model ...      -> OK 169 169 1 14604      (169 rows, grid flat)
+GENI 4 <169 rows> 0,<169 x im_patch>,671    -> T 4609 4849 260 4332     (171 positions, 51.7 s of prefill)
+GEN  4        0,<169 x im_patch>,671        -> T 3967 10059 678 304     (the same prompt, rows not injected)
+```
+
+The two answers differ, which is the point: the rows reach the trunk. What is *not* claimed is that the answer is
+right - that is the encoder's business (llama.cpp's step3vl graph, unmodified here) and would need a reference output
+to say anything about.
+
+Build cost: `strata-vision` (CPU, from `tools/vision`) takes two minutes and needs no model - it reads the mmproj.
 
 ## Tests
 

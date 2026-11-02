@@ -1973,7 +1973,10 @@ int run(int argc, char** argv) {
         // `--logits` is a switch; the flags this engine takes all take a value, so one with nothing after it is an
         // error and not a silent no-op (the loop used to stop at argc-1, which swallowed a trailing bare flag).
         const bool is_flag = argv[i][0] == '-' && argv[i][1] != '\0';
-        const bool is_switch = std::strcmp(argv[i], "--logits") == 0 || std::strcmp(argv[i], "--kv-host") == 0;
+        // switches this engine takes or tolerates: `--vision` is written by setup for the families that read pictures,
+        // and here the encoder is strata-vision's, so it is accepted and does nothing
+        const bool is_switch = std::strcmp(argv[i], "--logits") == 0 || std::strcmp(argv[i], "--kv-host") == 0 ||
+                               std::strcmp(argv[i], "--vision") == 0;
         if (is_flag && !is_switch && i + 1 >= argc) {
             std::printf("strata-step35: %s needs a value\n", argv[i]);
             return 2;
@@ -2030,6 +2033,8 @@ int run(int argc, char** argv) {
             seed = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--kv-host") == 0) {
             kv_host = true;
+        } else if (std::strcmp(argv[i], "--vision") == 0) {
+            // pictures arrive as GENI requests; the flag only says the encoder is there
         } else if (std::strcmp(argv[i], "--image-token") == 0) {
             image_token = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--dump-embeddings") == 0) {

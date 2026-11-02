@@ -65,7 +65,7 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     problems: list[str] = []
     if family == "step35":
         return _plan_step35(model_dir=model_dir, context=context, model_name=model_name, log=log, backend=backend,
-                            vram_gb=vram_gb, notes=notes)
+                            vram_gb=vram_gb, notes=notes, family_def=family_def)
     if family not in FAMILIES:
         # no full stop: the caller joins the problems with "; " and ends the sentence (a "gyro.." came out of the old text, round 8, N11)
         return None, [f"Strata can write the settings itself only for the Qwen3.8-Flash-Next, Swift, Coder, Gyro and "
@@ -144,7 +144,8 @@ def step35_kv_gb(context: int) -> float:
 
 
 def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, backend: str | None, vram_gb: float,
-                 notes: list | None) -> tuple[dict | None, list[str]]:
+                 notes: list | None, family_def: dict | None = None) -> tuple[dict | None, list[str]]:
+    family_mmproj = (family_def or {}).get("mmproj")
     """The run config for a Step-3.7-Flash folder that is already on disk: two shards, the folder's own tokenizer,
     and the engine reading the GGUF directly - no prepared pack, no expert profile, nothing to download."""
     problems: list[str] = []
@@ -169,6 +170,15 @@ def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, b
         args += ["--expert-cache", str(tier_mib)]
     cfg = {"exe": "component:strata-engine", "args": args, "cwd": str(Path(model_dir)), "tokenizer": str(tokenizer),
            "model_name": model_name, "arch": "step35", "log": str(log), "lib_dirs": [], "port": 8080}
+    # pictures: the mmproj beside the shards (or one folder up, as the tokenizer is), read by strata-vision
+    mmproj = Path(model_dir) / (family_mmproj or "mmproj-step3.7-flash-f16.gguf")
+    if not mmproj.exists():
+        mmproj = Path(model_dir).parent / (family_mmproj or "mmproj-step3.7-flash-f16.gguf")
+    if mmproj.exists():
+        cfg["vision"] = True
+        cfg["mmproj"] = str(mmproj)
+    elif notes is not None:
+        notes.append("Step-3.7-Flash: no mmproj file beside the model, so pictures stay off for this install.")
     if backend == "metal":
         cfg["env"] = {"STRATA_METAL_STREAM": "1"}
     if backend:
