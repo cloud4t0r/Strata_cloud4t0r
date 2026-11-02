@@ -174,8 +174,9 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **One request at a time, deliberately.** `--serve` answers one GEN at a time and the engine is single-device; the
   server's slots and `--layer-split` are accepted and ignored. Batching positions is measured 4.5x worse per position
   than decoding them one at a time (above), so this is a measurement, not an omission.
-- **No vision, and it is a second model.** The `mmproj` is a 47-block ViT that has to be run in the same process with
-  the text model (see above); nothing of it exists here.
+- **Vision: the engine takes the picture rows, the rest is wiring.** `GENI` lands the encoder's rows on the
+  `<im_patch>` cells and is verified against the text path; `strata-vision` (llama.cpp mtmd, with the `step3vl` graph)
+  is not built here, the mmproj is not in the family's file list, and the catalogue still says `vision: false`.
 
 ## The KV cache: what it is, and what it cost
 
@@ -673,6 +674,38 @@ So a gathered MoE kernel is not worth writing for this engine: it would trade th
 worth writing the day the experts are in VRAM (they are 75 GB) or the file is on a bus that carries 78 GB/s. Until
 then this page says so with the probe's numbers rather than with an opinion, and the probe stays in the tree as the
 diagnostic that answered it.
+
+## Pictures: the engine side is in, the encoder is llama.cpp's
+
+The page used to say vision was "a second model in the same process, the largest item left". That was wrong twice
+over: this model **does** support pictures - `mmproj-step3.7-flash-f16.gguf` is a 47-block ViT (`projector_type`
+`step3vl`) and the chat template carries `<im_patch>` - and Strata never runs a ViT itself. Pictures go through
+`strata-vision`, which is llama.cpp's **mtmd** tool with the model's mmproj, and the mtmd in this tree already has the
+`step3vl` clip graph (`tools/mtmd/models/step3vl.cpp`, dispatched in `clip.cpp`). So the encoder was never ours to
+write.
+
+What was missing is the engine half, and it is in:
+
+- `--serve` accepts `GENI <n> [key=value ...] <file> <id,id,...>`, where `<file>` is a stratum-vision file (`SVE1`
+  records: `n, nx, ny, n_embd` then `n x n_embd` floats, in prompt order). The rows replace the embeddings of the
+  prompt's `<im_patch>` cells, in place, before the first block runs - one position per cell, since this decoder has a
+  plain 1-D rope and needs no (t, h, w).
+- `--dump-embeddings <file> --tokens <ids>` writes a prompt's own embedding rows in that format, which is what makes
+  the path testable without the encoder: feeding a prompt's own rows back as pictures must answer exactly what the
+  text path answers.
+
+Verified: `GEN 6 0,671,6102,294,8760,344` and `GENI 6 <rows> 128001,128001,...` (six tokens replaced by their own
+embeddings) both answer `11111 16 455 6102 294 10322`, token for token. And the refusals are named: a row count that
+does not match the cells (`the prompt has 2 <im_patch> cell(s), the embeddings file 6 row(s)`), a prompt with no cell,
+an unreadable file.
+
+**The `<im_patch>` id is 128001 and it is a flag** (`--image-token`), not a lookup: the reader keeps only the first 64
+entries of `tokenizer.ggml.tokens`, so the token cannot be found at runtime - the other engines of this Terminal carry
+their pad token the same way.
+
+What is still missing is not in this engine: build `strata-vision` here (llama.cpp's mtmd is in the tree but not
+built), ship the mmproj with the family (`setup.py` does not list it), and turn `vision` back on in the catalogue -
+then a real picture can be tried. The estimate for that is a day, not weeks.
 
 ## Tests
 
