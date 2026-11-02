@@ -161,10 +161,13 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
   package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
   start needs an engine built from this branch. The app and the web page do not know the family yet either.
+- **Expert routing is host-side, and it is now the first item.** The profile after the caches: the router's ids and
+  weights coming back to the host are **9% of a token** (it waits for the router's own kernels, which is why enqueueing
+  the two copies and waiting once changes nothing - 273 ms against 249, noise). Removing it needs the eight experts'
+  matvecs to happen in one device-side kernel reading a device-side residency table, i.e. a gathered MoE kernel for
+  every quantized type the release uses. That is the work, and the ceiling is measured at 9%.
 - **Expert routing is host-side.** Every position of every block brings its eight expert ids back to the host, which
-  copies the matrices: that round trip is what makes a CUDA graph impossible and what a device-side gather would
-  remove. Measured, it is 1.97% of a token - the smallest of the three items this page has profiled, and not worth a
-  device-side router until everything above it is gone.
+  copies the matrices: that round trip is also what makes a CUDA graph impossible.
 - **The cache goes to host, it does not page in and out.** `--kv-host` keeps the whole cache in pinned host memory
   (measured: 3.46 GB of VRAM freed at 131072 for 0.003 s per token); a *partial* spill - only the pages a window needs,
   as `kv_stream.hpp` does for the QSA layers - is not written, and the read cost of a fully filled long context is
@@ -334,7 +337,7 @@ The ladder it produces, all at 24 tokens:
 | `+ --expert-cache 8000` | 0.220 | -72% |
 | `+ --expert-cache 12000` | **0.200** | **-75%** |
 | `+ --expert-cache 10000 --gpu-spec --drafts 1` | 0.253 | -68% |
-| `--dense-cache auto --expert-cache auto` | **0.218** (200 tokens) | **-73%** |
+| `--dense-cache auto --expert-cache auto` | **0.121** (24 tokens) | **-85%** |
 
 ## Speculative decoding, and why K=1
 
@@ -542,6 +545,10 @@ with the expert tier holding the experts, **66% of a token was the dense weights
 | `--dense-cache 2600` | **0.503** | **-39%** |
 | `--dense-cache 2600 --expert-cache 10000` | **0.264** | **-68%** |
 | the same with `--gpu-spec --drafts 1` | **0.258** | **-68%**, 4 of 5 drafts accepted |
+
+The same cache also keeps each mixture-of-experts block's **router, selection bias and shared expert** - 11 MB a
+block, 431 MB for the 42 of them - which the profile found were being uploaded once per pass per block: **41% of a
+token**. Kept, that is 0.200 s/token down to **0.121 s/token**, and the one-off fill is 128 ms.
 
 All 45 blocks fit: 1.88 GB, `45 block(s) resident, 0 streamed` (the budget is only a ceiling; a block that does not
 fit is streamed exactly as before). Both caches take **`auto`**: what the card has left once the K/V cache and 1.5 GB
