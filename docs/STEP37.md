@@ -161,11 +161,10 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
   package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
   start needs an engine built from this branch. The app and the web page do not know the family yet either.
-- **Expert routing is host-side, and it is now the first item.** The profile after the caches: the router's ids and
-  weights coming back to the host are **9% of a token** (it waits for the router's own kernels, which is why enqueueing
-  the two copies and waiting once changes nothing - 273 ms against 249, noise). Removing it needs the eight experts'
-  matvecs to happen in one device-side kernel reading a device-side residency table, i.e. a gathered MoE kernel for
-  every quantized type the release uses. That is the work, and the ceiling is measured at 9%.
+- **Expert routing is host-side, and it stays that way.** The round trip is 9% of a token, and a gathered device-side
+  kernel would remove it - but only by reading the expert bytes from the file mapping at **2.2 GB/s** (measured by
+  `step35_hostread_probe`), which is ~0.9 s per token against today's 0.121. The engine is right to copy (78.8 GB/s)
+  and to keep them in the tier; the item is closed by a measurement, not by a plan.
 - **Expert routing is host-side.** Every position of every block brings its eight expert ids back to the host, which
   copies the matrices: that round trip is also what makes a CUDA graph impossible.
 - **The cache goes to host, it does not page in and out.** `--kv-host` keeps the whole cache in pinned host memory
@@ -651,6 +650,29 @@ What it does **not** measure: the read cost at a context that is really filled. 
 add is arithmetic, not a measurement: 12 full blocks x 2112 B x positions = 3.3 GB per token at 131072, which at
 20 GB/s is 0.17 s - at which point the tier would have to be given back, and the choice becomes a measurement worth
 making on the card that needs it.
+
+## A device-side MoE kernel: the measurement that decides it
+
+The host round trip that routes a position's eight experts is now the first item left (9% of a token, above). A single
+kernel doing the eight matvecs from device memory would remove it - and it can only do that if the expert bytes are
+device-addressable. They are not: they live in the file's mapping, and every miss copies them to VRAM. So the question
+is whether a kernel can read that mapping, and `step35_hostread_probe` answers it with numbers:
+
+| | 268 MB of a real shard |
+|---|---|
+| a kernel reading the mapping, registered as host-mapped | **120.3 ms, 2.2 GB/s** |
+| the same bytes copied to VRAM first, then read there | **3.4 ms, 78.8 GB/s** |
+
+Registration works - `cudaHostRegister` accepts a file mapping on this driver and `cudaHostGetDevicePointer` gives a
+kernel a usable view - so the mechanism is there. The *bandwidth* is not: 2.2 GB/s is what a device read of host memory
+costs. An expert is 5.9 MB, a position routes to eight of them, 47 MB per position per block, 42 blocks:
+**21 ms per position per block, ~0.9 s per token** - seven times what the engine does today, where the bytes reach VRAM
+at 78.8 GB/s and the tier keeps them there.
+
+So a gathered MoE kernel is not worth writing for this engine: it would trade the 9% round trip for ~700%. It becomes
+worth writing the day the experts are in VRAM (they are 75 GB) or the file is on a bus that carries 78 GB/s. Until
+then this page says so with the probe's numbers rather than with an opinion, and the probe stays in the tree as the
+diagnostic that answered it.
 
 ## Tests
 
