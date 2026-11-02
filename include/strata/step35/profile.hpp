@@ -19,6 +19,7 @@ struct Profile {
     uint64_t expert_calls = 0, expert_ns = 0;       ///< the three matrices of one expert, H2D (no tier)
     uint64_t steps_calls = 0, steps_ns = 0;         ///< a pass's positions, H2D, once per layer
     uint64_t block_calls = 0, block_ns = 0;         ///< one block's dense weights, uploaded per pass and per layer
+    uint64_t moe_calls = 0, moe_ns = 0;             ///< a MoE block's router and shared expert, uploaded per pass and per layer
 };
 
 bool profiling();                        ///< STRATA_STEP35_PROFILE=1

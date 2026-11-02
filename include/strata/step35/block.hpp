@@ -177,12 +177,26 @@ void mtp_close(MtpContext& ctx);
 /// The blocks' DENSE weights, resident.  A pass uploads and frees one block's attention and feed-forward tensors per
 /// layer, which the profile measures at 66% of a token once the expert tier holds the experts - the dense part is only
 /// ~2 GB for all 45 blocks, so keeping it costs little and removes the larger half of a pass.
+/// A mixture-of-experts block's SMALL resident tensors - the router, its selection bias and the shared expert's three
+/// matrices: ~11 MB a block, but uploaded once per pass per block, which the profile measures at 41% of a token.
+struct MoeSmall {
+    void* router = nullptr;
+    float* sbias = nullptr;
+    void* sg = nullptr;
+    void* su = nullptr;
+    void* sd = nullptr;
+    int t_sh = 0;
+    size_t bytes = 0;
+};
+
 struct DenseCache {
     const strata::GgufModel* file = nullptr;
     std::vector<DenseBlock> blocks;
     std::vector<char> ready;      ///< 1: `blocks[layer]` is uploaded and must not be released
     size_t budget = 0, used = 0;  ///< bytes this cache may hold, and what it holds
     int kept = 0, streamed = 0;   ///< layers resident, layers too big for the budget
+    std::vector<MoeSmall> moe;    ///< per layer: its router and shared expert, when they are resident
+    std::vector<char> moe_ready;
 };
 
 /// Uploads a block into `cache` when it fits, up to `budget` bytes; a block that does not fit is streamed as before.
@@ -194,6 +208,15 @@ void dense_cache_done(DenseCache& c, int layer, DenseBlock& streamed);
 void dense_cache_close(DenseCache& c);
 /// The bytes the blocks' dense weights take on the card: what an "auto" budget has to know before it decides.
 uint64_t dense_layers_bytes(const strata::GgufModel& file, int n_layers, int dense_layers);
+/// A mixture-of-experts block's small resident tensors: the cached copy when it fits and is there (or null when it is
+/// not), with `kept` saying whether the caller may fill it through `dense_cache_moe_take`.
+MoeSmall* dense_cache_moe(DenseCache& c, int layer);
+/// Records the tensors a caller just uploaded so the next pass reuses them instead of uploading again.
+bool dense_cache_moe_take(DenseCache& c, int layer, void* router, float* sbias, void* sg, void* su, void* sd,
+                          int t_sh, size_t bytes);
+/// The bytes a MoE block's small tensors take, per block and for the whole file (what "auto" has to budget for).
+uint64_t moe_small_bytes(const strata::GgufModel& file, int layer);
+uint64_t moe_small_total(const strata::GgufModel& file, int n_layers, int dense_layers);
 
 /// One mixture-of-experts block whose experts stay in the FILE: the attention half, the router, the selection
 /// bias and the shared expert are resident (a few MB), and the eight chosen experts are copied out of the

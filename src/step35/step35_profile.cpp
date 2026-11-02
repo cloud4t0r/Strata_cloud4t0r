@@ -36,13 +36,14 @@ void print_profile(double total_s) {
     std::fprintf(stderr,
                  "strata-step35: profile over %.2f s - position %llu call(s) %.1f ms (%.2f%%), router %llu call(s) "
                  "%.1f ms (%.2f%%), experts %llu call(s) %.1f ms (%.2f%%), steps %llu call(s) %.1f ms (%.2f%%), "
-                 "blocks %llu call(s) %.1f ms (%.2f%%)\n",
+                 "blocks %llu call(s) %.1f ms (%.2f%%), moe-small %llu call(s) %.1f ms (%.2f%%)\n",
                  total_s, (unsigned long long) p.position_calls, (double) p.position_ns / 1e6,
                  share(p.position_ns, total_s), (unsigned long long) p.router_calls, (double) p.router_ns / 1e6,
                  share(p.router_ns, total_s), (unsigned long long) p.expert_calls, (double) p.expert_ns / 1e6,
                  share(p.expert_ns, total_s), (unsigned long long) p.steps_calls, (double) p.steps_ns / 1e6,
                  share(p.steps_ns, total_s), (unsigned long long) p.block_calls, (double) p.block_ns / 1e6,
-                 share(p.block_ns, total_s));
+                 share(p.block_ns, total_s), (unsigned long long) p.moe_calls, (double) p.moe_ns / 1e6,
+                 share(p.moe_ns, total_s));
 }
 
 }  // namespace strata::step35

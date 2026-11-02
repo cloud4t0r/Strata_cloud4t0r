@@ -736,7 +736,9 @@ void auto_budgets(const strata::GgufModel& file, int n_blocks, int dense_layers,
     // a cache in pinned host memory costs the card nothing: that VRAM goes to the experts instead
     const uint64_t kv = kv_host ? 0 : kernels::session_bytes_at(session, session.capacity);
     const uint64_t room = free_b > kv + reserve ? (uint64_t) free_b - kv - reserve : 0;
-    const uint64_t dense_need = kernels::dense_layers_bytes(file, n_blocks, dense_layers);
+    // the blocks AND their routers and shared experts: leaving the latter out is what made auto stream them for ever
+    const uint64_t dense_need = kernels::dense_layers_bytes(file, n_blocks, dense_layers) +
+                                kernels::moe_small_total(file, n_blocks, dense_layers);
     // rounded UP: a budget a byte short of the blocks streams the last one for ever
     if (dense_mib < 0) dense_mib = (int) ((std::min(dense_need, room) + (1u << 20) - 1) >> 20);
     // what the dense cache will really take: its budget if the person set one, the blocks' size if it is auto

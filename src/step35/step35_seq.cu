@@ -522,7 +522,18 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
             float* wts = nullptr;
             void *dg = nullptr, *du = nullptr, *dd = nullptr;
             int t_sh = 0;
-            if (ok) {
+            // The router, its bias and the shared expert are ~11 MB a block and were uploaded once per pass per block:
+            // 41% of a token, measured.  With a dense cache they are kept like the block's own weights.
+            MoeSmall* small = blocks ? dense_cache_moe(*blocks, layer) : nullptr;
+            if (small != nullptr) {
+                router = small->router;
+                sbias = small->sbias;
+                sg = small->sg;
+                su = small->su;
+                sd = small->sd;
+                t_sh = small->t_sh;
+            } else if (ok) {
+                ProfileScope tp(profile().moe_calls, profile().moe_ns);
                 try {
                     router = upload(file, pre + "ffn_gate_inp.weight", rb);
                     t_sh = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
@@ -530,6 +541,9 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     sg = upload(file, pre + "ffn_gate_shexp.weight", rb);
                     su = upload(file, pre + "ffn_up_shexp.weight", rb);
                     sd = upload(file, pre + "ffn_down_shexp.weight", rb);
+                    if (blocks)   // kept for the next pass when the budget allows it
+                        dense_cache_moe_take(*blocks, layer, router, sbias, sg, su, sd, t_sh,
+                                             (size_t) moe_small_bytes(file, layer));
                 } catch (const std::exception& ex) {
                     err = ex.what();
                     ok = false;
@@ -560,6 +574,9 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 ok = gemv(GGML_TYPE_F32, router, xp, logits, e, n_expert, d_q8, nullptr);
                 if (ok) moe_route(logits, sbias, 1, n_expert, top_k, exp_scale, exp_norm, ids, wts, nullptr);
                 {
+                    // The two copies wait for the router's own kernels, and that wait is what this costs: measured,
+                    // enqueueing them and waiting once instead of twice changes nothing (273 ms against 249, noise),
+                    // so the price is the round trip itself - what a device-side router would remove.
                     ProfileScope t(profile().router_calls, profile().router_ns);
                     if (ok) ok = cudaMemcpy(h_ids.data(), ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) == cudaSuccess;
                     if (ok) ok = cudaMemcpy(h_w.data(), wts, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -603,7 +620,10 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, 1.0f, e);
                 if (ok) k_add_n<<<(e + 255) / 256, 256>>>(hp, eacc, e);
             }
-            for (void* q : {router, (void*) sbias, sg, su, sd, (void*) logits, (void*) eg, (void*) eu,
+            // the five the cache may own are freed by `dense_cache_close`, not here
+            const bool owned = blocks && (size_t) layer < blocks->moe_ready.size() && blocks->moe_ready[(size_t) layer];
+            for (void* q : {owned ? nullptr : router, owned ? nullptr : (void*) sbias, owned ? nullptr : sg,
+                            owned ? nullptr : su, owned ? nullptr : sd, (void*) logits, (void*) eg, (void*) eu,
                             (void*) eact, (void*) ed, (void*) eacc, (void*) ids, (void*) wts, dg, du, dd})
                 if (q) cudaFree(q);
         }

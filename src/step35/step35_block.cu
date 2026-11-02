@@ -86,6 +86,45 @@ size_t block_bytes(const strata::GgufModel& file, int layer, bool with_ffn) {
     return total;
 }
 
+uint64_t moe_small_bytes(const strata::GgufModel& file, int layer) {
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    uint64_t total = 0;
+    for (const char* name : {"ffn_gate_inp.weight", "exp_probs_b.bias", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                             "ffn_down_shexp.weight"})
+        if (const strata::TensorInfo* t = file.find(pre + name)) total += strata::tensor_payload_bytes(*t);
+    return total;
+}
+
+uint64_t moe_small_total(const strata::GgufModel& file, int n_layers, int dense_layers) {
+    uint64_t total = 0;
+    for (int l = dense_layers; l < n_layers; ++l) total += moe_small_bytes(file, l);
+    return total;
+}
+
+MoeSmall* dense_cache_moe(DenseCache& c, int layer) {
+    if (layer < 0 || (size_t) layer >= c.moe.size()) return nullptr;
+    MoeSmall& m = c.moe[(size_t) layer];
+    return m.router != nullptr ? &m : nullptr;
+}
+
+bool dense_cache_moe_take(DenseCache& c, int layer, void* router, float* sbias, void* sg, void* su, void* sd,
+                          int t_sh, size_t bytes) {
+    if (layer < 0 || (size_t) layer >= c.moe.size()) return false;
+    if (c.moe_ready[(size_t) layer]) return false;   // the dense half is a different allocation: no clash
+    if (c.used + bytes > c.budget) return false;                                // it stays streamed this pass
+    MoeSmall& m = c.moe[(size_t) layer];
+    m.router = router;
+    m.sbias = sbias;
+    m.sg = sg;
+    m.su = su;
+    m.sd = sd;
+    m.t_sh = t_sh;
+    m.bytes = bytes;
+    c.moe_ready[(size_t) layer] = 1;
+    c.used += bytes;
+    return true;
+}
+
 uint64_t dense_layers_bytes(const strata::GgufModel& file, int n_layers, int dense_layers) {
     uint64_t total = 0;
     for (int l = 0; l < n_layers; ++l) total += block_bytes(file, l, l < dense_layers);
@@ -100,6 +139,8 @@ bool dense_cache_open(DenseCache& c, const strata::GgufModel& file, int n_layers
     c.file = &file;
     c.blocks.assign((size_t) n_layers, DenseBlock{});
     c.ready.assign((size_t) n_layers, 0);
+    c.moe.assign((size_t) n_layers, MoeSmall{});
+    c.moe_ready.assign((size_t) n_layers, 0);
     c.budget = budget;
     c.used = 0;
     c.kept = c.streamed = 0;
@@ -140,8 +181,19 @@ void dense_cache_done(DenseCache& c, int layer, DenseBlock& streamed) {
 }
 
 void dense_cache_close(DenseCache& c) {
-    for (size_t l = 0; l < c.blocks.size(); ++l)
+    for (size_t l = 0; l < c.blocks.size(); ++l) {
         if (c.ready[l]) release_block(c.blocks[(size_t) l]);
+        if (l < c.moe_ready.size() && c.moe_ready[l]) {
+            MoeSmall& m = c.moe[l];
+            cudaFree(m.router);
+            cudaFree(m.sbias);
+            cudaFree(m.sg);
+            cudaFree(m.su);
+            cudaFree(m.sd);
+        }
+    }
+    c.moe.clear();
+    c.moe_ready.clear();
     c.blocks.clear();
     c.ready.clear();
     c.used = 0;
