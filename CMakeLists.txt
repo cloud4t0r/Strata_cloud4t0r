@@ -962,6 +962,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(step35_kv_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(step35_kv_parity PRIVATE strata_step35 strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME step35_kv_parity COMMAND step35_kv_parity)
+  # can a kernel read the GGUF mapping?  A diagnostic for the device-side MoE (src/step35/step35_hostread_probe.cpp)
+  add_executable(step35_hostread_probe src/step35/step35_hostread_probe.cu)
+  target_include_directories(step35_hostread_probe PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(step35_hostread_probe PRIVATE ${_strata_gpu_runtime_target})
+
   # the MTP (NextN) block: one synthetic NextN file, the same two-step chain on the kernels and on the reference
   add_executable(step35_mtp_parity src/step35/step35_mtp_parity.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/step35/step35ref.cpp)
   target_include_directories(step35_mtp_parity PRIVATE ${_strata_gpu_include_directories}
