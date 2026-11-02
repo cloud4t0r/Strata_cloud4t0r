@@ -165,8 +165,10 @@ the same file, so a few 1e-3 per block is inside its spread.
   copies the matrices: that round trip is what makes a CUDA graph impossible and what a device-side gather would
   remove. Measured, it is 1.97% of a token - the smallest of the three items this page has profiled, and not worth a
   device-side router until everything above it is gone.
-- **No cache spill.** A K/V cache that outgrows VRAM has no host copy (`kv_stream.hpp` has one for the QSA layers);
-  it matters above 131072 positions on a card that also wants the tier (6.7 GB at the model's 262144 maximum).
+- **The cache goes to host, it does not page in and out.** `--kv-host` keeps the whole cache in pinned host memory
+  (measured: 3.46 GB of VRAM freed at 131072 for 0.003 s per token); a *partial* spill - only the pages a window needs,
+  as `kv_stream.hpp` does for the QSA layers - is not written, and the read cost of a fully filled long context is
+  arithmetic here rather than a measurement.
 - **One request at a time, deliberately.** `--serve` answers one GEN at a time and the engine is single-device; the
   server's slots and `--layer-split` are accepted and ignored. Batching positions is measured 4.5x worse per position
   than decoding them one at a time (above), so this is a measurement, not an omission.
@@ -619,6 +621,29 @@ Using it means four pieces this engine does not have: the image preprocessing (t
 over 47 blocks and 2704 patches, the merger, and the text side - the `<im_patch>` token of the chat template, whose
 rows are replaced by the projected image embeddings before the first block. None of that is a kernel away from what
 exists: it is a second model in the same process, and it is the largest item left on this page.
+
+## The K/V cache can live in host memory
+
+`--kv-host` puts the four K/V pools in **pinned, device-mapped host memory** instead of VRAM: one pinned allocation per
+layer, the kernels get its device view, and every attention reads it over the bus. The cache then costs the card
+nothing, and what it was holding goes to the experts.
+
+Measured at 131072 positions (`--max-context 131072`, six-token prompt, `--dense-cache auto --expert-cache auto`):
+
+| | peak VRAM | expert tier | s/token |
+|---|---|---|---|
+| cache in VRAM | 16.69 GB | 9587 MiB | 0.296 |
+| `--kv-host` | **13.23 GB** | **12860 MiB** | 0.299 |
+
+So the 3.43 GB the cache was holding become 3.4 GB of resident experts - the thing a token actually spends its time
+on - for a cost that does not show at nine used positions (0.296 against 0.299, inside the noise). The tokens are
+identical, `11111 16 455 6102 294 ...`, as they must be: this moves where the cells live, not what they hold.
+
+What it does **not** measure: the read cost at a context that is really filled. Nothing here prefills 131072 positions
+(that is hours), and with nine positions written the attention reads nine cells. The bus traffic a full context would
+add is arithmetic, not a measurement: 12 full blocks x 2112 B x positions = 3.3 GB per token at 131072, which at
+20 GB/s is 0.17 s - at which point the tier would have to be given back, and the choice becomes a measurement worth
+making on the card that needs it.
 
 ## Tests
 
