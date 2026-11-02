@@ -70,6 +70,25 @@ run, and `--m2-kv auto` (default) writes `--kv int8` (a quarter of FP32's VRAM).
 
 </details>
 
+<details>
+<summary><b>Step-3.7-Flash</b> (this fork)</summary>
+
+Step-3.7-Flash (196B, 11B active, 288 experts top-8, hybrid attention) runs on its own engine path on Linux, on
+AMD cards. Its two-shard IQ3_XXS release is 75.8 GB and the picture reader is another 4.0 GB. The experts are read
+from the file, so about 24 GB of RAM gives the page cache that makes it fast; the engine's own memory was measured
+at 2.2 GB.
+
+```sh
+./setup.sh --family step35
+```
+
+Setup compiles the engine from source, checks or downloads the two shards and the picture reader, extracts the
+tokenizer and writes the start script. The engine keeps the dense weights, the routers and an expert tier in
+graphics memory (`--dense-cache auto --expert-cache auto`). Details and measured numbers:
+[docs/STEP37.md](docs/STEP37.md).
+
+</details>
+
 
 <details>
 <summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>

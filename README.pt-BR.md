@@ -36,7 +36,7 @@ Recomendamos **primeiro a ISTA-DASLab**, depois a **Unsloth** e outros provedore
 | **ISTA-DASLab · recomendado** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) para programar. |
 | **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Usa menos memória, mas é mais lento. |
-| **Outras opções** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork) |
+| **Outras opções** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork), [Step-3.7-Flash](docs/STEP37.md) (this fork) |
 
 [Compare tamanhos, necessidades de memória e compatibilidade](docs/MODELS.md).
 
@@ -48,6 +48,23 @@ Recomendamos **primeiro a ISTA-DASLab**, depois a **Unsloth** e outros provedore
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. Esses são os pacotes documentados atualmente para este modelo.
 
 [Guia do modelo e compatibilidade](docs/QWEN36.md).
+
+</details>
+
+<details>
+<summary><b>Step-3.7-Flash</b> (este fork)</summary>
+
+Step-3.7-Flash (196 bilhões de parâmetros, 11 bilhões ativos, 288 especialistas top-8, atenção híbrida) usa seu
+próprio caminho de motor no Linux, em placas AMD. A versão IQ3_XXS tem 75,8 GB em dois arquivos, mais 4,0 GB para o
+leitor de imagens. Os especialistas são lidos do arquivo: cerca de 24 GB de RAM servem de cache de páginas para
+acelerar as leituras; o motor foi medido em 2,2 GB.
+
+```sh
+./setup.sh --family step35
+```
+
+A instalação compila o motor a partir do código-fonte, verifica ou baixa os dois arquivos e o leitor de imagens,
+extrai o tokenizer e escreve o script de inicialização. Detalhes e medições: [docs/STEP37.md](docs/STEP37.md).
 
 </details>
 

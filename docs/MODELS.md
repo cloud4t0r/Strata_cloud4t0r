@@ -1,12 +1,13 @@
 ﻿# Which model? Sizes, versions and what fits
 
 This page helps you choose a model and check that your computer can run it. It covers DeepSeek V4.1-Flash,
-Qwen3.8-Flash-Next (and its variants), Qwen3.6-35B-A3B and MiniMax-M2 (this fork, Linux only). For installing,
-see [INSTALL.md](INSTALL.md).
+Qwen3.8-Flash-Next (and its variants), Qwen3.6-35B-A3B and this fork's MiniMax-M2 and Step-3.7-Flash (Linux only).
+For installing, see [INSTALL.md](INSTALL.md).
 
 > **On this page:** [Quick start](#quick-start) · [Pick by memory](#pick-by-memory) ·
 > [DeepSeek V4.1-Flash](#deepseek-v41-flash) · [Qwen3.8-Flash-Next](#qwen38-flash-next) ·
-> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [MiniMax-M2](#minimax-m2) · [Adding or switching models](#adding-or-switching-models) ·
+> [Qwen3.6-35B-A3B](#qwen36-35b-a3b) · [MiniMax-M2](#minimax-m2) · [Step-3.7-Flash](#step-37-flash) ·
+> [Adding or switching models](#adding-or-switching-models) ·
 > [History](#history--older-measurements)
 
 ## Quick start
@@ -48,6 +49,7 @@ They are estimates; a given context may still not fit.
 - **More memory:** [Unsloth's 4 to 8 bit files](#unsloths-files-ud-iq4_xs-to-q8_0) need 72 to 136 GB for all experts in RAM.
 - **A smaller model:** [Qwen3.6-35B-A3B](#qwen36-35b-a3b), 32 to 52 GB of RAM.
 - **A very large model:** [DeepSeek V4.1-Flash](#deepseek-v41-flash), 12 GB graphics card, 46 to 64 GB of RAM and 257 GB of disk.
+- **A large model read from disk:** [Step-3.7-Flash](#step-37-flash), 75.8 GB on disk and about 24 GB of RAM for the page cache.
 
 If RAM is short, setup can read experts from the SSD instead ([below](#will-it-fit)). That works and is much slower.
 
@@ -317,6 +319,39 @@ The full guide: [MINIMAX_M2.md](MINIMAX_M2.md).
 
 ```
 ./setup.sh --setup --family minimax2
+```
+
+
+## Step-3.7-Flash
+
+A model from StepFun: [Step-3.7-Flash](https://huggingface.co/stepfun-ai/Step-3.7-Flash-GGUF) (196 billion
+parameters, 11 billion active per token, 288 experts top-8, hybrid attention). It reads text and pictures. This fork
+runs StepFun's IQ3_XXS release on its own engine path, on Linux AMD cards; setup compiles the engine from source. A
+downloaded engine package does not serve it yet (0.1.55 predates this branch).
+
+The experts are read from the GGUF where they lie, so the file does not need to fit in RAM: RAM is the page cache
+that makes the reads fast. Setup plans for about 24 GB of it; the engine's own memory was measured at 2.2 GB.
+
+| File | Download | In plain words |
+| --- | ---: | --- |
+| **IQ3_XXS** | 75.8 GB | the release's only offering so far (two shards) |
+| picture reader | 4.0 GB | the vision encoder (`mmproj`); `--vision no` leaves it out |
+
+**Measured on:** 2 x 16 GB AMD cards, 62 GB RAM, ROCm, IQ3_XXS.
+
+| Workload | Time |
+| --- | ---: |
+| one token, all 45 blocks, warm page cache | 1.39 s (2.13 s cold) |
+| a decoded token after a 6-position prompt | 0.96 s |
+| a decoded token at 1600 positions of context | 0.93 s |
+| a decoded token with the dense and expert caches | 0.12 s |
+
+The engine keeps the dense weights, the routers and an expert tier in graphics memory
+(`--dense-cache auto --expert-cache auto`). Pictures, limits and the engine's own commands:
+[STEP37.md](STEP37.md).
+
+```sh
+./setup.sh --family step35
 ```
 
 ## Adding or switching models

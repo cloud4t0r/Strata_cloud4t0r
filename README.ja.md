@@ -36,7 +36,7 @@
 | **ISTA-DASLab · おすすめ** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S。[Coder: IQ1\_M](docs/MODELS.md#coder)（コーディング向け）。 |
 | **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。メモリ使用量は少ないですが、動作は遅くなります。 |
-| **その他の選択肢** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork) |
+| **その他の選択肢** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork), [Step-3.7-Flash](docs/STEP37.md) (this fork) |
 
 [サイズ、必要なメモリ、互換性を比べる](docs/MODELS.md)。
 
@@ -48,6 +48,23 @@
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0。現在、このモデルで文書化されているパックです。
 
 [モデルガイドと互換性](docs/QWEN36.md)。
+
+</details>
+
+<details>
+<summary><b>Step-3.7-Flash</b>（このフォーク）</summary>
+
+Step-3.7-Flash（196B パラメータ、11B アクティブ、288 エキスパート top-8、ハイブリッド注意）は、Linux の AMD
+カードで独自のエンジンパスを使います。IQ3_XXS 版は 2 ファイルで 75.8 GB、画像リーダーが別に 4.0 GB です。
+エキスパートはファイルから読み出されるため、約 24 GB の RAM が読み出しを速くするページキャッシュになります。
+エンジン自体は 2.2 GB と測定されています。
+
+```sh
+./setup.sh --family step35
+```
+
+インストールはソースからエンジンをコンパイルし、2 つのファイルと画像リーダーを検証またはダウンロードし、
+トークナイザーを展開して起動スクリプトを書き出します。詳細と測定値: [docs/STEP37.md](docs/STEP37.md)。
 
 </details>
 

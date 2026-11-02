@@ -24,6 +24,8 @@ Model availability, provider preference and API details are in [AI_REFERENCE.md]
   `--speed faster|full` (or `--full-quality`) chooses how many experts it uses per word; Faster is the default on a
   PC with 16 GB of graphics memory or less. Print the plan first:
   `strata launch --plan --family deepseek41 --model ist-das-2.00bpw`.
+  This fork also carries MiniMax-M2 / M2.5 and Step-3.7-Flash, on their own engine paths on Linux AMD, compiled
+  from source. They are not in a downloaded engine package yet.
 - Check the **chosen pack's** memory and disk needs. Do not reuse a Flash-Next estimate for every family.
   Unified memory is one pool, not RAM plus VRAM. A completed download does not establish that a model can run.
 - Keep the default local-only access. Share the server over a network only when the user asks; recommend an API key
@@ -65,6 +67,7 @@ can differ. Gyro is a memory-saving fallback, currently slower, not a general sp
 | Unsloth Flash-Next | `--family unsloth --model UD-Q4_K_XL` (check the pack's backend limits) |
 | Gyro Flash-Next | `--family gyro --model Gyro-S` |
 | Unsloth Qwen3.6 | `--family qwen36 --model UD-Q4_K_XL` |
+| Step-3.7-Flash (this fork, source setup) | `--family step35 --model IQ3_XXS` |
 
 These are choices, not an instruction to install every row. The full list and memory estimates are in
 [MODELS.md](MODELS.md). For example, inspect the ISTA-DASLab Q2_0 plan:
@@ -110,6 +113,13 @@ Useful options:
 This fork also runs MiniMax-M2 on its own engine path, installed from source:
 `./setup.sh --family minimax2` (compiles the engine, downloads the 54.7 GB, writes `run_minimax_m2.sh`).
 It is not a `strata launch` family. See [MINIMAX_M2.md](MINIMAX_M2.md).
+
+### Step-3.7-Flash (this fork, Linux only)
+
+This fork also runs Step-3.7-Flash on its own engine path, installed from source:
+`./setup.sh --family step35` (compiles the engine, checks or downloads the two IQ3_XXS shards, 75.8 GB, and the
+4.0 GB picture reader, then writes the start script). A downloaded engine package does not serve it yet (0.1.55
+predates this branch). See [STEP37.md](STEP37.md).
 
 ## 5. Verify the running service
 

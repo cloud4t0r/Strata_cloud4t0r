@@ -90,8 +90,9 @@ changes the order only with `--reorder` (your trace's pairs first, then the base
 ## Which model?
 
 [MODELS.md](MODELS.md) is the page for choosing a model: sizes, memory, providers and what fits. The families are
-DeepSeek V4.1-Flash, Qwen3.8-Flash-Next (with its Coder, Swift, Gyro, Unsloth and NVFP4 variants) and Qwen3.6-35B-A3B
-([QWEN36.md](QWEN36.md)). The ISTA-DASLab Qwen3.8-Flash-Next packs are:
+DeepSeek V4.1-Flash, Qwen3.8-Flash-Next (with its Coder, Swift, Gyro, Unsloth and NVFP4 variants), Qwen3.6-35B-A3B
+([QWEN36.md](QWEN36.md)), and this fork's MiniMax-M2 ([MINIMAX_M2.md](MINIMAX_M2.md)) and Step-3.7-Flash
+([STEP37.md](STEP37.md)). The ISTA-DASLab Qwen3.8-Flash-Next packs are:
 
 | Model | Download | RAM it uses | Speed | Quality |
 | --- | ---: | ---: | --- | --- |

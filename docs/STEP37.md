@@ -69,6 +69,20 @@ hf download stepfun-ai/Step-3.7-Flash-GGUF \
 Two shards, 46.65 GB + 29.11 GB, plus 3.71 GB for the MTP heads. `--include` takes **one** pattern: a second
 pattern on the same line is read as a filename and silently downloads nothing.
 
+### Installing with setup (this fork)
+
+The same files are installed by setup, which also compiles the engine and the picture reader and writes the start
+script:
+
+```sh
+./setup.sh --family step35
+```
+
+It plans for about 24 GB of RAM (the page cache that makes the expert reads fast), checks both shards and
+`mmproj-step3.7-flash-f16.gguf` against their pinned sizes and SHA-256, and writes the engine's own options
+(`--dense-cache auto --expert-cache auto`) into the config. `--gguf-dir DIR` uses files you already have (put the
+mmproj beside the shards). `--vision no` leaves the picture reader out.
+
 ## The four commands
 
 `--inspect` reads the file and checks every tensor against the keys that describe it. It opens no GPU.
@@ -153,14 +167,15 @@ the same file, so a few 1e-3 per block is inside its spread.
 
 - **The expert tier is flat.** `--expert-cache` keeps a FIFO ring of whole experts and nothing else: no routing
   policy, no per-layer budget, no cross-device promotion, and it is sized by the flag rather than by what is free.
-- **The app shows it, and does not manage it yet.** The family appears in the app's model list (its entry is in
-  `setup.py`'s table, which the app reads through `tools/strata_mcp.py`), with the short name `Step-3.7 IQ3_XXS`. What
-  the app cannot do is start it: `--start` goes through the engine package from the update feed, which does not carry
-  this branch's `--serve` for step35 (see below), and the app's Flash-Next-only additions (request slots, the RAM
-  budget, the resource profile) are now skipped for it the way they are for DeepSeek's engine.
+- **The app lists it, and starting it still needs this branch's engine.** The family appears in the app's model list
+  (its entry is in `setup.py`'s table, which the app reads through `tools/strata_mcp.py`), with the short name
+  `Step-3.7 IQ3_XXS`, and its name is mapped in the app (`step-3.7-flash-`). What the app cannot do is start it from a
+  downloaded engine package: `--start` goes through the update feed, whose 0.1.55 package predates this branch's
+  `--serve` for step35. The app's Flash-Next-only additions (request slots, the RAM budget, the resource profile) are
+  skipped for it the way they are for DeepSeek's engine.
 - **No release ships it.** The launcher plans the family and writes its config, but `--start` installs the engine
-  package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35, so the
-  start needs an engine built from this branch. The app and the web page do not know the family yet either.
+  package from the update feed (0.1.55) and that release does not carry this fork's `--serve` for step35. A source
+  checkout compiles its own engine (`./setup.sh --family step35`) and serves it.
 - **Expert routing is host-side, and it stays that way.** The round trip is 9% of a token, and a gathered device-side
   kernel would remove it - but only by reading the expert bytes from the file mapping at **2.2 GB/s** (measured by
   `step35_hostread_probe`), which is ~0.9 s per token against today's 0.121. The engine is right to copy (78.8 GB/s)
@@ -174,9 +189,11 @@ the same file, so a few 1e-3 per block is inside its spread.
 - **One request at a time, deliberately.** `--serve` answers one GEN at a time and the engine is single-device; the
   server's slots and `--layer-split` are accepted and ignored. Batching positions is measured 4.5x worse per position
   than decoding them one at a time (above), so this is a measurement, not an omission.
-- **Vision: the engine takes the picture rows, the rest is wiring.** `GENI` lands the encoder's rows on the
-  `<im_patch>` cells and is verified against the text path; `strata-vision` (llama.cpp mtmd, with the `step3vl` graph)
-  is not built here, the mmproj is not in the family's file list, and the catalogue still says `vision: false`.
+- **Vision works through setup, with the engine's half already verified.** `GENI` lands the encoder's rows on the
+  `<im_patch>` cells and is verified against the text path (above). `setup.py` carries the picture reader
+  (`mmproj-step3.7-flash-f16.gguf`, 3.97 GB) in the family's file list, with `vision: true`; `./setup.sh --family
+  step35` checks or downloads it and builds `engine/strata-vision` (llama.cpp mtmd, with the `step3vl` graph). `--vision
+  no` leaves both files out.
 
 ## The KV cache: what it is, and what it cost
 

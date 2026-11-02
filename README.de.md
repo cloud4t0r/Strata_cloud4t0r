@@ -36,7 +36,7 @@ Wir empfehlen **zuerst ISTA-DASLab**, danach **Unsloth** und andere Anbieter, so
 | **ISTA-DASLab · empfohlen** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) zum Programmieren. |
 | **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Geringerer Speicherbedarf, aber langsamer. |
-| **Weitere Optionen** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork) |
+| **Weitere Optionen** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork), [Step-3.7-Flash](docs/STEP37.md) (this fork) |
 
 [Größen, Speicherbedarf und Kompatibilität vergleichen](docs/MODELS.md).
 
@@ -48,6 +48,23 @@ Wir empfehlen **zuerst ISTA-DASLab**, danach **Unsloth** und andere Anbieter, so
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. Das sind die derzeit dokumentierten Pakete für dieses Modell.
 
 [Modellanleitung und Kompatibilität](docs/QWEN36.md).
+
+</details>
+
+<details>
+<summary><b>Step-3.7-Flash</b> (dieser Fork)</summary>
+
+Step-3.7-Flash (196 Mrd. Parameter, 11 Mrd. aktiv, 288 Experten Top-8, hybride Aufmerksamkeit) nutzt seinen eigenen
+Engine-Pfad unter Linux auf AMD-Karten. Die IQ3_XXS-Version ist 75,8 GB groß (zwei Dateien), dazu 4,0 GB für den
+Bildleser. Die Experten werden aus der Datei gelesen: Rund 24 GB RAM dienen als Seiten-Cache, damit die Lesezugriffe
+schnell bleiben; der Engine selbst wurden 2,2 GB gemessen.
+
+```sh
+./setup.sh --family step35
+```
+
+Die Installation kompiliert die Engine aus dem Quelltext, prüft oder lädt die beiden Dateien und den Bildleser,
+extrahiert den Tokenizer und schreibt das Startskript. Details und Messwerte: [docs/STEP37.md](docs/STEP37.md).
 
 </details>
 

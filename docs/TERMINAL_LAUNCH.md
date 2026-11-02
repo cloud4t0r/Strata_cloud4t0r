@@ -144,6 +144,13 @@ strata launch --family deepseek41 --model ist-das-2.00bpw
 - `--model-path DIR` starts from the shards you already have.
 - `--plan` shows where the model goes on your cards and how much is held in RAM.
 
+## Step-3.7-Flash (this fork, source checkout)
+
+This fork also carries Step-3.7-Flash, on its own engine path. It is not a released `strata launch` family: install it
+from a source checkout with `./setup.sh --family step35`, which compiles the engine. The model is StepFun's IQ3_XXS
+release (two shards, 75.8 GB) plus a 4.0 GB picture reader, and it runs on Linux AMD cards. Details, commands and
+measured numbers: [STEP37.md](STEP37.md).
+
 ## After the start: the monitor
 
 The monitor has seven views. Press `1` to `7` or use the arrow keys.

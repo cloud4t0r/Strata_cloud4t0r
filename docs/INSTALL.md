@@ -12,6 +12,11 @@ install does not need a source checkout or a startup `.bat` file.
 | The terminal, or my coding tool | Run the one-line install, then `strata launch` ([steps](#the-terminal)) |
 | DeepSeek V4.1-Flash | Pick it in the app, or run `strata launch --family deepseek41` ([model page](MODELS.md#deepseek-v41-flash)) |
 
+This fork also carries MiniMax-M2 and Step-3.7-Flash. They are source-built engine paths on Linux AMD cards, not
+part of a released installer or engine package: install them from a source checkout with
+`./setup.sh --family minimax2` or `./setup.sh --family step35`. See [MINIMAX_M2.md](MINIMAX_M2.md) and
+[STEP37.md](STEP37.md).
+
 [Requirements](#what-you-need) · [Desktop app](#the-app) · [Terminal](#the-terminal) ·
 [Update](#updating) · [Files and folders](#where-things-are-stored) · [Build from source](SOURCE_INSTALL.md)
 

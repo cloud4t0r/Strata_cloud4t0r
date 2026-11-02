@@ -166,6 +166,10 @@ catalog; it is not a fixed two-model menu. Read the proposed download, memory us
 For documentation recommendations, prefer ISTA-DASLab when a compatible pack fits, then Unsloth, Gyro and others.
 Executable defaults may differ, so select the family explicitly when that choice matters.
 
+This fork also adds MiniMax-M2 / M2.5 and Step-3.7-Flash. They are source-only engine paths on Linux AMD cards
+(`--family minimax2`, `--family minimax25`, `--family step35`); a downloaded engine package does not serve them yet.
+See [MINIMAX_M2.md](MINIMAX_M2.md) and [STEP37.md](STEP37.md).
+
 ## Tuning for your PC
 
 Use source setup's `--calibrate` only where that backend supports it. Terminal tuning instead uses

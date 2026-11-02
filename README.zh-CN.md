@@ -36,7 +36,7 @@
 | **ISTA-DASLab · 推荐** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S。[Coder：IQ1\_M](docs/MODELS.md#coder)，适合写代码。 |
 | **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
 | **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。占用内存更少，但速度更慢。 |
-| **其他选项** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork) |
+| **其他选项** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md), [MiniMax-M2](docs/MINIMAX_M2.md) (this fork), [Step-3.7-Flash](docs/STEP37.md) (this fork) |
 
 [比较大小、内存需求和兼容性](docs/MODELS.md)。
 
@@ -48,6 +48,22 @@
 **Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0。这些是目前文档中收录的该模型的版本。
 
 [模型指南和兼容性](docs/QWEN36.md)。
+
+</details>
+
+<details>
+<summary><b>Step-3.7-Flash</b>（本分支）</summary>
+
+Step-3.7-Flash（196B 参数、11B 激活、288 个专家 top-8、混合注意力）在 Linux 的 AMD 显卡上使用自己的引擎路径。
+IQ3_XXS 版本为两个文件共 75.8 GB，另需 4.0 GB 的图片读取器。专家从文件中读取：约 24 GB 内存用作页面缓存，
+让读取保持快速；引擎本身实测占用 2.2 GB。
+
+```sh
+./setup.sh --family step35
+```
+
+安装会从源码编译引擎，校验或下载两个文件和图片读取器，提取分词器并写入启动脚本。详情与实测数据：
+[docs/STEP37.md](docs/STEP37.md)。
 
 </details>
 
