@@ -17,6 +17,8 @@ namespace {
 
 int64_t key_of(int layer, int expert) { return (int64_t) layer * 1000000 + (int64_t) expert; }
 
+size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
 }  // namespace
 
 bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up_bytes, size_t down_bytes,
@@ -28,55 +30,67 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up
     c.gate_bytes = gate_bytes;
     c.up_bytes = up_bytes;
     c.down_bytes = down_bytes;
-    c.slots.assign((size_t) n_slots, ExpertSlot{});
-    c.fetches.assign((size_t) n_slots, 0);
-    c.where.clear();
-    c.where.reserve((size_t) n_slots * 2);
-    c.host = host_pinned;
-    bool pinned = false;
-    auto alloc = [&](void** p, size_t bytes) {
-        if (!host_pinned) return cudaMalloc(p, bytes) == cudaSuccess;
-        // PAGEABLE, on purpose.  cudaHostAlloc locks the pages: they cannot be swapped, and asking for gigabytes of
-        // them on a desktop starves it until the session dies - measured on this machine, twice, with Cinnamon as the
-        // victim.  A pageable copy is slower (a few GB/s against ~27) and still beats the disk, and the kernel keeps
-        // the right to take the memory back instead of taking the desktop down.
-        *p = std::malloc(bytes);
-        pinned = false;
-        return *p != nullptr;
-    };
-    for (int i = 0; i < n_slots; ++i) {
-        ExpertSlot& s = c.slots[(size_t) i];
-        const bool ok = alloc(&s.gate, gate_bytes) && alloc(&s.up, up_bytes) && alloc(&s.down, down_bytes);
-        s.pinned = pinned;
-        if (!ok) {
-            // a smaller tier is still a tier: keep what was allocated and say how many slots it really holds
-            err = std::string("out of device memory after ") + std::to_string(i) + " expert slot(s)";
-            c.slots.resize((size_t) i);
-            c.n_slots = i;
-            return i > 0;
+    // ONE ALLOCATION FOR THE WHOLE TIER, sliced per matrix.  This is not tidiness: the driver hands out whole 2 MiB
+    // pages to any request above 1 MiB, which was measured here (1000 allocations of 1.19 MB took 2097 MB of VRAM,
+    // 1.76x; the same 1000 of 1 MiB took 1049 MB, 1.00x; one allocation of 1.74 GB took 1.00x).  A slot is three
+    // matrices of a few MiB, so three allocations a slot rounded up and the smaller packs paid 42% of the card for
+    // it: the AEON IQ1_M pack's 3560 KB an expert became 6 MiB, 2700 slots claimed 9.84 GB and really held 15.8 GB,
+    // and the output head then failed to allocate.  Sliced from one buffer, the rounding is paid once.
+    const size_t g = align_up(gate_bytes, 256), u = align_up(up_bytes, 256), d = align_up(down_bytes, 256);
+    const size_t per_slot = g + u + d;
+    c.slice_gate = g;
+    c.slice_up = u;
+    int slots = n_slots;
+    void* base = nullptr;
+    for (;;) {
+        if (host_pinned) {
+            // PAGEABLE, on purpose.  cudaHostAlloc locks the pages: they cannot be swapped, and asking for gigabytes
+            // of them on a desktop starves it until the session dies - measured on this machine, twice, with Cinnamon
+            // as the victim.  A pageable copy is slower (a few GB/s against ~27) and still beats the disk, and the
+            // kernel keeps the right to take the memory back instead of taking the desktop down.
+            base = std::malloc(per_slot * (size_t) slots);
+            if (base != nullptr) break;
+            err = "out of host memory";
+        } else {
+            if (cudaMalloc(&base, per_slot * (size_t) slots) == cudaSuccess) break;
+            err = "out of device memory";
         }
+        // a smaller tier is still a tier: half of it, until one slot fits
+        if (slots <= 1) {
+            err += ": not even one expert slot fits (" + std::to_string(per_slot / 1024) + " KB a slot)";
+            return false;
+        }
+        slots /= 2;
     }
-    c.n_slots = n_slots;
+    c.slots.assign((size_t) slots, ExpertSlot{});
+    c.fetches.assign((size_t) slots, 0);
+    c.where.clear();
+    c.where.reserve((size_t) slots * 2);
+    c.host = host_pinned;
+    c.base = base;
+    char* p = (char*) base;
+    for (int i = 0; i < slots; ++i) {
+        ExpertSlot& s = c.slots[(size_t) i];
+        s.gate = p;
+        s.up = p + g;
+        s.down = p + g + u;
+        s.pinned = false;   // the buffer is one, and c.base is what close releases
+        p += per_slot;
+    }
+    c.n_slots = slots;
+    if (slots < n_slots)   // the allocation stopped early: fewer slots, and the caller says so
+        err += " for " + std::to_string(n_slots) + " expert slot(s): kept " + std::to_string(slots);
     return true;
 }
 
 void expert_cache_close(ExpertCache& c) {
-    for (ExpertSlot& s : c.slots) {
+    if (c.base != nullptr) {          // one allocation, freed once (see expert_cache_open)
         if (c.host) {
-            if (s.pinned) {
-                cudaFreeHost(s.gate);
-                cudaFreeHost(s.up);
-                cudaFreeHost(s.down);
-            } else {
-                std::free(s.gate);
-                std::free(s.up);
-                std::free(s.down);
-            }
+            if (c.base_pinned) cudaFreeHost(c.base); else std::free(c.base);
         } else {
-            cudaFree(s.gate);
-            cudaFree(s.up);
-            cudaFree(s.down);
+            cudaFree(c.base);
         }
+        c.base = nullptr;
     }
     c.below = nullptr;
     c.slots.clear();

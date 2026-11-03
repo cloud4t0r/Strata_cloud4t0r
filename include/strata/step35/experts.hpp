@@ -40,6 +40,10 @@ struct ExpertCache {
     size_t gate_bytes = 0;
     size_t up_bytes = 0;    // == gate_bytes in every pack that stores gate and up the same way
     size_t down_bytes = 0;
+    // the slots are three slices of ONE buffer (the driver's 2 MiB page rounding is paid once, not 3 n_slots times)
+    void* base = nullptr;
+    bool base_pinned = false;
+    size_t slice_gate = 0, slice_up = 0;
     std::vector<ExpertSlot> slots;
     /// The level BELOW this one: a cache whose slots are pinned HOST memory.  A miss here asks it first, so the bytes
     /// come from RAM (pinned, DMA) instead of the file - which on a 75 GB model on a 62 GB machine is the page cache's
@@ -53,7 +57,8 @@ struct ExpertCache {
     std::vector<uint64_t> fetches;   ///< per slot: how many times it was filled (LFU)
 };
 
-/// Allocates `n_slots` experts of `gate_bytes`, `up_bytes` and `down_bytes`.  A slot is filled on first use.
+/// Allocates `n_slots` experts of `gate_bytes`, `up_bytes` and `down_bytes`, in ONE buffer sliced per matrix (see the
+/// note in experts.cu: the driver rounds every request above 1 MiB up to 2 MiB).  A slot is filled on first use.
 /// THE THREE ARE SEPARATE ON PURPOSE: the published Step-3.7 packs store the three matrices in different formats
 /// (bartowski's IQ2_XXS: gate/up IQ2_XXS, down IQ2_XS; the abliterated IQ1_M: gate/up IQ1_M, down IQ2_XXS), so a
 /// slot's bytes and the format each matrix is read with come from the file, per tensor, not from one type per expert.
