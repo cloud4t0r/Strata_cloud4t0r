@@ -1198,7 +1198,7 @@ int dump_embeddings(const std::string& path, const std::string& tokens_csv, cons
 /// prompt extends the one before decodes only what is new.
 int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib, int dense_mib,
           const std::string& tier_policy, bool kv_host, int image_token, int layer_split, int host_mib,
-          int vram_reserve_mib) {
+          int vram_reserve_mib, int vram_reserve_later_mib) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -1239,7 +1239,8 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
             cudaSetDevice(d);
             const int from = d == 0 ? 0 : split, to = d == 0 ? (split > 0 ? split : n_blocks) : n_blocks;
             auto_budgets_range(file, n_blocks, dense_layers, trunk, from, to, tier_mib_by_dev[d],
-                               dense_mib_by_dev[d], kv_host, stderr, (uint64_t) std::max(0, vram_reserve_mib) << 20);
+                               dense_mib_by_dev[d], kv_host, stderr,
+                               (uint64_t) std::max<int64_t>(0, d == 0 ? vram_reserve_mib : vram_reserve_later_mib) << 20);
             if (!open_tier(file, tier_mib_by_dev[d], tier[d], err, stderr, tier_policy) ||
                 !open_dense_cache(file, dense_mib_by_dev[d], n_blocks, dense[d], err)) {
                 std::printf("ERR %s\n", err.c_str());
@@ -1719,7 +1720,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
              int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib,
              const std::string& tier_policy, bool kv_host, int layer_split, int host_mib, int vram_reserve_mib,
-             const SamplerConfig& samp) {
+             int vram_reserve_later_mib, const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1794,7 +1795,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             cudaSetDevice(d);
             const int from = d == 0 ? 0 : split, to = d == 0 ? (split > 0 ? split : n_blocks) : n_blocks;
             auto_budgets_range(file, n_blocks, dense_layers, s, from, to, tier_mib_by_dev[d], dense_mib_by_dev[d],
-                               kv_host, stdout, (uint64_t) std::max(0, vram_reserve_mib) << 20);
+                               kv_host, stdout,
+                               (uint64_t) std::max<int64_t>(0, d == 0 ? vram_reserve_mib : vram_reserve_later_mib) << 20);
             if (!open_tier(file, tier_mib_by_dev[d], tier[d], err, stdout, tier_policy)) {
                 std::printf("strata-step35: %s\n", err.c_str());
                 cudaSetDevice(0);
@@ -2043,9 +2045,11 @@ void usage() {
         "      takes a quarter of what the machine can lend (ceiling 8 GiB), and anything above is clamped to that.\n"
         "      The memory is PAGEABLE on purpose: pinned memory cannot be swapped, and gigabytes of it take a desktop\n"
         "      down - measured, twice, with Cinnamon as the victim.  It is off unless asked for.\n"
-        "      --vram-reserve-mib N leaves N MiB of each card free for everything else, on top of the engine's own\n"
-        "      buffers.  The desktop's compositor lives there: a compositor with no VRAM loses its GL context and\n"
-        "      takes the session with it, which is what Mesa's DeviceReset in the log means.\n"
+        "      --vram-reserve-mib N leaves N MiB of the FIRST card free for everything else, and\n"
+        "      --vram-reserve-later-mib N of the SECOND, on top of the engine's own buffers.  The desktop's\n"
+        "      compositor lives there: a compositor with no VRAM loses its GL context and takes the session with it,\n"
+        "      which is what Mesa's DeviceReset in the log means.  With a layer split both cards are used, so reserve\n"
+        "      on BOTH - and more on the one that drives the display.\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -2196,7 +2200,7 @@ int run(int argc, char** argv) {
     // -1 means "auto": what the card has left once the K/V cache and a reserve are out of the way
     std::string tier_policy = "lru";
     bool kv_host = false, want_dump_emb = false;
-    int64_t layer_split = 0, host_mib = 0, vram_reserve_mib = 0;
+    int64_t layer_split = 0, host_mib = 0, vram_reserve_mib = 0, vram_reserve_later_mib = 0;
     int64_t image_token = kStep35ImageToken;
     std::string dump_emb;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
@@ -2266,6 +2270,8 @@ int run(int argc, char** argv) {
             kv_host = true;
         } else if (std::strcmp(argv[i], "--vram-reserve-mib") == 0) {
             vram_reserve_mib = std::strtoll(argv[++i], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--vram-reserve-later-mib") == 0) {
+            vram_reserve_later_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--host-cache") == 0) {
             const std::string v = argv[++i];
             host_mib = v == "auto" ? -1 : std::strtoll(v.c_str(), nullptr, 10);
@@ -2331,13 +2337,14 @@ int run(int argc, char** argv) {
                         (int) dense_mib, tier_policy);
     if (want_serve)
         return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, (int) dense_mib, tier_policy, kv_host,
-                     (int) image_token, (int) layer_split, (int) host_mib, (int) vram_reserve_mib);
+                     (int) image_token, (int) layer_split, (int) host_mib, (int) vram_reserve_mib,
+                     (int) vram_reserve_later_mib);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
                         (int) tier_mib, (int) dense_mib, tier_policy, kv_host, (int) layer_split, (int) host_mib,
-                        (int) vram_reserve_mib, samp);
+                        (int) vram_reserve_mib, (int) vram_reserve_later_mib, samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
