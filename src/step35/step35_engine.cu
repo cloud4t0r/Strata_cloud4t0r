@@ -1358,7 +1358,10 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                         const long long ms =
                             (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
-                        std::printf("PP %zu %zu %lld\n", off + n, prompt.size(), ms);
+                        // PP <read> <total> <ms> <tok/s>: the server takes the fifth field as the prompt's rate (it
+                        // showed "-" without it), and the fourth as the milliseconds since the prompt started
+                        std::printf("PP %zu %zu %lld %.1f\n", off + n, prompt.size(), ms,
+                                    (double) (off + n) / std::max(1e-9, (double) ms / 1000.0));
                         std::fflush(stdout);
                     }
                 }

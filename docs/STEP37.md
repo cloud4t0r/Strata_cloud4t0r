@@ -804,6 +804,26 @@ The fault that made this possible was a real one: `run_prompt_dense` allocated i
 the caller had left current** (the head lives on the second card in a split), then used it on card 0 - a memory fault
 that would have hit any caller. It now takes device 0 itself and hands it back.
 
+## Reading a prompt: what it costs, and one thing that did not work
+
+Measured on 116 positions, 45 blocks, both caches `auto`:
+
+| | s/position |
+|---|---|
+| one pass, cold page cache | 0.23-0.29 |
+| one pass, warm | **0.119** |
+| 116 single-token passes | 0.290 |
+
+The pass is the right way to read a prompt, and its cost is the expert bytes: each position routes to eight of 288
+experts per block, 5.9 MB each - ~47 MB per position, 5.5 GB for the 116. That is the NVMe, and it is why a warm run
+costs 0.119 s and a cold one 0.23-0.29: the pages are the difference.
+
+**Grouping the experts was tried and measured SLOWER, and is not in the tree.** The idea is that a hundred positions
+pick the same experts repeatedly (928 picks over 288 experts), so each could be read once and its matvecs run over all
+its positions in columns of eight. Measured on the same 116 positions: **0.295 s/position against 0.119** - 2.5x
+slower. The tier already serves the repeats, and the gather of every position's row, the 8-column matvecs and the
+scattered accumulation cost more than the reads they save. Written down here so nobody spends the day rediscovering it.
+
 ## Tests
 
 ```sh
