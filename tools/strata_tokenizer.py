@@ -90,6 +90,21 @@ PRE_PATTERNS = {
     "minimax-m2": MINIMAX2_PATTERN,
 }
 
+# What an architecture's vocabulary really uses, for the files that name a pre-tokenizer this tool does not implement.
+# A requantiser can carry the wrong one: the AEON IQ1_M pack of Step-3.7-Flash says `tekken` (a Mistral type, nothing to
+# do with this vocabulary - the release says `deepseek-v3`, and the two vocabularies are byte-identical), and the unknown
+# name used to fall through to QWEN35's split, which changes the ids of every prompt.  The architecture is what says which
+# tokenizer the weights were trained with, so it wins where we know it.
+ARCH_PRE = {"step35": "deepseek-v3"}
+
+
+def pre_for(arch, pre) -> str:
+    """The pre-tokenizer to use: the file's, unless it is one this tool does not implement and the architecture names one."""
+    name = str(pre or "")
+    if name in PRE_PATTERNS or name.startswith("deepseek"):
+        return name
+    return ARCH_PRE.get(str(arch or ""), name)
+
 
 # The `deepseek-v3` pre-tokenizer (DeepSeek-V3 / V4.1; llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, the same regex list as
 # JoyAI and Hunyuan-dense).  UNLIKE the single-pattern families it is a SEQUENCE: each pattern splits the pieces the
@@ -205,7 +220,7 @@ class Tokenizer:
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+                   pre_for(md.get("general.architecture"), md.get("tokenizer.ggml.pre", "qwen35")), special)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:

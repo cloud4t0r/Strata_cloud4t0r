@@ -369,6 +369,28 @@ class MiniMaxPreTokenizer(unittest.TestCase):
         self.assertEqual(tk.decode(tk.encode(text)), text)
 
 
+class WrongPreMetadata(unittest.TestCase):
+    """A file that names a pre-tokenizer we do not implement falls back to the ARCHITECTURE's, not to Qwen's.
+
+    Measured on the AEON IQ1_M pack of Step-3.7-Flash: it says `tekken`, its vocabulary is DeepSeek-V3's, and every prompt
+    was split the Qwen way before this - the ids differ, and the model answered with newlines.
+    """
+
+    def test_the_architecture_wins(self):
+        self.assertEqual(ST.pre_for("step35", "tekken"), "deepseek-v3")
+        self.assertEqual(ST.pre_for("step35", ""), "deepseek-v3")
+
+    def test_what_the_file_says_wins_when_we_implement_it(self):
+        self.assertEqual(ST.pre_for("step35", "deepseek-v3"), "deepseek-v3")
+        self.assertEqual(ST.pre_for("qwen35", "qwen35"), "qwen35")
+        self.assertEqual(ST.pre_for("minimax-m2", "minimax-m2"), "minimax-m2")
+        self.assertEqual(ST.pre_for("anything", "minimax-m2"), "minimax-m2")
+
+    def test_an_architecture_we_do_not_know_keeps_the_files_word(self):
+        self.assertEqual(ST.pre_for("acme", "tekken"), "tekken")
+        self.assertEqual(ST.pre_for(None, "qwen35"), "qwen35")
+
+
 class PieceCache(unittest.TestCase):
     def test_same_ids_cold_warm_and_off(self):
         rng = random.Random(7)
