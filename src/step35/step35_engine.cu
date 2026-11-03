@@ -1198,7 +1198,7 @@ int dump_embeddings(const std::string& path, const std::string& tokens_csv, cons
 /// prompt extends the one before decodes only what is new.
 int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib, int dense_mib,
           const std::string& tier_policy, bool kv_host, int image_token, int layer_split, int host_mib,
-          int vram_reserve_mib, int vram_reserve_later_mib) {
+          int vram_reserve_mib, int vram_reserve_later_mib, int prefill_chunk) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -1432,8 +1432,8 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
             if (keep < prompt.size()) {
                 std::printf("RESUME %zu\n", keep);   // the tokens the request reuses, before the first PP
                 std::fflush(stdout);
-                for (size_t off = keep; ok && off < prompt.size(); off += (size_t) kernels::kKvPassMax) {
-                    const size_t n = std::min((size_t) kernels::kKvPassMax, prompt.size() - off);
+                for (size_t off = keep; ok && off < prompt.size(); off += (size_t) prefill_chunk) {
+                    const size_t n = std::min((size_t) prefill_chunk, prompt.size() - off);
                     const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
                     std::vector<float> part;
                     std::vector<double> csum;
@@ -1521,6 +1521,10 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 std::fprintf(stderr, "strata-step35: expert tier (card %d): %llu hit(s) of %llu fetch(es)\n", d,
                              (unsigned long long) tier[d].hits,
                              (unsigned long long) (tier[d].hits + tier[d].misses));
+        if (host_mib != 0 && host_tier.n_slots > 0)
+            std::fprintf(stderr, "strata-step35: host expert cache: %llu hit(s) of %llu fetch(es), %d slot(s)\n",
+                         (unsigned long long) host_tier.hits,
+                         (unsigned long long) (host_tier.hits + host_tier.misses), host_tier.n_slots);
         kernels::head_close(head);
         kernels::session_destroy(trunk);
         if (host_mib != 0) kernels::expert_cache_close(host_tier);
@@ -1720,7 +1724,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
              int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib,
              const std::string& tier_policy, bool kv_host, int layer_split, int host_mib, int vram_reserve_mib,
-             int vram_reserve_later_mib, const SamplerConfig& samp) {
+             int vram_reserve_later_mib, int prefill_chunk, const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1845,8 +1849,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         std::vector<float> out;
         std::vector<double> sums;
         const auto t_prefill = std::chrono::steady_clock::now();
-        for (size_t off = 0; off < prompt.size(); off += (size_t) kernels::kKvPassMax) {
-            const size_t n = std::min((size_t) kernels::kKvPassMax, prompt.size() - off);
+        for (size_t off = 0; off < prompt.size(); off += (size_t) prefill_chunk) {
+            const size_t n = std::min((size_t) prefill_chunk, prompt.size() - off);
             const std::vector<int32_t> chunk(prompt.begin() + off, prompt.begin() + off + n);
             std::vector<float> part;
             std::vector<double> csum;
@@ -1969,6 +1973,10 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         }
         print_tier(tier[0], 0.0);
         print_dense_cache(dense[0]);
+        if (host_mib != 0 && host_tier.n_slots > 0)
+            std::printf("strata-step35: host expert cache: %llu hit(s) of %llu fetch(es), %d slot(s)\n",
+                        (unsigned long long) host_tier.hits,
+                        (unsigned long long) (host_tier.hits + host_tier.misses), host_tier.n_slots);
         if (split > 0) {
             print_tier(tier[1], 0.0);
             print_dense_cache(dense[1]);
@@ -2050,6 +2058,8 @@ void usage() {
         "      compositor lives there: a compositor with no VRAM loses its GL context and takes the session with it,\n"
         "      which is what Mesa's DeviceReset in the log means.  With a layer split both cards are used, so reserve\n"
         "      on BOTH - and more on the one that drives the display.\n"
+        "      --prefill-chunk N reads the prompt in passes of N positions (default 1024, never more).  A pass works\n"
+        "      through 8 x N experts per block, so a smaller pass keeps the card's tier usable: measured below.\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -2200,7 +2210,7 @@ int run(int argc, char** argv) {
     // -1 means "auto": what the card has left once the K/V cache and a reserve are out of the way
     std::string tier_policy = "lru";
     bool kv_host = false, want_dump_emb = false;
-    int64_t layer_split = 0, host_mib = 0, vram_reserve_mib = 0, vram_reserve_later_mib = 0;
+    int64_t layer_split = 0, host_mib = 0, vram_reserve_mib = 0, vram_reserve_later_mib = 0, prefill_chunk = 1024;
     int64_t image_token = kStep35ImageToken;
     std::string dump_emb;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
@@ -2268,6 +2278,10 @@ int run(int argc, char** argv) {
             seed = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--kv-host") == 0) {
             kv_host = true;
+        } else if (std::strcmp(argv[i], "--prefill-chunk") == 0) {
+            // never above kKvPassMax: a sliding layer's ring is sized for one such pass and nothing more
+            prefill_chunk = std::min<int64_t>(kernels::kKvPassMax,
+                                              std::max<int64_t>(1, std::strtoll(argv[++i], nullptr, 10)));
         } else if (std::strcmp(argv[i], "--vram-reserve-mib") == 0) {
             vram_reserve_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--vram-reserve-later-mib") == 0) {
@@ -2338,13 +2352,13 @@ int run(int argc, char** argv) {
     if (want_serve)
         return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, (int) dense_mib, tier_policy, kv_host,
                      (int) image_token, (int) layer_split, (int) host_mib, (int) vram_reserve_mib,
-                     (int) vram_reserve_later_mib);
+                     (int) vram_reserve_later_mib, (int) prefill_chunk);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
                         (int) tier_mib, (int) dense_mib, tier_policy, kv_host, (int) layer_split, (int) host_mib,
-                        (int) vram_reserve_mib, (int) vram_reserve_later_mib, samp);
+                        (int) vram_reserve_mib, (int) vram_reserve_later_mib, (int) prefill_chunk, samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {
