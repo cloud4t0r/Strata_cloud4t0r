@@ -334,17 +334,25 @@ that makes the reads fast. Setup plans for about 24 GB of it; the engine's own m
 
 | File | Download | In plain words |
 | --- | ---: | --- |
-| **IQ3_XXS** | 75.8 GB | the release's only offering so far (two shards) |
-| picture reader | 4.0 GB | the vision encoder (`mmproj`); `--vision no` leaves it out |
+| **IQ3_XXS** | 75.8 GB | stepfun's release (two shards) |
+| **Aeon-IQ1_M** | 48.4 GB | an abliterated requantisation, in two shards, with its own picture reader (4.4 GB). The smallest pack, and 40% fewer bytes read per token; see [STEP37.md](STEP37.md) |
+| picture reader | 4.0 GB | the vision encoder (`mmproj`); `--vision no` leaves it out (4.4 GB for Aeon-IQ1_M) |
 
-**Measured on:** 2 x 16 GB AMD cards, 62 GB RAM, ROCm, IQ3_XXS.
+**Measured on:** 2 x 16 GB AMD cards, 62 GB RAM, ROCm, both packs, 32768 positions of context, the layer split on, the
+dense and expert caches on, 8 decoded tokens:
 
-| Workload | Time |
-| --- | ---: |
-| one token, all 45 blocks, warm page cache | 1.39 s (2.13 s cold) |
-| a decoded token after a 6-position prompt | 0.96 s |
-| a decoded token at 1600 positions of context | 0.93 s |
-| a decoded token with the dense and expert caches | 0.12 s |
+| Workload | IQ3_XXS (75.8 GB) | Aeon-IQ1_M (48.4 GB) |
+| --- | ---: | ---: |
+| a decoded token, page cache dropped (the disk decides) | 1.40 s | 0.52 s |
+| a decoded token, warm page cache (the card decides) | 0.045 s | 0.045 s |
+| a decoded token after a 6-position prompt | 0.96 s | - |
+| a decoded token at 1600 positions of context | 0.93 s | - |
+| experts resident in the tier | 34% (2 x ~2000 of 12096) | 53% (2 x ~3200 of 12096) |
+| one prompt position, fresh | 0.139 s | 0.139 s |
+
+With a warm page cache the two packs decode at the same speed: at a 53% hit rate the token is no longer waiting on the
+disk. The smaller pack is what makes that hit rate possible on 62 GB of RAM, and it is 2.7x faster when the page cache
+has been dropped - which is the state a served model lives in once other programs have used the memory.
 
 The engine keeps the dense weights, the routers and an expert tier in graphics memory
 (`--dense-cache auto --expert-cache auto`). Pictures, limits and the engine's own commands:

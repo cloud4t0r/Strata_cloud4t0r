@@ -876,14 +876,53 @@ So each matrix now carries its own ggml type and its own row size: `ExpertCache`
 `t_sh` and `t_shd`, and the reference blocks (`MoeBlock`, `run_stream_block`) follow. A file whose expert format the
 kernels do not carry is **refused with its ggml type named**, before a slot is allocated, instead of computing with it.
 
-What that changes in bytes per expert, on the block sizes (arithmetic on `type_size`, not a measurement - the read itself
-still has to be timed on a downloaded pack):
+What that changes in bytes per expert, on the block sizes (arithmetic on `type_size`):
 
 | pack | bytes per expert | against 5.88 MB | reads per position |
 |---|---|---|---|
 | stepfun IQ3_XXS | 5.88 MB | - | 47 MB (measured) |
 | bartowski IQ2_XXS | 4.02 MiB | -30% | ~34 MB |
 | AEON IQ1_M | 3.48 MiB | -40% | ~29 MB |
+
+### The AEON pack, downloaded and measured
+
+`Aeon-IQ1_M` (Vegss, revision 559c8d44, 48.4 GB in two shards, its own mmproj) is offered by `setup.py` beside the
+release. Both packs on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer split, `--dense-cache auto
+--expert-cache auto`, the same prompt and the same 8 tokens:
+
+| | IQ3_XXS | Aeon-IQ1_M |
+|---|---|---|
+| a decoded token, page cache dropped (two runs each) | 1.40 / 1.43 s | 0.52 / 0.53 s |
+| a decoded token, page cache warm | 0.045 s | 0.045-0.054 s |
+| a decoded token, 16 tokens in one request, warm | 0.045 s | 0.054 s |
+| experts resident in the two tiers | 4086 of 12096 (34%) | 6392 of 12096 (53%) |
+| one prompt position, fresh | 0.139 s | 0.139 s |
+| tier hits over a 4-request run | 84% | 95% |
+
+**The smaller pack is 2.7x faster exactly when the disk is the bottleneck, and no faster when it is not.** With the page
+cache warm both decode at ~0.045 s a token: at a 95% hit rate the token is not waiting on the file any more, it is
+waiting on the matvecs. What the smaller file buys is that 95% - 48 GB has a chance of staying in 62 GB of RAM where
+76 GB does not - and that is the state a served model really lives in. What it costs is quality: IQ1_M is ~1.75 bits a
+weight, and the pack is abliterated on top of that.
+
+### The tier was allocating three times what it said
+
+Found while trying that pack, and it applies to every tier: the driver hands out whole **2 MiB pages** to any request
+above 1 MiB. Measured with a small HIP harness on this machine -
+
+| allocation | asked | VRAM taken |
+|---|---|---|
+| 1000 x 1 MiB | 1049 MB | 1049 MB (1.00x) |
+| 1000 x 1.19 MB | 1150 MB | 2097 MB (1.82x) |
+| 1000 x 1.96 MB | 1966 MB | 2097 MB (1.07x) |
+| 1 x 1.74 GB | 1740 MB | 1741 MB (1.00x) |
+
+- so a slot made of three matrices was rounded up three times. On the release (three 1.96 MB matrices) that is 2%, which
+is why it never showed; on IQ1_M (1.13 / 1.13 / 1.29 MB) it is 3.48 MB -> 6 MiB a slot, 1.7x. The engine reported
+"2700 slot(s) of 3560 KB = 9.84 GB of VRAM" while the card held 15.8 GB of it, and the output head then failed to
+allocate with 8, 10 and 12 GB of tier. The tier is ONE allocation sliced per matrix now; the same pack holds 3132 slots
+in 11.42 GB, and `rocm-smi` agrees with the engine's own figure (15.11 GB used where it claims 12.12 GB of tier beside
+2.04 GB of dense blocks and 0.47 GB of K/V).
 
 `IQ1_M`'s own kernels are not new here: `iq_parity` holds it against a fixture (dequant rel 0.00e+00, iq_mmvq rel
 5.53e-03 at 1..8 columns), and `pf_wmma_parity` covers it on the prompt path. `step35_gemv_parity` cannot synthesise it -
