@@ -42,7 +42,9 @@ struct DenseBlock {
     float* k_norm = nullptr;
     float* rope_ff = nullptr;   // shared rope_freqs table, or null
     int n_embd = 0, head_dim = 0, n_head = 0, n_head_kv = 0, n_rot = 0, ff = 0, n_ff_rope = 0;
-    int t_q = 0, t_k = 0, t_v = 0, t_wo = 0, t_gate = 0, t_ffn = 0;   // ggml types
+    // ggml type per matrix, not one per group: the release stores q/k as IQ2_S, v as Q4_K and the dense FFN as IQ3_XXS,
+    // and the packs that came after it mix them further (bartowski's IQ2_XXS: ffn_gate/up Q4_K, ffn_down Q6_K)
+    int t_q = 0, t_k = 0, t_v = 0, t_wo = 0, t_gate = 0, t_ffn = 0, t_ffn_up = 0, t_ffn_down = 0;
     double base = 0;
     bool sliding = false;
     float eps = 0;
