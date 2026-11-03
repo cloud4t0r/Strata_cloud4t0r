@@ -34,8 +34,9 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up
     // pages to any request above 1 MiB, which was measured here (1000 allocations of 1.19 MB took 2097 MB of VRAM,
     // 1.76x; the same 1000 of 1 MiB took 1049 MB, 1.00x; one allocation of 1.74 GB took 1.00x).  A slot is three
     // matrices of a few MiB, so three allocations a slot rounded up and the smaller packs paid 42% of the card for
-    // it: the AEON IQ1_M pack's 3560 KB an expert became 6 MiB, 2700 slots claimed 9.84 GB and really held 15.8 GB,
-    // and the output head then failed to allocate.  Sliced from one buffer, the rounding is paid once.
+    // it: a pack whose matrices are a few MiB paid 42% of the card - an expert of 3560 KB took 6 MiB, 2700 slots
+    // claimed 9.84 GB and really held 15.8 GB, and the output head then failed to allocate.  Sliced from one buffer,
+    // the rounding is paid once.
     const size_t g = align_up(gate_bytes, 256), u = align_up(up_bytes, 256), d = align_up(down_bytes, 256);
     const size_t per_slot = g + u + d;
     c.slice_gate = g;

@@ -97,7 +97,6 @@ WIN = os.name == "nt"
 # download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "stepfun-ai/Step-3.7-Flash-GGUF": "0b69336d2fd2adfdef9c66e425f7778196c31482",                      # 2026-06-03
-    "Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF": "559c8d448924f55ab7b470e936b0b4b02bdaae7c",  # 2026-11-02
     "bartowski/Step-3.7-Flash-GGUF": "e4f2a9e7e65462dcea257e1450db8361f906fb31",                     # 2026-11-02
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
@@ -732,15 +731,6 @@ STEP35_FILES = {
     # the picture reader (a 47-block ViT, projector_type step3vl), read by strata-vision (llama.cpp's mtmd)
     "mmproj-step3.7-flash-f16.gguf": (3972828768, "5f25d11f92235c69682ca820af5f4cb125ae1142c8c33c018d0b3c9000a2ec1c"),
 }
-# Vegss's requantisation of Step-3.7-Flash, abliterated (expert-granular abliteration of the base model, then IQ1_M):
-# 48.4 GB against the release's 75.8, and the only pack that is both smaller and abliterated.  Sizes and sha256 are the
-# Hub's own (the LFS oids of the file list at the revision above).
-STEP35_AEON_FILES = {
-    "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-00001-of-00002.gguf": (44685617120, "6739fbc535ff169b8a66fed8f61a3fc5bb0591817a73ceb39c7eacc0db461bd5"),
-    "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-00002-of-00002.gguf": (3708200736, "7c8b56b51f520d160096d5ee61d16e2a1396a9613b0e98f7427489ce73682bc8"),
-    # its picture reader: a 47-block ViT, same projector family (step3vl), read by strata-vision
-    "mmproj-step37-flash-f16.gguf": (4399308992, "efe6c3221883d7d620c4a3239b1bb83ec58833037a96e4bff6d1434eec3be31f"),
-}
 # bartowski's IQ2_XXS: the smallest pack that keeps the release's behaviour (no abliteration), 55.0 GB against 75.8.
 # Its shards keep the three NextN blocks in the same file (`step35.nextn_predict_layers` = 3, block_count 48), which is
 # what the engine's trunk_blocks() subtracts.  Sizes and sha256 are the Hub's LFS oids at the revision above.
@@ -861,11 +851,9 @@ OWN_PATH_FAMILIES = {
                "models": {
                    "IQ3_XXS": {"about": "3-bit i-quant, the release's only offering so far (75.8 GB)", "ram_gb": 24},
                    # another repository, another quantiser: the fields below replace the family's for this size only
-                   # (own_path_src).  IQ1_M stores the three expert matrices at 1.75 / 1.75 / 2.06 bits against
-                   # IQ3_XXS's 3.06 / 3.06 / 3.06, so an expert is 3.48 MiB instead of 5.88 - 40% fewer bytes read per
-                   # position - and the card's tier holds ~60% more of them (docs/STEP37.md).
-                   # the smallest pack that behaves like the release.  Its experts are IQ2_XXS (2.06 bits) with the down
-                   # matrix in IQ2_XS, so an expert is 4.02 MiB instead of 5.88 - a third fewer bytes read per position.
+                   # (own_path_src).  The smallest pack that behaves like the release: its experts are IQ2_XXS (2.06 bits)
+                   # with the down matrix in IQ2_XS, so an expert is 4.02 MiB instead of 5.88 - a third fewer bytes read
+                   # per position (docs/STEP37.md, measured: 0.92 s a token against 1.40 with the page cache dropped).
                    "IQ2_XXS": {"about": "2-bit i-quant (bartowski): 55.0 GB, the smallest pack that keeps the release's "
                                        "behaviour; ~a third fewer bytes an expert", "ram_gb": 24,
                                "hf": hf("bartowski/Step-3.7-Flash-GGUF") + "Step-3.7-Flash-IQ2_XXS/",
@@ -875,20 +863,7 @@ OWN_PATH_FAMILIES = {
                                "mmproj_hf": hf("bartowski/Step-3.7-Flash-GGUF"),
                                "license": "StepFun's model licence, and bartowski's requantisation of it: "
                                           "https://huggingface.co/bartowski/Step-3.7-Flash-GGUF"},
-                   # MEASURED BROKEN (2026-11-03): with greedy decoding from a plain prompt it answers only whitespace -
-                   # 15 spaces and a newline - where the release and IQ2_XXS answer the same sentence token for token.  The
-                   # pack loads, its hidden states are in the release's range and its tokenizer is now right, so what is
-                   # left is the ablation/requantisation itself.  Kept because it is pinned and someone may want to check
-                   # on a later revision; not recommended.
-                   "Aeon-IQ1_M": {"about": "abliterated (expert-granular), IQ1_M: 48.4 GB. MEASURED BROKEN: it answers "
-                                           "whitespace only (docs/STEP37.md), do not install it for real work", "ram_gb": 24,
-                                  "hf": hf("Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"),
-                                  "file": "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-0000{i}-of-00002.gguf",
-                                  "shards": 2, "sha256": STEP35_AEON_FILES,
-                                  "mmproj": "mmproj-step37-flash-f16.gguf",
-                                  "mmproj_hf": hf("Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"),
-                                  "license": "StepFun's model licence, and Vegss's abliteration of it: "
-                                             "https://huggingface.co/Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"}},
+               },
                "sha256": STEP35_FILES,
                # the K/V cache: 2112 B per layer per position, 45 layers, but only the 12 full-attention blocks keep
                # every position - the 33 sliding ones keep a 1536-cell ring, 0.11 GB whatever the context

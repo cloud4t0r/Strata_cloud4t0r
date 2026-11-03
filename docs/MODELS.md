@@ -336,8 +336,7 @@ that makes the reads fast. Setup plans for about 24 GB of it; the engine's own m
 | --- | ---: | --- |
 | **IQ3_XXS** | 75.8 GB | stepfun's release (two shards) |
 | **IQ2_XXS** | 55.0 GB | bartowski's 2-bit requantisation: the smallest pack that answers like the release, 1.5x a token when the disk decides; see [STEP37.md](STEP37.md) |
-| Aeon-IQ1_M | 48.4 GB | an abliterated requantisation. **Measured broken: it answers whitespace only.** Kept for reference, do not install |
-| picture reader | 4.0 GB | the vision encoder (`mmproj`); `--vision no` leaves it out (4.4 GB for Aeon-IQ1_M) |
+| picture reader | 4.0 GB | the vision encoder (`mmproj`); `--vision no` leaves it out |
 
 **Measured on:** 2 x 16 GB AMD cards, 62 GB RAM, ROCm, both packs, 32768 positions of context, the layer split on, the
 dense and expert caches on, 8 decoded tokens:

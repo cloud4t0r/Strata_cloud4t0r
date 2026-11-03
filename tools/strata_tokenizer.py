@@ -91,9 +91,9 @@ PRE_PATTERNS = {
 }
 
 # What an architecture's vocabulary really uses, for the files that name a pre-tokenizer this tool does not implement.
-# A requantiser can carry the wrong one: the AEON IQ1_M pack of Step-3.7-Flash says `tekken` (a Mistral type, nothing to
-# do with this vocabulary - the release says `deepseek-v3`, and the two vocabularies are byte-identical), and the unknown
-# name used to fall through to QWEN35's split, which changes the ids of every prompt.  The architecture is what says which
+# A requantiser can carry the wrong one: a Step-3.7-Flash pack came through saying `tekken` (a Mistral type, nothing to do
+# with this vocabulary - the release says `deepseek-v3`, and the vocabularies are byte-identical), and the unknown name
+# used to fall through to QWEN35's split, which changes the ids of every prompt.  The architecture is what says which
 # tokenizer the weights were trained with, so it wins where we know it.
 ARCH_PRE = {"step35": "deepseek-v3"}
 

@@ -854,7 +854,6 @@ is someone else's requantisation. The ones worth naming, with the sizes the Hub'
 |---|---|---|
 | `stepfun-ai/Step-3.7-Flash-GGUF` IQ3_XXS | 75.8 GB | the pack this page's figures were measured on |
 | `bartowski/Step-3.7-Flash-GGUF` IQ2_XXS | 55.0 GB | smallest with the base model's behaviour intact; keeps the 3 NextN blocks in the file |
-| `Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF` IQ1_M | 48.4 GB | abliterated (expert-granular); its own mmproj. **Measured broken, see below** |
 | `AesSedai/Step-3.7-Flash-GGUF` IQ2_S | 69.2 GB | 9% smaller than the release: not worth a download |
 | `hell0ks/Step-3.7-Flash-SOM-heretic-GGUF`, `PeterCxy/...-ARA-Heretic` | 105 GB | abliterated but LARGER: no gain here |
 
@@ -866,10 +865,10 @@ gate, up and down with `ffn_gate_exps.weight`'s type and, for the up matrix, its
 |---|---|---|---|
 | stepfun IQ3_XXS | IQ3_XXS | IQ3_XXS | IQ3_XXS |
 | bartowski IQ2_XXS | IQ2_XXS | IQ2_XXS | **IQ2_XS** |
-| AEON IQ1_M | IQ1_M | IQ1_M | **IQ2_XXS** |
 
 (The table is read off the GGUF headers themselves: 701 tensors in the first shard of each, grouped by type.) The shared
-expert has the same problem in the same packs - `ffn_down_shexp` is Q5_K in AEON while its gate and up are Q4_K.
+expert is read the same way, `t_sh` beside `t_shd`, so a pack that mixes its three matrices is read right instead of
+being read as three of the gate's.
 
 So each matrix now carries its own ggml type and its own row size: `ExpertCache` has `up_bytes` beside `gate_bytes` and
 `down_bytes`, `run_prompt_dense` reads `t_gate`, `t_up` and `t_down` from the three tensors, the dense-cache entry keeps
@@ -882,7 +881,6 @@ What that changes in bytes per expert, on the block sizes (arithmetic on `type_s
 |---|---|---|---|
 | stepfun IQ3_XXS | 5.88 MB | - | 47 MB (measured) |
 | bartowski IQ2_XXS | 4.02 MiB | -30% | ~34 MB |
-| AEON IQ1_M | 3.48 MiB | -40% | ~29 MB |
 
 ### HOW TO TELL WHETHER A PACK WORKS, IN ONE MINUTE
 
@@ -897,30 +895,26 @@ printf 'GEN 16 671,6102,294,8760,344\nQUIT\n' | strata-step35 --serve --model <f
 
 The release answers `11111 16 455 6102 294 10322 344 17575 16 455 6102 294 14251 344 16235 16`, which decodes to
 " Paris. The capital of Germany is Berlin. The capital of Italy is Rome."  Any pack that answers the same ids is the same
-model; anything else is not.  A pack that answers `223` fifteen times is answering fifteen spaces.
+model; anything else is not, however plausible its hidden states look.
 
-### Two packs bought, measured, and what they were worth
+### A second pack, downloaded and measured
 
-Both were downloaded and run on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer split,
-`--dense-cache auto --expert-cache auto`:
+`IQ2_XXS` (bartowski, revision e4f2a9e7, 55.0 GB in two shards) is offered by `setup.py` beside the release.  Both packs
+were run on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer split, `--dense-cache auto
+--expert-cache auto`:
 
-| | stepfun IQ3_XXS (75.8 GB) | bartowski IQ2_XXS (55.0 GB) | Vegss AEON-IQ1_M (48.4 GB) |
-|---|---|---|---|
-| the test above | right ids | **the same 16 ids** | 15 spaces and a newline |
-| a decoded token, page cache dropped | 1.40 / 1.43 s | **0.92 s** | 0.52 / 0.53 s |
-| a decoded token, warm | 0.045 s | 0.044 s | 0.045-0.054 s |
-| experts resident in the two tiers | 4086 of 12096 (34%) | 5540 (46%) | 6392 (53%) |
-| tier hits over a 4-request run | 84% | 85% | 95% |
+| | stepfun IQ3_XXS (75.8 GB) | bartowski IQ2_XXS (55.0 GB) |
+|---|---|---|
+| the test above | right ids | **the same 16 ids** |
+| a decoded token, page cache dropped | 1.40 / 1.43 s | **0.92 s** |
+| a decoded token, warm | 0.045 s | 0.044 s |
+| experts resident in the two tiers | 4086 of 12096 (34%) | 5540 (46%) |
+| tier hits over a 4-request run | 84% | 85% |
+| a 17-token prompt and 400 tokens, through the server | 6.4 tokens/s | **17.3 tokens/s** |
 
-**IQ2_XXS is the one to use.** Same answers, 1.5x a token when the disk decides, and 55 GB in a 62 GB machine has a
-real chance of staying in the page cache where 76 GB does not - which is the state a served model lives in.  Warm, the
-three are the same speed: at 85% of experts resident the token is waiting on the matvecs, not on the file.
-
-**The AEON pack is broken and `setup.py` says so.** It loads, `--inspect` passes, its hidden states are in the release's
-range, its tokenizer is right once `pre_for` uses the architecture's split instead of the `tekken` its metadata claims -
-and it still answers whitespace.  With the same engine, the same prompt and the same config the release and IQ2_XXS both
-answer the sentence above, so what is left is the pack: an expert-granular abliteration of a 180B mixture of experts,
-requantised to IQ1_M's ~1.75 bits.
+**The smaller pack is the one to use.** Same answers, 1.5x a token when the disk decides, and 55 GB in a 62 GB machine
+has a real chance of staying in the page cache where 76 GB does not - which is the state a served model lives in.  Warm,
+the two are the same speed: at 85% of experts resident the token is waiting on the matvecs, not on the file.
 
 ### The tier was allocating three times what it said
 
@@ -934,16 +928,16 @@ above 1 MiB. Measured with a small HIP harness on this machine -
 | 1000 x 1.96 MB | 1966 MB | 2097 MB (1.07x) |
 | 1 x 1.74 GB | 1740 MB | 1741 MB (1.00x) |
 
-- so a slot made of three matrices was rounded up three times. On the release (three 1.96 MB matrices) that is 2%, which
-is why it never showed; on IQ1_M (1.13 / 1.13 / 1.29 MB) it is 3.48 MB -> 6 MiB a slot, 1.7x. The engine reported
-"2700 slot(s) of 3560 KB = 9.84 GB of VRAM" while the card held 15.8 GB of it, and the output head then failed to
-allocate with 8, 10 and 12 GB of tier. The tier is ONE allocation sliced per matrix now; the same pack holds 3132 slots
-in 11.42 GB, and `rocm-smi` agrees with the engine's own figure (15.11 GB used where it claims 12.12 GB of tier beside
+- so a slot made of three matrices was rounded up three times.  On the release (three 1.96 MB matrices) that is 2%,
+which is why it never showed; on a pack whose matrices are a few MiB (1.13 / 1.13 / 1.29 MB, 3.48 MB an expert) it is
+3.48 MB -> 6 MiB a slot, 1.7x, and the tiers then claim more VRAM than they hold.  The tier is ONE allocation sliced per
+matrix now, and `rocm-smi` agrees with what the engine prints (15.11 GB used where it claims 12.12 GB of tier beside
 2.04 GB of dense blocks and 0.47 GB of K/V).
 
-`IQ1_M`'s own kernels are not new here: `iq_parity` holds it against a fixture (dequant rel 0.00e+00, iq_mmvq rel
-5.53e-03 at 1..8 columns), and `pf_wmma_parity` covers it on the prompt path. `step35_gemv_parity` cannot synthesise it -
-ggml's `from_float_ref` is NULL for IQ1_M, IQ2_XXS and IQ2_XS - which is why those three are checked by fixture instead.
+The i-quant formats a pack may use are not new kernels here either: `iq_parity` holds each against a fixture (IQ1_M, for
+one, at dequant rel 0.00e+00 and iq_mmvq rel 5.53e-03 at 1..8 columns) and `pf_wmma_parity` covers them on the prompt
+path.  `step35_gemv_parity` cannot synthesise IQ1_M, IQ2_XXS or IQ2_XS - ggml's `from_float_ref` is NULL for the three -
+which is why those are checked by fixture instead.
 
 ## Tests
 

@@ -372,8 +372,8 @@ class MiniMaxPreTokenizer(unittest.TestCase):
 class WrongPreMetadata(unittest.TestCase):
     """A file that names a pre-tokenizer we do not implement falls back to the ARCHITECTURE's, not to Qwen's.
 
-    Measured on the AEON IQ1_M pack of Step-3.7-Flash: it says `tekken`, its vocabulary is DeepSeek-V3's, and every prompt
-    was split the Qwen way before this - the ids differ, and the model answered with newlines.
+    Measured on a Step-3.7-Flash requant that names `tekken`: its vocabulary is DeepSeek-V3's, and every prompt was split
+    the Qwen way before this - the ids differ from the release's for the same text.
     """
 
     def test_the_architecture_wins(self):
