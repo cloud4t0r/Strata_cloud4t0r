@@ -857,6 +857,14 @@ OWN_PATH_FAMILIES = {
                # and shared expert with them (0.48 -> 0.20), and the expert tier with what is left (0.20 -> 0.12).
                # "auto" sizes each from the card: the blocks first, the tier with the rest.
                "engine_args": ["--dense-cache", "auto", "--expert-cache", "auto"],
+               # two cards: layers 0-21 on the first, 22-44 on the second, each card with its own K/V share, dense
+               # cache and expert tier (measured on two 16 GB cards: 0.168 s/token on one, 0.133 on two, same tokens)
+               "n_layers": 45, "layer_split": 22,
+               # What a card needs, MEASURED on this engine (docs/STEP37.md): the blocks' dense weights with their
+               # routers and shared experts (2.2 GB for all 45), the head and buffers plus the sliding rings' fixed
+               # 0.11 GB, and NO expert room - the tier is optional, the model runs without it (slower).  The context
+               # costs 12 full layers x 2112 B per position, the 33 sliding ones being rings.
+               "vram_budget": {"dense_gib": 2.31, "fixed_gib": 0.6, "experts_gib": 0.0, "extra_bytes_per_token": 0},
                # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
                "mtp": 0,
                "state_gb": 0.0},

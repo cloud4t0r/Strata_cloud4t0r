@@ -186,9 +186,9 @@ the same file, so a few 1e-3 per block is inside its spread.
   (measured: 3.46 GB of VRAM freed at 131072 for 0.003 s per token); a *partial* spill - only the pages a window needs,
   as `kv_stream.hpp` does for the QSA layers - is not written, and the read cost of a fully filled long context is
   arithmetic here rather than a measurement.
-- **One request at a time, deliberately.** `--serve` answers one GEN at a time and the engine is single-device; the
-  server's slots and `--layer-split` are accepted and ignored. Batching positions is measured 4.5x worse per position
-  than decoding them one at a time (above), so this is a measurement, not an omission.
+- **One request at a time, deliberately.** `--serve` answers one GEN at a time; batching *positions* is measured 4.5x
+  worse per position than decoding them one at a time (above), so this is a measurement, not an omission. Two *cards*
+  are supported (`--layer-split`, above); more than two, and the server's request slots, are not.
 - **Vision works through setup, with the engine's half already verified.** `GENI` lands the encoder's rows on the
   `<im_patch>` cells and is verified against the text path (above). `setup.py` carries the picture reader
   (`mmproj-step3.7-flash-f16.gguf`, 3.97 GB) in the family's file list, with `vision: true`; `./setup.sh --family
@@ -774,6 +774,30 @@ What is still not a release: the engine **package** the app and `strata launch` 
 feed (`component:strata-engine`), and the feed's 0.1.55 was built before this branch. A source checkout compiles the
 engine itself and is fine; a downloaded Strata would offer the family and then fail to serve it until a release built
 from a tree with it is published.
+
+## Two cards: a layer split
+
+`--layer-split N` (or `auto`, half the blocks) runs layers 0..N-1 on the first card and the rest on the second. Each
+card gets its own share of the K/V cache, its own dense-block cache and its own expert tier, each sized from its own
+free VRAM; the head (128 896 x 4096) lives where the last layers do. The residual stream crosses **once per pass**,
+through the host - 16 KB at one token, and the two cards need no peer mapping for that.
+
+Measured on this machine (two 16 GB cards, a gfx1030 and a gfx1201, IQ3_XXS, 8 tokens, both caches on `auto`):
+
+| | s/token | expert tiers | tokens |
+|---|---|---|---|
+| one card | 0.168 | 12.1 GB | `11111 16 455 6102 294 10322 344 17575` |
+| `--layer-split auto` (layers 0-21 / 22-44) | **0.133** | 14.0 + 14.1 GB | the same eight |
+
+The two runs answer the same tokens, which is the point: the split decides where a block runs, not what it computes.
+
+`setup.py` writes it: `--gpus 0,1` gives `"gpu": [0, 1]` and `"layer_split": "22"` in the config, and the server adds
+`--layer-split 22` to the engine's arguments. Serving through `serve/server.py` with that config reached `loaded` in 6 s
+and answered HTTP 200 with **16.4 GB of VRAM on card 0 and 16.9 GB on card 1** - both cards carrying their half.
+
+The fault that made this possible was a real one: `run_prompt_dense` allocated its residual stream on **whatever device
+the caller had left current** (the head lives on the second card in a split), then used it on card 0 - a memory fault
+that would have hit any caller. It now takes device 0 itself and hands it back.
 
 ## Tests
 
