@@ -926,6 +926,21 @@ were run on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer s
 has a real chance of staying in the page cache where 76 GB does not - which is the state a served model lives in.  Warm,
 the two are the same speed: at 85% of experts resident the token is waiting on the matvecs, not on the file.
 
+### The request's own figures, and the end of a reply
+
+The engine sends two more things the Monitor needed:
+
+- `DONE ... tier_hits=<n> tier_fetches=<n> expert_mb=<n>`: this request's share of routed experts the card's tier
+  served, and the MB the model file had to serve for the rest.  `serve/server.py` reads them into the request's
+  `timings` (`tier_hit_rate`, `expert_mb_from_file`), into the history the app's Monitor draws, and into the Terminal's
+  own line: `done: 272 tokens in 22 s (14.7 tok/s) (stop, cancel=False), experts 92.6% in VRAM, 28494 MB read from the
+  model file`.  The Monitor's recent-requests table has a "From disk" column for it (MB, and MB a token underneath).
+- the END TOKEN.  The engine used to swallow its own `<|im_end|>` instead of sending it, so the server - which learns
+  that a reply ended from the token it stops on - kept its default and every finished answer was reported as `length`:
+  the Monitor said "Max tokens" for replies that ended exactly where the model wanted.  It is sent now, the engine's
+  `DONE` says `stop` when it ended the reply, and the server honours that word too (serve/server.py's
+  `engine_finished`, serve/test_server.py's Step35Done).
+
 ### What the disk is really asked for, per token
 
 The expert tier serves 85-90% of the fetches on this machine (4949 experts of 12096 resident in 24 GB of VRAM), and the

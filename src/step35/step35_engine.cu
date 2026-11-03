@@ -1504,6 +1504,10 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
             cached = prompt;
             int emitted = 0, pos = (int) prompt.size();
             bool stopped = false;
+            // this request's own figures, from here to DONE: what the tier served, and what the file had to serve
+            const uint64_t hits0 = (uint64_t) (tier[0].hits + tier[1].hits);
+            const uint64_t fetches0 = (uint64_t) (tier[0].hits + tier[0].misses + tier[1].hits + tier[1].misses);
+            kernels::expert_bytes_take();
             const auto t_gen = std::chrono::steady_clock::now();
             Rng rng(samp.seed);
             std::vector<int> history = prompt;
@@ -1515,11 +1519,16 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                     break;
                 }
                 const int tok = sample(lg, samp, history, rng);
-                if (eos >= 0 && tok == eos) break;
+                // THE END TOKEN IS SENT, THEN THE REPLY ENDS.  Dropping it here made every answer look like it ran
+                // out of max tokens: the server learns a reply ended from the token it stops on, so it saw the stream
+                // stop early and kept its own default - "length" - and the Monitor said "Max tokens" for answers that
+                // ended exactly where the model wanted (its own <|im_end|>).
+                const bool ended = eos >= 0 && tok == eos;
                 std::printf("T %d\n", tok);
                 std::fflush(stdout);
                 history.push_back(tok);
                 ++emitted;
+                if (ended) break;
                 if (stop.exchange(false)) {
                     stopped = true;
                     break;
@@ -1548,7 +1557,16 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 const long long dec_ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t_gen).count();
                 const char* finish = stopped ? "cancel" : (emitted >= max_new ? "length" : "stop");
-                std::printf("DONE %d %d %lld %lld %s\n", emitted, (int) prompt.size(), pre_ms, dec_ms, finish);
+                // ... and the request's own cache figures, as key=value after the positional fields (the server reads
+                // them for the Monitor): the tier's share of the routed experts, and the MB the file served when it
+                // missed (an expert is ~4 MB, so 10 MB a token here means the page cache is holding the pack)
+                const uint64_t hits1 = (uint64_t) (tier[0].hits + tier[1].hits);
+                const uint64_t fetches1 = (uint64_t) (tier[0].hits + tier[0].misses + tier[1].hits + tier[1].misses);
+                const uint64_t file_mb_x10 = kernels::expert_bytes_take() / 100000;
+                std::printf("DONE %d %d %lld %lld %s tier_hits=%llu tier_fetches=%llu expert_mb=%llu.%llu\n",
+                            emitted, (int) prompt.size(), pre_ms, dec_ms, finish,
+                            (unsigned long long) (hits1 - hits0), (unsigned long long) (fetches1 - fetches0),
+                            (unsigned long long) (file_mb_x10 / 10), (unsigned long long) (file_mb_x10 % 10));
             }
             std::fflush(stdout);
         }

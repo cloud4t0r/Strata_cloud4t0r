@@ -66,6 +66,13 @@ struct ExpertCache {
 /// level below a VRAM tier, not a replacement for it.
 bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up_bytes, size_t down_bytes,
                        std::string& err, bool host_pinned = false);
+/// Bytes taken out of the model file for the routed experts since the last call: every slot a miss fills (from the
+/// host cache, or from the file) and every expert the no-tier path copies.  An expert is ~4 MB on the packs measured
+/// here, so this is what the disk serves for a request - the figure that says "warm page cache" from "the NVMe is the
+/// limit" (docs/STEP37.md: 330 MB a token cold, 0 warm).  Returns the total and resets it.
+uint64_t expert_bytes_take();
+void expert_bytes_add(uint64_t n);
+
 /// "fifo", "lru", "lfu"; anything else leaves the policy alone and returns false.
 bool expert_cache_policy(ExpertCache& c, const std::string& name);
 void expert_cache_close(ExpertCache& c);

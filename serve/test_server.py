@@ -41,6 +41,56 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class Step35Done(unittest.TestCase):
+    """The DONE line Step-3.7-Flash sends: the five positional fields, then its expert-tier figures as key=value.
+
+    Two things broke on it before: int(f[6]) ran on "tier_hits=..." and threw the whole parse away (so the request
+    reported "length" with no cache figures), and an engine that ends the reply on its own end token looked like a reply
+    that ran out of room - the Monitor said "Max tokens" for a finished answer.
+    """
+
+    LINE = "DONE 272 17 55 21000 stop tier_hits=120 tier_fetches=130 expert_mb=28494.3"
+
+    def engine(self):
+        eng = StrataEngine.__new__(StrataEngine)        # no process: _parse_done only fills self.last
+        eng.last = None
+        return eng
+
+    def test_the_tier_figures_are_read(self):
+        eng = self.engine()
+        eng._parse_done(self.LINE)
+        self.assertEqual(eng.last["finish"], "stop")
+        self.assertEqual(eng.last["generated"], 272)
+        self.assertEqual(eng.last["tier_hits"], 120)
+        self.assertEqual(eng.last["tier_fetches"], 130)
+        self.assertAlmostEqual(eng.last["expert_mb"], 28494.3)
+        self.assertTrue(eng.last["engine_finished"])
+
+    def test_the_positional_fields_still_parse_around_them(self):
+        eng = self.engine()
+        eng._parse_done("DONE 12 34 5 6 length 2 3 4 7 8 0 0 1.5 34 9 tier_hits=1 tier_fetches=2 expert_mb=3.0")
+        self.assertEqual((eng.last["drafts_offered"], eng.last["reused"]), (3, 4))
+        self.assertEqual((eng.last["hits"], eng.last["lookups"]), (7, 8))
+        self.assertEqual(eng.last["prompt_read"], 34)
+        self.assertEqual(eng.last["offloaded"], 9)
+        self.assertNotIn("engine_finished", eng.last)   # "length": the engine did not end it
+
+    def test_a_finished_reply_is_not_length(self):
+        eng = self.engine()
+        eng._parse_done(self.LINE)
+        self.assertTrue(eng.last.get("engine_finished"))
+
+    def test_the_timings_and_the_total_carry_them(self):
+        mostly = {"prompt_ms": 1000.0, "decode_ms": 2000.0, "generated": 40, "tier_hits": 90, "tier_fetches": 100,
+                  "expert_mb": 12.5, "finish": "stop"}
+        timings = request_timings(20, 40, mostly)
+        self.assertAlmostEqual(timings["tier_hit_rate"], 0.9)
+        self.assertAlmostEqual(timings["expert_mb_from_file"], 12.5)
+        totals = request_stats([dict(mostly, tier_hits=50, tier_fetches=60, expert_mb=2.5), mostly])
+        self.assertEqual((totals["tier_hits"], totals["tier_fetches"]), (140, 160))
+        self.assertAlmostEqual(totals["expert_mb"], 15.0)
+
+
 class MaxTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

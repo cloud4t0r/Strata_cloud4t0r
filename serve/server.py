@@ -1401,21 +1401,44 @@ class StrataEngine:
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
+        # the positional fields, each read only when it IS a number: an engine may put key=value fields right after
+        # the five it must send (Step-3.7-Flash's tier figures are there), and int() on "tier_hits=42" used to throw
+        # away the whole parse - the request then reported "length" with no cache figures at all
+        def num(i, kind=float):
+            try:
+                return kind(f[i])
+            except (IndexError, ValueError):
+                return None
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
-            self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
+            got = (num(6, int), num(7, int), num(8, int))
+            if None not in got:
+                self.last.update(drafts_accepted=got[0], drafts_offered=got[1], reused=got[2])
         if len(f) >= 11:                                  # decode hit rate fields
-            self.last.update(hits=int(f[9]), lookups=int(f[10]))
+            got = (num(9, int), num(10, int))
+            if None not in got:
+                self.last.update(hits=got[0], lookups=got[1])
         if len(f) >= 14:                                  # the expert tiers (engine 0.1.31+): RAM / file blobs, file MB
-            self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
+            got = (num(11, int), num(12, int), num(13))
+            if None not in got:
+                self.last.update(ram_blobs=got[0], file_blobs=got[1], file_mb=got[2])
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
-            self.last.update(prompt_read=int(f[14]))
+            got = num(14, int)
+            if got is not None:
+                self.last.update(prompt_read=got)
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
-            self.last.update(offloaded=int(f[15]))
-        for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
-            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+            got = num(15, int)
+            if got is not None:
+                self.last.update(offloaded=got)
+        # ... and when the engine ended the reply itself (its own end token), say so: the driver's default is "length"
+        # and it only learns otherwise from a stop token it sees in the stream
+        if self.last.get("finish") == "stop":
+            self.last["engine_finished"] = True
+        for tok in f[6:]:                                 # key=value fields after the positional ones (the prompt's
+            key, eq, value = tok.partition("=")           # first chunk, its streamed expert blobs, and Step-3.7's
+            if eq and key in ("chunk", "experts_streamed",  # owner of the expert tiers)
+                             "tier_hits", "tier_fetches", "expert_mb"):
                 try:
-                    self.last[key] = int(value)
+                    self.last[key] = float(value) if key == "expert_mb" else int(value)
                 except ValueError:
                     pass
 
@@ -5903,6 +5926,12 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif finish == "length" and n < max_new and any(s.get("engine_finished") for s in segments):
+                        # the engine ended the reply on its own end token: the driver's default is "length", and it
+                        # only learns otherwise from a stop id it sees in the stream.  An engine that swallows that
+                        # token (Step-3.7-Flash did until now) would make every finished answer look like it ran out
+                        # of room - the Monitor said "Max tokens" for replies that ended where the model wanted.
+                        finish = "stop"
                     elif looped:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
@@ -5925,6 +5954,12 @@ class Service:
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                            # Step-3.7: the expert tier's share of this request's routed experts, and what the model
+                            # file served when it missed (~4 MB an expert). 10 MB a token: the page cache holds the
+                            # pack; hundreds: the disk is the limit (docs/STEP37.md).
+                            tier_rate = round(last["tier_hits"] / last["tier_fetches"], 3) \
+                                if last.get("tier_fetches") else None
+                            expert_mb = last.get("expert_mb")
                             # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
                             # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
@@ -5946,7 +5981,9 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                "hit_rate": hit_rate, "pcie_share": pcie_share,
+                                "tier_hit_rate": tier_rate, "expert_mb": expert_mb,
+                                "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
@@ -5973,6 +6010,10 @@ class Service:
                             ft = st.get("first_token")
                             rate = answer_speed(last, n, now - ft if ft else None)
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                            if tier_rate is not None:
+                                hit_msg += f", experts {tier_rate*100:.1f}% in VRAM"
+                            if expert_mb:
+                                hit_msg += f", {expert_mb:.0f} MB read from the model file"
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
@@ -6123,7 +6164,11 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            # the routed experts the card's tier served, and the MB the model file served for the rest
+            **({"tier_hit_rate": round(last["tier_hits"] / last["tier_fetches"], 3),
+                "expert_mb_from_file": round(float(last.get("expert_mb") or 0.0), 1)}
+               if last.get("tier_fetches") else {})}
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -6137,7 +6182,8 @@ def request_stats(segments: list[dict]) -> dict:
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed",
+                "tier_hits", "tier_fetches", "expert_mb"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result

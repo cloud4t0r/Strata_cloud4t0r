@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -17,9 +18,14 @@ namespace {
 
 int64_t key_of(int layer, int expert) { return (int64_t) layer * 1000000 + (int64_t) expert; }
 
+std::atomic<uint64_t> g_expert_bytes{0};   // see expert_bytes_take: the file's bytes this process has moved
+
 size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 }  // namespace
+
+uint64_t expert_bytes_take() { return g_expert_bytes.exchange(0); }
+void expert_bytes_add(uint64_t n) { g_expert_bytes.fetch_add(n); }
 
 bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up_bytes, size_t down_bytes,
                        std::string& err, bool host_pinned) {
@@ -181,6 +187,7 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
         c.where.erase(s.key);   // the key leaves with the bytes: a stale entry would send a fetch to a reused slot
         ++c.evictions;
     }
+    expert_bytes_add((uint64_t) c.gate_bytes + c.up_bytes + c.down_bytes);   // read out of the file, from any level
     if (c.host) {   // a host cache's slot IS host memory: the three copies are memcpy, not a device transfer
         std::memcpy(s.gate, gate_src, c.gate_bytes);
         std::memcpy(s.up, up_src, c.up_bytes);

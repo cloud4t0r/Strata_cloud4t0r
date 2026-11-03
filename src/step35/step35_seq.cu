@@ -695,6 +695,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                         wd = slot->down;
                     } else {
                         ProfileScope t(profile().expert_calls, profile().expert_ns);
+                        expert_bytes_add(gate_bytes + up_bytes + down_bytes);   // no tier: the file for every expert
                         ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                         if (ok) ok = cudaMemcpy(du, base_u + ex * up_bytes, up_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                         if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;

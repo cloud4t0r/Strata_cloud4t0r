@@ -222,6 +222,9 @@ export interface ServeRequest {
   promptTps?: number | null;
   hitRate?: number | null;
   pcieShare?: number | null;
+  /** the model file's bytes for this request's routed experts (MB): ~10 with the page cache holding the pack, hundreds
+   *  when the disk is the limit (Step-3.7-Flash's own figure, docs/STEP37.md) */
+  expertMb?: number | null;
   finishReason?: string | null;
 }
 
