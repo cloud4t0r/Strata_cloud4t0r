@@ -941,6 +941,21 @@ The engine sends two more things the Monitor needed:
   `DONE` says `stop` when it ended the reply, and the server honours that word too (serve/server.py's
   `engine_finished`, serve/test_server.py's Step35Done).
 
+### A STOP that outlived its request
+
+Every request whose answer ended on its own end token was followed by one that answered a single token and reported
+`length` - the second picture upload, the message after a finished reply.  The cause was in the engine's serve loop: its
+reader thread sets a `stop` flag for every `STOP` line it sees, and the server sends one after a reply that ended on its
+stop token (it breaks out of the stream, then asks the engine to stop and drains to `DONE`).  The engine read that STOP
+after its own `DONE`, i.e. while it was idle between two requests, and the flag stayed set: the NEXT request was stopped
+after its first token, the engine said `DONE ... cancel`, and the server - which had not cancelled anything - ended the
+reply at one token.
+
+`stop` is cleared once per request now, where a `GEN`/`GENI` line is taken off the queue, so only a STOP seen while a
+request runs can stop it.  Measured, three requests in one session, IQ2_XXS: 272 tokens `stop`, then the picture (483
+tokens, `stop`, "I see a red circle on a blue background"), then 56 tokens `stop` - where the picture request had answered
+one token before.
+
 ### What the disk is really asked for, per token
 
 The expert tier serves 85-90% of the fetches on this machine (4949 experts of 12096 resident in 24 GB of VRAM), and the

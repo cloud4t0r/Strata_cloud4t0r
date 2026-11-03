@@ -1368,6 +1368,12 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 stop = false;
                 continue;
             }
+            // A STOP THAT ARRIVED BETWEEN TWO REQUESTS BELONGS TO THE ONE THAT JUST ENDED.  The reader thread sets the
+            // flag for every STOP line it sees, and reads it inside a generation - so a STOP sent after a reply that
+            // ended on its own end token (the server sends one, then drains to DONE) stayed set and cancelled the NEXT
+            // request after its first token: "done: 1 tokens ... (length)" on every request that followed a finished
+            // one.  Cleared here, once per request, so only a STOP seen while this one runs can stop it.
+            stop = false;
 
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
