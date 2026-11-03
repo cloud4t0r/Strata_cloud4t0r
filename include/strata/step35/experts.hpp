@@ -26,6 +26,7 @@ struct ExpertSlot {
     void* up = nullptr;
     void* down = nullptr;
     int64_t key = -1;   ///< layer * 1e6 + expert, or -1 while the slot is empty
+    bool pinned = false;///< a host slot that cudaHostAlloc gave us (cudaFreeHost), else malloc (free)
     uint64_t used = 0;  ///< fetch order, for the eviction choice
 };
 
@@ -39,6 +40,11 @@ struct ExpertCache {
     size_t gate_bytes = 0;
     size_t down_bytes = 0;
     std::vector<ExpertSlot> slots;
+    /// The level BELOW this one: a cache whose slots are pinned HOST memory.  A miss here asks it first, so the bytes
+    /// come from RAM (pinned, DMA) instead of the file - which on a 75 GB model on a 62 GB machine is the page cache's
+    /// coin toss, page by page, instead of an expert-granular choice.
+    ExpertCache* below = nullptr;
+    bool host = false;          ///< this cache's own slots live in pinned host memory
     std::unordered_map<int64_t, int> where;   ///< (layer, expert) -> slot index
     uint64_t clock = 0;
     // counters, for the figure the engine prints
@@ -47,7 +53,10 @@ struct ExpertCache {
 };
 
 /// Allocates `n_slots` experts of `gate_bytes` (twice: gate and up) and `down_bytes`.  A slot is filled on first use.
-bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err);
+/// `host_pinned`: the slots live in pinned host memory (about 20 GB/s of copy, no page faults) instead of VRAM - the
+/// level below a VRAM tier, not a replacement for it.
+bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err,
+                       bool host_pinned = false);
 /// "fifo", "lru", "lfu"; anything else leaves the policy alone and returns false.
 bool expert_cache_policy(ExpertCache& c, const std::string& name);
 void expert_cache_close(ExpertCache& c);

@@ -824,6 +824,29 @@ its positions in columns of eight. Measured on the same 116 positions: **0.295 s
 slower. The tier already serves the repeats, and the gather of every position's row, the 8-column matvecs and the
 scattered accumulation cost more than the reads they save. Written down here so nobody spends the day rediscovering it.
 
+## An expert cache in RAM, behind the VRAM tier
+
+`--host-cache MiB` puts a second level **behind** the expert tier: its slots are pinned host memory, filled from the file
+on their own misses, and a miss in the card's tier is then served from RAM instead of from the file. The tier is asked
+first (`ExpertCache::below`), so nothing in the kernels or in the block code changed - the same `expert_cache_fetch`,
+one level down.
+
+What it is for: the page cache's choices are made page by page over a 75 GB file on a 62 GB machine, and they are
+undone by whatever else the machine reads. This one chooses **expert by expert**, in memory the engine owns.
+
+Measured with the page cache **dropped before every request** (`echo 3 > /proc/sys/vm/drop_caches`), 116 positions, 45
+blocks, 8192 context, the same prompt read twice by the same engine:
+
+| second read, page cache gone | prompt read |
+|---|---|
+| without `--host-cache` | **774 ms** (5.5 GB off the NVMe, ~7 GB/s) |
+| `--host-cache 8000` | **207 ms** (the same bytes out of pinned RAM, ~27 GB/s) |
+
+**3.7x**, and it is the case that matters for a served model: the first request fills the cache, and every later one
+that touches the same experts does not go back to the disk. With a **warm page cache the two are identical** (0.122 s
+per position either way) - the cache has nothing to add when the file is already in memory, which is why it is opt-in
+and not the default.
+
 ## Tests
 
 ```sh

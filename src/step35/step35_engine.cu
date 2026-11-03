@@ -795,6 +795,32 @@ void print_dense_cache(const kernels::DenseCache& cache) {
                 (double) cache.used / 1e9, cache.streamed);
 }
 
+/// The level BELOW the tier: pinned host memory, expert-granular, filled from the file on its own misses.  A miss in
+/// the tier then copies from RAM instead of from the page cache's coin toss over a 75 GB file.
+bool open_host_cache(const strata::GgufModel& file, int mib, int n_blocks, kernels::ExpertCache& cache, std::string& err,
+                     std::FILE* out) {
+    if (mib <= 0) return true;
+    const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
+    size_t shard = 0;
+    const strata::TensorInfo* tg = file.find("blk." + std::to_string(dense) + ".ffn_gate_exps.weight", &shard);
+    const strata::TensorInfo* td = file.find("blk." + std::to_string(dense) + ".ffn_down_exps.weight", &shard);
+    if (!tg || !td) {
+        err = "cannot size the host cache: no expert tensors";
+        return false;
+    }
+    const int n_expert = (int) file.meta().get("step35.expert_count")->num();
+    const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
+    const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
+    const size_t per_expert = 2 * gate_bytes + down_bytes;
+    const int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
+    if (n_slots <= 0) return true;
+    if (!kernels::expert_cache_open(cache, n_slots, gate_bytes, down_bytes, err, true)) return false;
+    std::fprintf(out, "strata-step35: host expert cache: %d slot(s) of %zu KB = %.1f GB of RAM\n", cache.n_slots,
+                 per_expert / 1024, (double) cache.n_slots * (double) per_expert / 1e9);
+    (void) n_blocks;
+    return true;
+}
+
 /// What the tier bought, and what it did not: a hit rate with no time next to it would say nothing.
 void print_tier(const kernels::ExpertCache& tier, double seconds) {
     if (tier.n_slots <= 0) return;
@@ -1122,7 +1148,7 @@ int dump_embeddings(const std::string& path, const std::string& tokens_csv, cons
 /// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
 /// prompt extends the one before decodes only what is new.
 int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib, int dense_mib,
-          const std::string& tier_policy, bool kv_host, int image_token, int layer_split) {
+          const std::string& tier_policy, bool kv_host, int image_token, int layer_split, int host_mib) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
@@ -1176,6 +1202,21 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
         if (split > 0)
             std::fprintf(stderr, "strata-step35: layer split: layers 0-%d on card 0, %d-%d on card 1\n", split - 1,
                          split, n_blocks - 1);
+        kernels::ExpertCache host_tier[2];
+        if (host_mib > 0) {
+            for (int d = 0; d < (split > 0 ? 2 : 1); ++d) {
+                cudaSetDevice(d);
+                if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier[d], err, stderr)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    std::fflush(stdout);
+                    cudaSetDevice(0);
+                    return 1;
+                }
+            }
+            cudaSetDevice(0);
+            if (tier[0].n_slots > 0) tier[0].below = &host_tier[0];
+            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier[1];
+        }
         kernels::ExpertCache* tierp = tier[0].n_slots > 0 ? &tier[0] : nullptr;
         kernels::DenseCache* densep = dense[0].budget > 0 ? &dense[0] : nullptr;
         kernels::ExpertCache* tierp2 = (split > 0 && tier[1].n_slots > 0) ? &tier[1] : nullptr;
@@ -1436,6 +1477,8 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                              (unsigned long long) (tier[d].hits + tier[d].misses));
         kernels::head_close(head);
         kernels::session_destroy(trunk);
+        for (int d = 0; d < 2; ++d)
+            if (host_mib > 0) kernels::expert_cache_close(host_tier[d]);
         kernels::expert_cache_close(tier[0]);
         kernels::dense_cache_close(dense[0]);
         if (split > 0) {
@@ -1631,7 +1674,8 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
 /// and `--ref --tokens "<n + m ids>"` answers for the same sequence in float64.
 int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::string& next_csv, int n_blocks,
              int max_ctx, bool want_logits, int max_new, int tier_mib, int dense_mib,
-             const std::string& tier_policy, bool kv_host, int layer_split, const SamplerConfig& samp) {
+             const std::string& tier_policy, bool kv_host, int layer_split, int host_mib,
+             const SamplerConfig& samp) {
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         auto parse = [](const std::string& csv) {
@@ -1719,6 +1763,22 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             }
         }
         cudaSetDevice(0);
+        // the level below: one host cache per card's tier (they hold the same experts, so one would do, but a split's
+        // two tiers must not fight over one LRU)
+        kernels::ExpertCache host_tier[2];
+        if (host_mib > 0) {
+            for (int d = 0; d < (split > 0 ? 2 : 1); ++d) {
+                cudaSetDevice(d);
+                if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier[d], err, stdout)) {
+                    std::printf("strata-step35: %s\n", err.c_str());
+                    cudaSetDevice(0);
+                    return 1;
+                }
+            }
+            cudaSetDevice(0);
+            if (tier[0].n_slots > 0) tier[0].below = &host_tier[0];
+            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier[1];
+        }
         kernels::ExpertCache* tierp = tier[0].n_slots > 0 ? &tier[0] : nullptr;
         kernels::DenseCache* densep = dense[0].budget > 0 ? &dense[0] : nullptr;
         kernels::ExpertCache* tierp2 = (split > 0 && tier[1].n_slots > 0) ? &tier[1] : nullptr;
@@ -1870,6 +1930,8 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             print_tier(tier[1], 0.0);
             print_dense_cache(dense[1]);
         }
+        for (int d = 0; d < 2; ++d)
+            if (host_mib > 0) kernels::expert_cache_close(host_tier[d]);
         kernels::expert_cache_close(tier[0]);
         kernels::dense_cache_close(dense[0]);
         if (split > 0) {
@@ -1935,6 +1997,9 @@ void usage() {
         "      first and the tier with the rest.  --max-new stops on the file's own end token.\n"
         "      --kv-host puts the K/V cache in pinned, device-mapped host memory: it costs no VRAM at all, at the price\n"
         "      of reading it over the bus - what lets a context bigger than the card run at all.\n"
+        "      --host-cache MiB puts a second level BEHIND the expert tier, in pinned RAM: a miss in the card's tier\n"
+        "      then copies from memory instead of from the file.  Keep it under the free RAM (the model's 75 GB does\n"
+        "      not fit; a third of it is what the page cache would hold anyway, but chosen expert by expert).\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -2085,7 +2150,7 @@ int run(int argc, char** argv) {
     // -1 means "auto": what the card has left once the K/V cache and a reserve are out of the way
     std::string tier_policy = "lru";
     bool kv_host = false, want_dump_emb = false;
-    int64_t layer_split = 0;
+    int64_t layer_split = 0, host_mib = 0;
     int64_t image_token = kStep35ImageToken;
     std::string dump_emb;
     double temperature = 0.0, top_p = 1.0, repeat_penalty = 1.0;
@@ -2153,6 +2218,8 @@ int run(int argc, char** argv) {
             seed = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--kv-host") == 0) {
             kv_host = true;
+        } else if (std::strcmp(argv[i], "--host-cache") == 0) {
+            host_mib = std::strtoll(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--layer-split") == 0) {
             const std::string v = argv[++i];
             layer_split = v == "auto" ? -1 : std::strtoll(v.c_str(), nullptr, 10);
@@ -2215,12 +2282,13 @@ int run(int argc, char** argv) {
                         (int) dense_mib, tier_policy);
     if (want_serve)
         return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, (int) dense_mib, tier_policy, kv_host,
-                     (int) image_token, (int) layer_split);
+                     (int) image_token, (int) layer_split, (int) host_mib);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
         return gpu_chat(trunk, tokens, next, (int) layers, (int) max_ctx, want_logits, (int) max_new,
-                        (int) tier_mib, (int) dense_mib, tier_policy, kv_host, (int) layer_split, samp);
+                        (int) tier_mib, (int) dense_mib, tier_policy, kv_host, (int) layer_split, (int) host_mib,
+                        samp);
     if (want_seq) return gpu_seq(trunk, tokens, (int) layers, (int) pos, want_logits);
     if (want_all) {
         if (token < 0) {

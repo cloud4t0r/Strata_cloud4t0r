@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::step35::kernels {
 namespace {
@@ -17,7 +18,8 @@ int64_t key_of(int layer, int expert) { return (int64_t) layer * 1000000 + (int6
 
 }  // namespace
 
-bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err) {
+bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err,
+                       bool host_pinned) {
     if (n_slots <= 0 || gate_bytes == 0 || down_bytes == 0) {
         err = "an expert cache needs slots and a size";
         return false;
@@ -28,10 +30,22 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t do
     c.fetches.assign((size_t) n_slots, 0);
     c.where.clear();
     c.where.reserve((size_t) n_slots * 2);
+    c.host = host_pinned;
+    bool pinned = false;
+    auto alloc = [&](void** p, size_t bytes) {
+        if (!host_pinned) return cudaMalloc(p, bytes) == cudaSuccess;
+        if (cudaHostAlloc(p, bytes, cudaHostAllocDefault) == cudaSuccess) {
+            pinned = true;
+            return true;
+        }
+        *p = std::malloc(bytes);   // pinning a lot of memory can be refused: pageable still beats the file
+        pinned = false;
+        return *p != nullptr;
+    };
     for (int i = 0; i < n_slots; ++i) {
         ExpertSlot& s = c.slots[(size_t) i];
-        const bool ok = cudaMalloc(&s.gate, gate_bytes) == cudaSuccess && cudaMalloc(&s.up, gate_bytes) == cudaSuccess &&
-                        cudaMalloc(&s.down, down_bytes) == cudaSuccess;
+        const bool ok = alloc(&s.gate, gate_bytes) && alloc(&s.up, gate_bytes) && alloc(&s.down, down_bytes);
+        s.pinned = pinned;
         if (!ok) {
             // a smaller tier is still a tier: keep what was allocated and say how many slots it really holds
             err = std::string("out of device memory after ") + std::to_string(i) + " expert slot(s)";
@@ -46,10 +60,23 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t do
 
 void expert_cache_close(ExpertCache& c) {
     for (ExpertSlot& s : c.slots) {
-        cudaFree(s.gate);
-        cudaFree(s.up);
-        cudaFree(s.down);
+        if (c.host) {
+            if (s.pinned) {
+                cudaFreeHost(s.gate);
+                cudaFreeHost(s.up);
+                cudaFreeHost(s.down);
+            } else {
+                std::free(s.gate);
+                std::free(s.up);
+                std::free(s.down);
+            }
+        } else {
+            cudaFree(s.gate);
+            cudaFree(s.up);
+            cudaFree(s.down);
+        }
     }
+    c.below = nullptr;
     c.slots.clear();
     c.where.clear();
     c.fetches.clear();
@@ -79,6 +106,39 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
         ++c.hits;
         hit = true;
         return &s;
+    }
+    // A MISS HERE IS NOT A MISS BELOW.  If a host cache is behind this one, it holds the bytes or reads them once; the
+    // copy that fills this slot then comes from RAM rather than from the file.
+    if (c.below != nullptr) {
+        bool hit2 = false;
+        ExpertSlot* s2 = expert_cache_fetch(*c.below, layer, expert, gate_src, up_src, down_src, hit2, err);
+        if (s2 == nullptr) return nullptr;
+        ++c.misses;
+        int idx2 = (int) (c.misses - 1) % c.n_slots;
+        if (c.policy != TierPolicy::Fifo) {
+            int best = 0;
+            for (int i = 0; i < c.n_slots; ++i)
+                if (c.slots[(size_t) i].used < c.slots[(size_t) best].used) best = i;
+            idx2 = best;
+        }
+        ExpertSlot& dst = c.slots[(size_t) idx2];
+        if (dst.key >= 0) {
+            c.where.erase(dst.key);
+            ++c.evictions;
+        }
+        const cudaError_t e1 = cudaMemcpy(dst.gate, s2->gate, c.gate_bytes, cudaMemcpyHostToDevice);
+        const cudaError_t e2 = cudaMemcpy(dst.up, s2->up, c.gate_bytes, cudaMemcpyHostToDevice);
+        const cudaError_t e3 = cudaMemcpy(dst.down, s2->down, c.down_bytes, cudaMemcpyHostToDevice);
+        if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
+            err = std::string("filling an expert slot from the host cache: ") +
+                  cudaGetErrorString(e1 != cudaSuccess ? e1 : (e2 != cudaSuccess ? e2 : e3));
+            return nullptr;
+        }
+        dst.key = key;
+        dst.used = ++c.clock;
+        ++c.fetches[(size_t) idx2];
+        c.where[key] = idx2;
+        return &dst;
     }
     // a miss: pick the slot to reuse.  FIFO walks the ring; LRU takes the least recently filled and LFU the least
     // often filled (ties to the oldest).  The scan is over the slots, once per miss, and the routing is what it is
