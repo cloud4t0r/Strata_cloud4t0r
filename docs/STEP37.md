@@ -732,6 +732,12 @@ The rest is wired:
 - `tools/vision`: the grid came from the decoder positions, which is right for the M-RoPE families and wrong for
   `step3vl` (its positions are 1-D: a square 169-token picture was read as "not rectangular"). It now asks mtmd for
   `nx`/`ny` first and falls back to the positions.
+- `serve/server.py`: the prompt hook was the Qwen3-VL shape - `<|vision_start|>` then `<|image_pad|>`, one pair per
+  picture - and this template writes a **bare `<im_patch>`** and its vocabulary has no `<|image_pad|>` at all.  So the
+  pair test matched nothing, `k != len(encoded)` held, and every picture was refused with `400 invalid request: the
+  prompt and its images do not match` before the encoder had even run.  `IMAGE_MARKERS` names the family's marker
+  (`{"step35": ("<im_patch>", None)}`) and `expand_image_cells` does the expansion for both shapes, refusing a prompt
+  whose markers and pictures disagree rather than answering one nobody wrote (serve/test_image_markers.py).
 
 Measured end to end on this machine, a 96x96 PNG (a red disc on a blue field):
 
@@ -744,6 +750,10 @@ GEN  4        0,<169 x im_patch>,671        -> T 3967 10059 678 304     (the sam
 The two answers differ, which is the point: the rows reach the trunk. What is *not* claimed is that the answer is
 right - that is the encoder's business (llama.cpp's step3vl graph, unmodified here) and would need a reference output
 to say anything about.
+
+Over HTTP, with the IQ2_XXS pack and its own mmproj, a 96x96 PNG (a red disc on a blue field) sent as a data: URL: 191
+prompt tokens (17 of text and 169 of picture + markers), 25.7 s of prefill, and an answer that starts "It's a solid blue
+color" - the background it was given.  Before `IMAGE_MARKERS` the same request was the 400 above.
 
 Build cost: `strata-vision` (CPU, from `tools/vision`) takes two minutes and needs no model - it reads the mmproj.
 
@@ -915,6 +925,23 @@ were run on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer s
 **The smaller pack is the one to use.** Same answers, 1.5x a token when the disk decides, and 55 GB in a 62 GB machine
 has a real chance of staying in the page cache where 76 GB does not - which is the state a served model lives in.  Warm,
 the two are the same speed: at 85% of experts resident the token is waiting on the matvecs, not on the file.
+
+### What the disk is really asked for, per token
+
+The expert tier serves 85-90% of the fetches on this machine (4949 experts of 12096 resident in 24 GB of VRAM), and the
+rest is the file.  Measured by reading `/sys/block/nvme1n1/stat` around a 100-token greedy run of IQ2_XXS at 32768
+positions, the split layer's configuration, the caches auto:
+
+| page cache | read from the NVMe | per token |
+|---|---:|---:|
+| dropped first (`posix_fadvise(DONTNEED)` on the two shards) | 33 054 MB | **330.5 MB** |
+| the same run again, file warm | 0 MB | 0.0 MB |
+
+330 MB a token at 85% of fetches served from VRAM.  That is the number that decides whether a run is fast: at ~2 GB/s of
+NVMe it is 0.16 s a token, which is exactly the gap between 0.09 s (warm, 11 tokens/s) and 0.25 s (4 tokens/s).  A
+55 GB pack on a 62 GB machine only stays warm while the RAM stays free - the page cache is the second level, and
+`--host-cache` cannot replace it (measured on the same run: 1988 slots of 8.4 GB served 101 of 16176 fetches, 0.6%, while
+taking that RAM from the page cache).
 
 ### The tier was allocating three times what it said
 

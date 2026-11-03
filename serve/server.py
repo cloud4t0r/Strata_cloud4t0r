@@ -90,6 +90,33 @@ from serve import images as images_api  # noqa: E402
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
+# WHICH TOKEN STANDS FOR A PICTURE'S CELLS, per architecture.  The Qwen3-VL families (and DeepSeek-V4.1's own tower) write
+# <|vision_start|><|image_pad|> once per picture; Step-3.7-Flash's chat template writes a bare <im_patch> (its vocabulary
+# has no <|image_pad|> at all), and the pair test below never matched it - every picture came back as "the prompt and its
+# images do not match" (400) before a single row was encoded.  One marker, one picture either way.
+IMAGE_MARKERS = {"step35": ("<im_patch>", None)}
+
+
+def expand_image_cells(ids: list, pad: int, start: int | None, counts: list, literal: list) -> list:
+    """The prompt ids with one picture's cells in place of each of its markers: `counts[i]` cells for the i-th marker, in
+    the order the template wrote them.  `start` is the marker a picture must follow (None for the families whose template
+    writes the marker alone), `literal` the ids the marker's TEXT is worth when it is not a picture.  Raises ValueError
+    when the markers and the pictures disagree: an answer to a prompt the caller did not write is worse than a 400."""
+    out, k = [], 0
+    for j, t in enumerate(ids):
+        if t == pad and (start is None or (j > 0 and ids[j - 1] == start)):
+            if k == len(counts):
+                raise ValueError("the prompt and its images do not match")
+            out += [pad] * counts[k]
+            k += 1
+        elif t == pad:
+            out += literal
+        else:
+            out.append(t)
+    if k != len(counts):
+        raise ValueError("the prompt and its images do not match")
+    return out
+
 
 def popen(what: str, args: list, role: str = "engine", **kw):
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
@@ -5258,8 +5285,9 @@ class Service:
                 self.embeddings.keys = None
                 images, ds_pics = [], True
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            pad_text, start_text = IMAGE_MARKERS.get(self.model_arch or "", (IMAGE_PAD, VISION_START))
+            pad = self.tok.encode(pad_text, parse_special=True)[0]
+            start = self.tok.encode(start_text, parse_special=True)[0] if start_text else None
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5274,22 +5302,9 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
-            out, k = [], 0
-            for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
-                    # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
-                    if k == len(encoded):
-                        raise ValueError("the prompt and its images do not match")
-                    out += [pad] * encoded[k][1]
-                    k += 1
-                elif t == pad:
-                    out += literal
-                else:
-                    out.append(t)
-            if k != len(encoded):
-                raise ValueError("the prompt and its images do not match")
-            ids = out
+            # more markers than pictures (text parts that cut the pair apart) and fewer both raise: see the helper
+            literal = self.tok.encode(pad_text, parse_special=False)
+            ids = expand_image_cells(ids, pad, start, [c[1] for c in encoded], literal)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
