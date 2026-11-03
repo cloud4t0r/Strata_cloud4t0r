@@ -65,7 +65,9 @@ def plan(*, family: str, model: str, model_dir: Path, data_dir: Path, src: Path,
     problems: list[str] = []
     if family == "step35":
         return _plan_step35(model_dir=model_dir, context=context, model_name=model_name, log=log, backend=backend,
-                            vram_gb=vram_gb, notes=notes, family_def=family_def)
+                            vram_gb=vram_gb, notes=notes, family_def=family_def,
+                            packs=Path(data_dir) / "packs",
+                            pack_name=pack_name or model.lower())
     if family not in FAMILIES:
         # no full stop: the caller joins the problems with "; " and ends the sentence (a "gyro.." came out of the old text, round 8, N11)
         return None, [f"Strata can write the settings itself only for the Qwen3.8-Flash-Next, Swift, Coder, Gyro and "
@@ -144,7 +146,8 @@ def step35_kv_gb(context: int) -> float:
 
 
 def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, backend: str | None, vram_gb: float,
-                 notes: list | None, family_def: dict | None = None) -> tuple[dict | None, list[str]]:
+                 notes: list | None, family_def: dict | None = None,
+                 packs: Path | None = None, pack_name: str = "") -> tuple[dict | None, list[str]]:
     family_mmproj = (family_def or {}).get("mmproj")
     """The run config for a Step-3.7-Flash folder that is already on disk: two shards, the folder's own tokenizer,
     and the engine reading the GGUF directly - no prepared pack, no expert profile, nothing to download."""
@@ -153,10 +156,21 @@ def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, b
     if not shards:
         problems.append(f"the model files are not all in {model_dir} (every -0000N-of-0000N.gguf shard is needed)")
     tokenizer = Path(model_dir) / "tokenizer"
+    looked = [Path(model_dir), Path(model_dir).parent]
     if not tokenizer.exists():                      # a folder laid out as models/<name>/<quant>/: the files one level up
         tokenizer = Path(model_dir).parent / "tokenizer"
+    if not tokenizer.exists() and packs is not None:   # where setup.py keeps it (data/packs/<tag>/tokenizer: the tag,
+        for name in (pack_name, model_name.lower(), model_name.lower().replace("step-3.7-flash-", "step-3.7-flash-")):
+            cand = Path(packs) / name / "tokenizer"    # then the model's own name; both are the same folder for step35)
+            looked.append(cand)
+            if cand.exists():
+                tokenizer = cand
+                break
+        if not tokenizer.exists():
+            tokenizer = Path(model_dir) / "tokenizer"
     if not tokenizer.exists():
-        problems.append(f"the tokenizer folder is not beside the model files (looked in {Path(model_dir)} and {Path(model_dir).parent})")
+        problems.append("the tokenizer folder is not beside the model files (looked in "
+                        + ", ".join(str(p) for p in looked) + ")")
     if problems:
         return None, problems
     # The expert tier gets what the card has left after the K/V cache and 1 GB of working buffers (the head alone is

@@ -445,7 +445,9 @@ class Catalog:
             rec = 8192 if vram < 10 else 16384 if vram < 20 else 32768       # an Arc keeps the session and the experts in the same memory
         mod = self.strata.setup_module()
         models = self.tables()[0]
-        if mod is not None and models[model].get("budget"):
+        # a family with its own engine path keeps its sizes in its own table, not in setup's MODELS (Step-3.7-Flash's
+        # Aeon-IQ1_M has no Unsloth budget to consider); its own entry is what says what it needs
+        if mod is not None and (models.get(model) or {}).get("budget"):
             try:
                 if mod.unsloth_budget(model, hw.get("ram_gb") or 0.0):
                     rec = 8192 if vram < 14 else 32768
