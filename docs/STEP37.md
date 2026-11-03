@@ -791,6 +791,11 @@ Measured on this machine (two 16 GB cards, a gfx1030 and a gfx1201, IQ3_XXS, 8 t
 
 The two runs answer the same tokens, which is the point: the split decides where a block runs, not what it computes.
 
+`setup.py` offers 8K, 32K, 64K and 128K for this family and no further: 262144 **fits** in VRAM (6.6 GB of K/V, 3.3
+per card) but it takes the room the expert tier lives in, and a prompt on this path costs ~0.2-0.3 s per position to
+read - a 256K prompt is hours before the first token. A context that fits is not a context that is usable; `--context`
+with `--yes` still writes 262144 for anyone who wants it.
+
 `setup.py` writes it: `--gpus 0,1` gives `"gpu": [0, 1]` and `"layer_split": "22"` in the config, and the server adds
 `--layer-split 22` to the engine's arguments. Serving through `serve/server.py` with that config reached `loaded` in 6 s
 and answered HTTP 200 with **16.4 GB of VRAM on card 0 and 16.9 GB on card 1** - both cards carrying their half.

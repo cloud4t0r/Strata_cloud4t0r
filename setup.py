@@ -865,6 +865,10 @@ OWN_PATH_FAMILIES = {
                # 0.11 GB, and NO expert room - the tier is optional, the model runs without it (slower).  The context
                # costs 12 full layers x 2112 B per position, the 33 sliding ones being rings.
                "vram_budget": {"dense_gib": 2.31, "fixed_gib": 0.6, "experts_gib": 0.0, "extra_bytes_per_token": 0},
+               # 131072 is the offer: 262144 fits in VRAM (6.6 GB of K/V, 3.3 per card) but the K/V takes the room the
+               # expert tier lives in, and reading a prompt on this path costs ~0.2-0.3 s a position - a 256K prompt is
+               # hours before the first token.  The model's own 262144 stays reachable with --context and --yes.
+               "context_cap": 131072,
                # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
                "mtp": 0,
                "state_gb": 0.0},
@@ -8217,8 +8221,11 @@ def engine_families(eng: Path) -> set:
 
 def own_path_contexts(fam: dict) -> list:
     """The contexts offered for an own-path family: CONTEXTS up to the 262144 this engine path runs without rope
-    scaling, plus the family's "extra_contexts" (MiniMax-M2: 16K, between 8K and 32K)."""
-    return sorted({c for c in CONTEXTS if c <= 262144} | set(fam.get("extra_contexts", ())))
+    scaling, plus the family's "extra_contexts" (MiniMax-M2: 16K, between 8K and 32K).  A family may cap the offer
+    ("context_cap"): Step-3.7-Flash does, because past 131072 the K/V cache eats the VRAM its expert tier needs and the
+    prompt takes hours to read on this path - a context that fits is not a context that is usable."""
+    cap = int(fam.get("context_cap") or 262144)
+    return sorted({c for c in CONTEXTS if c <= cap} | {c for c in fam.get("extra_contexts", ()) if c <= cap})
 
 
 def own_path_kv_modes(fam: dict) -> list:
