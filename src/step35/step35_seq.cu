@@ -425,6 +425,22 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     }
     cudaMemcpy(d_h, out.data(), out.size() * sizeof(float), cudaMemcpyHostToDevice);
 
+    // The MoE branch's scratch, allocated ONCE for the whole pass instead of once per block: 11 cudaMalloc and 11
+    // cudaFree per mixture-of-experts block was 462 of each per token, on a card whose memory is already 14 GB deep in
+    // the expert tier and the dense cache - the fragmentation that leaves is a token that gets slower as it goes.
+    // per device: a split runs mixture-of-experts blocks on both cards, and a scratch allocated on one is a fault on
+    // the other
+    float* m_logits[2] = {nullptr, nullptr};
+    float* m_eg[2] = {nullptr, nullptr};
+    float* m_eu[2] = {nullptr, nullptr};
+    float* m_eact[2] = {nullptr, nullptr};
+    float* m_ed[2] = {nullptr, nullptr};
+    float* m_eacc[2] = {nullptr, nullptr};
+    float* m_wts[2] = {nullptr, nullptr};
+    int32_t* m_ids[2] = {nullptr, nullptr};
+    void* m_dg[2] = {nullptr, nullptr};
+    void* m_du[2] = {nullptr, nullptr};
+    void* m_dd[2] = {nullptr, nullptr};
     int cur_dev = 0;
     for (int layer = 0; layer < n_blocks; ++layer) {
         // A layer split: this block runs on card 1, and the residual stream crosses once, through the host (16 KB at
@@ -604,16 +620,29 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     ok = false;
                 }
             }
-            ok = ok && cudaMalloc((void**) &logits, (size_t) n_expert * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &eg, (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &eu, (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &eact, (size_t) n_ff_sh * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &ed, (size_t) e * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &eacc, (size_t) e * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc((void**) &ids, (size_t) top_k * sizeof(int32_t)) == cudaSuccess &&
-                 cudaMalloc((void**) &wts, (size_t) top_k * sizeof(float)) == cudaSuccess &&
-                 cudaMalloc(&dg, gate_bytes) == cudaSuccess && cudaMalloc(&du, gate_bytes) == cudaSuccess &&
-                 cudaMalloc(&dd, down_bytes) == cudaSuccess;
+            if (ok && m_logits[dev] == nullptr) {
+                ok = cudaMalloc((void**) &m_logits[dev], (size_t) n_expert * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_eg[dev], (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_eu[dev], (size_t) n_ff_exp * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_eact[dev], (size_t) n_ff_sh * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_ed[dev], (size_t) e * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_eacc[dev], (size_t) e * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_ids[dev], (size_t) top_k * sizeof(int32_t)) == cudaSuccess &&
+                     cudaMalloc((void**) &m_wts[dev], (size_t) top_k * sizeof(float)) == cudaSuccess &&
+                     cudaMalloc(&m_dg[dev], gate_bytes) == cudaSuccess && cudaMalloc(&m_du[dev], gate_bytes) == cudaSuccess &&
+                     cudaMalloc(&m_dd[dev], down_bytes) == cudaSuccess;
+            }
+            logits = m_logits[dev];
+            eg = m_eg[dev];
+            eu = m_eu[dev];
+            eact = m_eact[dev];
+            ed = m_ed[dev];
+            eacc = m_eacc[dev];
+            ids = m_ids[dev];
+            wts = m_wts[dev];
+            dg = m_dg[dev];
+            du = m_du[dev];
+            dd = m_dd[dev];
             float clamp_exp = 0, clamp_sh = 0;
             for (const auto& c : {std::make_pair("swiglu_clamp_exp", &clamp_exp),
                                   std::make_pair("swiglu_clamp_shexp", &clamp_sh)}) {
@@ -680,8 +709,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
             const bool owned = moe_cache && (size_t) layer < moe_cache->moe_ready.size() &&
                                moe_cache->moe_ready[(size_t) layer];
             for (void* q : {owned ? nullptr : router, owned ? nullptr : (void*) sbias, owned ? nullptr : sg,
-                            owned ? nullptr : su, owned ? nullptr : sd, (void*) logits, (void*) eg, (void*) eu,
-                            (void*) eact, (void*) ed, (void*) eacc, (void*) ids, (void*) wts, dg, du, dd})
+                            owned ? nullptr : su, owned ? nullptr : sd})
                 if (q) cudaFree(q);
         }
         if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
@@ -697,6 +725,11 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         double s = 0;
         for (float val : check) s += (double) val;
         sums.push_back(s);
+    }
+    for (int d = 0; d < 2; ++d) {
+        for (void* q : {(void*) m_logits[d], (void*) m_eg[d], (void*) m_eu[d], (void*) m_eact[d], (void*) m_ed[d],
+                        (void*) m_eacc[d], (void*) m_ids[d], (void*) m_wts[d], m_dg[d], m_du[d], m_dd[d]})
+            if (q) cudaFree(q);
     }
     out.resize((size_t) n_pos * e);
     cudaMemcpy(out.data(), d_h, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
