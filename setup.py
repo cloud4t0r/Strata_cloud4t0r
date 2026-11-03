@@ -856,6 +856,9 @@ OWN_PATH_FAMILIES = {
                # IQ3_XXS release): the blocks' dense weights kept in VRAM (0.80 -> 0.48 s/token), the MoE blocks' router
                # and shared expert with them (0.48 -> 0.20), and the expert tier with what is left (0.20 -> 0.12).
                # "auto" sizes each from the card: the blocks first, the tier with the rest.
+               # and nothing else: --host-cache is NOT written by default - it costs RAM, and its gain was measured
+               # only with the page cache dropped (docs/STEP37.md); --vram-reserve-mib comes from the two-card block
+               # above, per card, with the display card determined from the kernel
                "engine_args": ["--dense-cache", "auto", "--expert-cache", "auto"],
                # two cards: layers 0-21 on the first, 22-44 on the second, each card with its own K/V share, dense
                # cache and expert tier (measured on two 16 GB cards: 0.168 s/token on one, 0.133 on two, same tokens)
@@ -4450,8 +4453,44 @@ def amd_gpus(sysfs="/sys"):
             g["pci_id"] = int((dev / "device").read_text().strip(), 16)
         except (OSError, ValueError):
             pass
+        try:                                           # 0000:2f:00.0 - how /sys/class/drm/cardN names the same card
+            g["pci"] = os.path.basename(os.path.realpath(dev))
+        except OSError:
+            pass
         found.append(amd_apply_uma(g, gtt))            # Strix Halo: unified memory (carve-out + shared)
     return found
+
+
+def amd_display_index(gpus: list, sysfs="/sys") -> int | None:
+    """The AMD card that DRIVES THE DISPLAY, as amd_gpus numbers it (HIP's own order), or None when it cannot be told.
+
+    Not hardcoded and not "the first one": a desktop can render on either.  The kernel knows - the card the firmware made
+    primary (`device/boot_vga`), else the one with the most connected outputs - and the DRM card is matched to the GPU
+    list by its PCI address, which is what `pci` on each entry is for."""
+    if WIN:
+        return None
+    best = None
+    for card in sorted(Path(sysfs, "class/drm").glob("card[0-9]*")):
+        try:
+            pci = os.path.basename(os.path.realpath(card / "device"))
+        except OSError:
+            continue
+        idx = next((g["index"] for g in gpus if g.get("pci") == pci), None)
+        if idx is None:
+            continue
+        try:
+            boot = (card / "device" / "boot_vga").read_text().strip() == "1"
+        except OSError:
+            boot = False
+        if boot:
+            return idx
+        try:
+            n = sum(1 for st in card.parent.glob(card.name + "-*/status") if st.read_text().strip() == "connected")
+        except OSError:
+            n = 0
+        if best is None or n > best[1]:
+            best = (idx, n)
+    return best[0] if best and best[1] > 0 else None
 
 
 def amd_vram_used_gib(sysfs="/sys") -> dict:
@@ -8634,8 +8673,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cards = [gpu if i == gpu.get("index") else byid.get(i, {"index": i, "vram_gb": 0.0, "name": "?"})
                  for i in multi]
         ls = getattr(a, "layer_split", None)
-        if ls is None or str(ls).strip().lower() in ("", "auto"):
-            split = fam["layer_split"]
+        split_auto = ls is None or str(ls).strip().lower() in ("", "auto")
+        if split_auto:
+            split = fam["layer_split"]      # a starting point; derived from each card's usable VRAM further down
         else:
             top = min(nl - 1, M2_LAYER_SPLIT_MAX)
             if not str(ls).strip().isdigit() or not 2 <= int(str(ls).strip()) <= top:
@@ -8707,6 +8747,16 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         for i, c in enumerate(cards):
             total = float(c.get("vram_gb", 0.0))
             avail.append(max(0.0, total - used.get(c["index"], 0.0)))
+        # VRAM kept for the desktop: 700 MiB on a card that only computes, 2048 on the one that DRIVES THE DISPLAY -
+        # determined from the kernel (boot_vga, else the connected outputs), never assumed to be the second.  The layers
+        # are then divided the way the usable room is divided, unless the person asked for a split.
+        disp = amd_display_index(amd) if hip else None
+        reserves = [(2048 if disp == c["index"] else 700) for c in cards]
+        usable = [max(0.5, a_i - r / 1024.0) for a_i, r in zip(avail, reserves)]
+        if split_auto:
+            split = max(1, min(nl - 1, int(round(nl * usable[0] / max(1e-9, sum(usable))))))
+        for i, c in enumerate(cards):
+            total = float(c.get("vram_gb", 0.0))
             span = f"layers 0-{split - 1}" if i == 0 else f"layers {split}-{nl - 1}"
             what = (", the embedding, the output head and a copy of every layer's dense weights" if i == 0
                     else " with its own copy of their dense weights")
@@ -8903,14 +8953,24 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     # free VRAM less the reserve (MiniMax-M2: m2_engine.cu's place_experts, 768 MiB by default).  What setup wrote
     # before was MiniMax-M2's --expert-vram, the experts' total in GiB, derived from the first card's VRAM: it read no
     # per-card value, and the Flash-Next path (the other own-path family) has no such option at all.
-    if a.vram_reserve_mib is not None:
-        args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
-        ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert slots take "
-           "that much less)")
-    later = getattr(a, "vram_reserve_later_mib", None)
-    if later is not None:                          # the second card's own reserve, written as given
-        args += ["--vram-reserve-later-mib", str(later)]
-        ok(f"VRAM kept free on the second card: {later} MiB (--vram-reserve-later-mib)")
+    if two:                                        # per card, and the display card gets more: 700 to a compute card,
+        first = a.vram_reserve_mib if a.vram_reserve_mib is not None else reserves[0]      # 2048 to the one on screen
+        later = getattr(a, "vram_reserve_later_mib", None)
+        if later is None:
+            later = reserves[1]
+        args += ["--vram-reserve-mib", str(first), "--vram-reserve-later-mib", str(later)]
+        ok(f"VRAM kept free for the desktop: {first} MiB on GPU {cards[0]['index']}, {later} MiB on GPU "
+           f"{cards[1]['index']}" + (f" (the display is on GPU {disp})" if disp is not None else
+                                     " (the display card could not be determined)"))
+    else:
+        if a.vram_reserve_mib is not None:
+            args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+            ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert slots take "
+               "that much less)")
+        later = getattr(a, "vram_reserve_later_mib", None)
+        if later is not None:                      # the second card's own reserve, written as given
+            args += ["--vram-reserve-later-mib", str(later)]
+            ok(f"VRAM kept free on the second card: {later} MiB (--vram-reserve-later-mib)")
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "arch": fam["arch"],
            "log": str(home() / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
