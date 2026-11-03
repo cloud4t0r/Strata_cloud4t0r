@@ -73,7 +73,7 @@ extrait le tokenizer et écrit le script de démarrage. Détails et mesures : [d
 
 Dans l'**application de bureau** et dans le **Terminal**. Ce qui ne tient pas en mémoire est lu depuis votre SSD : il faut donc beaucoup d'espace disque libre.
 
-| Jeu (IST-DAS) | Téléchargement | Espace disque libre nécessaire |
+| Jeu (ISTA-DAS) | Téléchargement | Espace disque libre nécessaire |
 | --- | ---: | ---: |
 | 1.75 bpw | 239 GB | environ 245 GB |
 | 2.00 bpw | 257 GB | environ 265 GB |
