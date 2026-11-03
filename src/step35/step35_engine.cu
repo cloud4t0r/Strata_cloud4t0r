@@ -18,6 +18,7 @@
 #include "strata/step35/profile.hpp"
 #include "strata/step35/sampler.hpp"
 #include "strata/step35/session.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <ggml.h>
 #include <cuda_runtime.h>
@@ -685,30 +686,60 @@ int argmax(const std::vector<float>& lg) {
     return best;
 }
 
+/// One expert's three matrices as the FILE stores them: bytes and ggml type per matrix, because they are not written
+/// in one format.  bartowski's IQ2_XXS pack keeps gate/up as IQ2_XXS and the down matrix as IQ2_XS; the abliterated
+/// IQ1_M keeps gate/up as IQ1_M and down as IQ2_XXS.  Reading all three with the gate's type - what this did until
+/// now - would hand the kernels the wrong row size and the wrong format: silently, and only on those packs.
+struct ExpertShape {
+    size_t gate = 0, up = 0, down = 0;
+    int t_gate = -1, t_up = -1, t_down = -1;
+    size_t per_expert() const { return gate + up + down; }
+};
+
+/// Reads a pack's expert shape from block `layer`, and refuses a format the kernels do not carry rather than
+/// computing with it.
+bool expert_shape(const strata::GgufModel& file, int layer, int n_expert, ExpertShape& s, std::string& err) {
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    size_t shard = 0;
+    const strata::TensorInfo* tg = file.find(pre + "ffn_gate_exps.weight", &shard);
+    const strata::TensorInfo* tu = file.find(pre + "ffn_up_exps.weight", &shard);
+    const strata::TensorInfo* td = file.find(pre + "ffn_down_exps.weight", &shard);
+    if (!tg || !tu || !td) {
+        err = "cannot size the experts: no expert tensors";
+        return false;
+    }
+    s.gate = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
+    s.up = strata::tensor_payload_bytes(*tu) / (size_t) n_expert;
+    s.down = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
+    s.t_gate = (int) tg->type;
+    s.t_up = (int) tu->type;
+    s.t_down = (int) td->type;
+    for (const strata::TensorInfo* t : {tg, tu, td})
+        if (!strata::kernels::iq_supported((int) t->type)) {
+            err = std::string("this file's experts are ") + ggml_type_name(t->type) +
+                  ", a format these kernels do not carry (the published IQ2_XXS, IQ1_M, IQ2_S and IQ3_XXS packs are)";
+            return false;
+        }
+    return true;
+}
+
 /// The VRAM-resident expert tier, sized from a MiB budget and the file's own expert shapes.  The shapes come from
 /// block 3 (the first mixture-of-experts block) because that is where the tensors exist.
 bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tier, std::string& err,
                std::FILE* out = stdout, const std::string& policy = "lru") {
     if (mib <= 0) return true;
     const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
-    size_t shard = 0;
-    const strata::TensorInfo* tg = file.find("blk." + std::to_string(dense) + ".ffn_gate_exps.weight", &shard);
-    const strata::TensorInfo* td = file.find("blk." + std::to_string(dense) + ".ffn_down_exps.weight", &shard);
-    if (!tg || !td) {
-        err = "cannot size the expert tier: no expert tensors";
-        return false;
-    }
     const int n_expert = (int) file.meta().get("step35.expert_count")->num();
-    const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
-    const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
-    const size_t per_expert = 2 * gate_bytes + down_bytes;
+    ExpertShape sh;
+    if (!expert_shape(file, dense, n_expert, sh, err)) return false;
+    const size_t per_expert = sh.per_expert();
     const int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
     if (n_slots <= 0) {
         err = "the expert tier budget is smaller than one expert (" + std::to_string(per_expert / 1024) + " KB)";
         return false;
     }
     const int asked = n_slots;
-    if (!kernels::expert_cache_open(tier, n_slots, gate_bytes, down_bytes, err)) return false;
+    if (!kernels::expert_cache_open(tier, n_slots, sh.gate, sh.up, sh.down, err)) return false;
     if (!kernels::expert_cache_policy(tier, policy)) {
         err = "unknown expert tier policy " + policy + " (fifo, lru or lfu)";
         return false;
@@ -833,17 +864,10 @@ bool open_host_cache(const strata::GgufModel& file, int mib, int n_blocks, kerne
     }
     if (mib <= 0) return true;
     const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
-    size_t shard = 0;
-    const strata::TensorInfo* tg = file.find("blk." + std::to_string(dense) + ".ffn_gate_exps.weight", &shard);
-    const strata::TensorInfo* td = file.find("blk." + std::to_string(dense) + ".ffn_down_exps.weight", &shard);
-    if (!tg || !td) {
-        err = "cannot size the host cache: no expert tensors";
-        return false;
-    }
     const int n_expert = (int) file.meta().get("step35.expert_count")->num();
-    const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
-    const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
-    const size_t per_expert = 2 * gate_bytes + down_bytes;
+    ExpertShape sh;
+    if (!expert_shape(file, dense, n_expert, sh, err)) return false;
+    const size_t per_expert = sh.per_expert();
     int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
     // Pinned memory is not swapped: asking for more than half of what the machine can lend does not slow the model
     // down, it slows the DESKTOP down until it dies - measured here, 33.6 GB pinned on 62 GB took Cinnamon with it.
@@ -863,7 +887,7 @@ bool open_host_cache(const strata::GgufModel& file, int mib, int n_blocks, kerne
         mib = (int) ((uint64_t) n_slots * per_expert / (1u << 20));
     }
     if (n_slots <= 0) return true;
-    if (!kernels::expert_cache_open(cache, n_slots, gate_bytes, down_bytes, err, true)) return false;
+    if (!kernels::expert_cache_open(cache, n_slots, sh.gate, sh.up, sh.down, err, true)) return false;
     std::fprintf(out, "strata-step35: host expert cache: %d slot(s) of %zu KB = %.1f GB of RAM\n", cache.n_slots,
                  per_expert / 1024, (double) cache.n_slots * (double) per_expert / 1e9);
     (void) n_blocks;

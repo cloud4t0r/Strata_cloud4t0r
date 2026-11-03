@@ -845,6 +845,50 @@ pageable copy is a few GB/s rather than ~27, and with a warm page cache the two 
 position). What it is for is the case a served model lives in - a first request fills the cache, and later ones do not
 go back to the disk when the machine has read something else since.
 
+## The other packs of this family, and the format each expert matrix is in
+
+stepfun-ai publish this model in one size only for the small end (IQ3_XXS, 75.8 GB over two shards); every other pack
+is someone else's requantisation. The ones worth naming, with the sizes the Hub's file list reports:
+
+| pack | size | notes |
+|---|---|---|
+| `stepfun-ai/Step-3.7-Flash-GGUF` IQ3_XXS | 75.8 GB | the pack this page's figures were measured on |
+| `bartowski/Step-3.7-Flash-GGUF` IQ2_XXS | 55.0 GB | smallest with the base model's behaviour intact |
+| `Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF` IQ1_M | 48.4 GB | abliterated (expert-granular); its own mmproj |
+| `AesSedai/Step-3.7-Flash-GGUF` IQ2_S | 69.2 GB | 9% smaller than the release: not worth a download |
+| `hell0ks/Step-3.7-Flash-SOM-heretic-GGUF`, `PeterCxy/...-ARA-Heretic` | 105 GB | abliterated but LARGER: no gain here |
+
+**A pack does not store the three matrices of an expert in one format, and the engine used to assume it did.** It read
+gate, up and down with `ffn_gate_exps.weight`'s type and, for the up matrix, its row size. On the release that is right
+(gate, up and down are all IQ3_XXS), so nothing showed. On the others it is silently wrong:
+
+| pack | gate | up | down |
+|---|---|---|---|
+| stepfun IQ3_XXS | IQ3_XXS | IQ3_XXS | IQ3_XXS |
+| bartowski IQ2_XXS | IQ2_XXS | IQ2_XXS | **IQ2_XS** |
+| AEON IQ1_M | IQ1_M | IQ1_M | **IQ2_XXS** |
+
+(The table is read off the GGUF headers themselves: 701 tensors in the first shard of each, grouped by type.) The shared
+expert has the same problem in the same packs - `ffn_down_shexp` is Q5_K in AEON while its gate and up are Q4_K.
+
+So each matrix now carries its own ggml type and its own row size: `ExpertCache` has `up_bytes` beside `gate_bytes` and
+`down_bytes`, `run_prompt_dense` reads `t_gate`, `t_up` and `t_down` from the three tensors, the dense-cache entry keeps
+`t_sh` and `t_shd`, and the reference blocks (`MoeBlock`, `run_stream_block`) follow. A file whose expert format the
+kernels do not carry is **refused with its ggml type named**, before a slot is allocated, instead of computing with it.
+
+What that changes in bytes per expert, on the block sizes (arithmetic on `type_size`, not a measurement - the read itself
+still has to be timed on a downloaded pack):
+
+| pack | bytes per expert | against 5.88 MB | reads per position |
+|---|---|---|---|
+| stepfun IQ3_XXS | 5.88 MB | - | 47 MB (measured) |
+| bartowski IQ2_XXS | 4.02 MiB | -30% | ~34 MB |
+| AEON IQ1_M | 3.48 MiB | -40% | ~29 MB |
+
+`IQ1_M`'s own kernels are not new here: `iq_parity` holds it against a fixture (dequant rel 0.00e+00, iq_mmvq rel
+5.53e-03 at 1..8 columns), and `pf_wmma_parity` covers it on the prompt path. `step35_gemv_parity` cannot synthesise it -
+ggml's `from_float_ref` is NULL for IQ1_M, IQ2_XXS and IQ2_XS - which is why those three are checked by fixture instead.
+
 ## Tests
 
 ```sh

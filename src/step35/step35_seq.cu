@@ -583,6 +583,13 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
             const strata::TensorInfo* tu = file.find(pre + "ffn_up_exps.weight", &shard_u);
             const uint8_t* base_u = tu ? (const uint8_t*) file.shard(shard_u).tensor_data(*tu) : nullptr;
             if (!tu) { err = "missing ffn_up_exps"; ok = false; }
+            // NOT ONE FORMAT PER EXPERT: the published packs store gate, up and down in different formats
+            // (bartowski's IQ2_XXS: IQ2_XXS / IQ2_XXS / IQ2_XS; the abliterated IQ1_M: IQ1_M / IQ1_M / IQ2_XXS).
+            // Each matrix is read with its own type, and its own row size is what the slot and the copies use.
+            const size_t up_bytes = ok ? strata::tensor_payload_bytes(*tu) / (size_t) n_expert : 0;
+            const int t_gate = ok ? (int) tg->type : 0;
+            const int t_up = ok ? (int) tu->type : 0;
+            const int t_down = ok ? (int) td->type : 0;
             size_t rb = 0;
             void* router = nullptr;
             float* sbias = nullptr;
@@ -591,7 +598,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
             int32_t* ids = nullptr;
             float* wts = nullptr;
             void *dg = nullptr, *du = nullptr, *dd = nullptr;
-            int t_sh = 0;
+            int t_sh = 0, t_shd = 0;
             // The router, its bias and the shared expert are ~11 MB a block and were uploaded once per pass per block:
             // 41% of a token, measured.  With a dense cache they are kept like the block's own weights.
             DenseCache* moe_cache = (dev == 1) ? blocks2 : blocks;
@@ -603,17 +610,19 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 su = small->su;
                 sd = small->sd;
                 t_sh = small->t_sh;
+                t_shd = small->t_shd;
             } else if (ok) {
                 ProfileScope tp(profile().moe_calls, profile().moe_ns);
                 try {
                     router = upload(file, pre + "ffn_gate_inp.weight", rb);
                     t_sh = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
+                    t_shd = (int) file.find(pre + "ffn_down_shexp.weight")->type;
                     if (file.find(pre + "exp_probs_b.bias")) sbias = (float*) upload(file, pre + "exp_probs_b.bias", rb);
                     sg = upload(file, pre + "ffn_gate_shexp.weight", rb);
                     su = upload(file, pre + "ffn_up_shexp.weight", rb);
                     sd = upload(file, pre + "ffn_down_shexp.weight", rb);
                     if (moe_cache)   // kept for the next pass when the budget allows it
-                        dense_cache_moe_take(*moe_cache, layer, router, sbias, sg, su, sd, t_sh,
+                        dense_cache_moe_take(*moe_cache, layer, router, sbias, sg, su, sd, t_sh, t_shd,
                                              (size_t) moe_small_bytes(file, layer));
                 } catch (const std::exception& ex) {
                     err = ex.what();
@@ -629,7 +638,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                      cudaMalloc((void**) &m_eacc[dev], (size_t) e * sizeof(float)) == cudaSuccess &&
                      cudaMalloc((void**) &m_ids[dev], (size_t) top_k * sizeof(int32_t)) == cudaSuccess &&
                      cudaMalloc((void**) &m_wts[dev], (size_t) top_k * sizeof(float)) == cudaSuccess &&
-                     cudaMalloc(&m_dg[dev], gate_bytes) == cudaSuccess && cudaMalloc(&m_du[dev], gate_bytes) == cudaSuccess &&
+                     cudaMalloc(&m_dg[dev], gate_bytes) == cudaSuccess && cudaMalloc(&m_du[dev], up_bytes) == cudaSuccess &&
                      cudaMalloc(&m_dd[dev], down_bytes) == cudaSuccess;
             }
             logits = m_logits[dev];
@@ -675,7 +684,7 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     if (this_tier != nullptr) {
                         bool hit = false;
                         ExpertSlot* slot = expert_cache_fetch(*this_tier, layer, (int) ex, base_g + ex * gate_bytes,
-                                                              base_u + ex * gate_bytes, base_d + ex * down_bytes, hit,
+                                                              base_u + ex * up_bytes, base_d + ex * down_bytes, hit,
                                                               err);
                         if (slot == nullptr) {
                             ok = false;
@@ -687,21 +696,21 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     } else {
                         ProfileScope t(profile().expert_calls, profile().expert_ns);
                         ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-                        if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+                        if (ok) ok = cudaMemcpy(du, base_u + ex * up_bytes, up_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                         if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
                     }
-                    if (ok) ok = gemv((ggml_type) tg->type, wg, xp, eg, e, n_ff_exp, d_q8, nullptr);
-                    if (ok) ok = gemv((ggml_type) tg->type, wu, xp, eu, e, n_ff_exp, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) t_gate, wg, xp, eg, e, n_ff_exp, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) t_up, wu, xp, eu, e, n_ff_exp, d_q8, nullptr);
                     if (ok) ok = cudaMemcpy(eact, eg, (size_t) n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
                     if (ok) k_silu_mul_n<<<(n_ff_exp + 255) / 256, 256>>>(eact, eu, n_ff_exp, clamp_exp);
-                    if (ok) ok = gemv((ggml_type) tg->type, wd, eact, ed, n_ff_exp, e, d_q8, nullptr);
+                    if (ok) ok = gemv((ggml_type) t_down, wd, eact, ed, n_ff_exp, e, d_q8, nullptr);
                     if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, h_w[(size_t) k], e);
                 }
                 if (ok) ok = gemv((ggml_type) t_sh, sg, xp, eg, e, n_ff_sh, d_q8, nullptr);
                 if (ok) ok = gemv((ggml_type) t_sh, su, xp, eu, e, n_ff_sh, d_q8, nullptr);
                 if (ok) ok = cudaMemcpy(eact, eg, (size_t) n_ff_sh * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
                 if (ok) k_silu_mul_n<<<(n_ff_sh + 255) / 256, 256>>>(eact, eu, n_ff_sh, clamp_sh);
-                if (ok) ok = gemv((ggml_type) t_sh, sd, eact, ed, n_ff_sh, e, d_q8, nullptr);
+                if (ok) ok = gemv((ggml_type) t_shd, sd, eact, ed, n_ff_sh, e, d_q8, nullptr);
                 if (ok) k_acc_scaled_rows<<<(e + 255) / 256, 256>>>(eacc, ed, 1.0f, e);
                 if (ok) k_add_n<<<(e + 255) / 256, 256>>>(hp, eacc, e);
             }

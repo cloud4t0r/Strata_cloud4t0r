@@ -19,13 +19,14 @@ int64_t key_of(int layer, int expert) { return (int64_t) layer * 1000000 + (int6
 
 }  // namespace
 
-bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err,
-                       bool host_pinned) {
-    if (n_slots <= 0 || gate_bytes == 0 || down_bytes == 0) {
+bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up_bytes, size_t down_bytes,
+                       std::string& err, bool host_pinned) {
+    if (n_slots <= 0 || gate_bytes == 0 || up_bytes == 0 || down_bytes == 0) {
         err = "an expert cache needs slots and a size";
         return false;
     }
     c.gate_bytes = gate_bytes;
+    c.up_bytes = up_bytes;
     c.down_bytes = down_bytes;
     c.slots.assign((size_t) n_slots, ExpertSlot{});
     c.fetches.assign((size_t) n_slots, 0);
@@ -45,7 +46,7 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t do
     };
     for (int i = 0; i < n_slots; ++i) {
         ExpertSlot& s = c.slots[(size_t) i];
-        const bool ok = alloc(&s.gate, gate_bytes) && alloc(&s.up, gate_bytes) && alloc(&s.down, down_bytes);
+        const bool ok = alloc(&s.gate, gate_bytes) && alloc(&s.up, up_bytes) && alloc(&s.down, down_bytes);
         s.pinned = pinned;
         if (!ok) {
             // a smaller tier is still a tier: keep what was allocated and say how many slots it really holds
@@ -128,7 +129,7 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
             ++c.evictions;
         }
         const cudaError_t e1 = cudaMemcpy(dst.gate, s2->gate, c.gate_bytes, cudaMemcpyHostToDevice);
-        const cudaError_t e2 = cudaMemcpy(dst.up, s2->up, c.gate_bytes, cudaMemcpyHostToDevice);
+        const cudaError_t e2 = cudaMemcpy(dst.up, s2->up, c.up_bytes, cudaMemcpyHostToDevice);
         const cudaError_t e3 = cudaMemcpy(dst.down, s2->down, c.down_bytes, cudaMemcpyHostToDevice);
         if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
             err = std::string("filling an expert slot from the host cache: ") +
@@ -167,7 +168,7 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
     }
     if (c.host) {   // a host cache's slot IS host memory: the three copies are memcpy, not a device transfer
         std::memcpy(s.gate, gate_src, c.gate_bytes);
-        std::memcpy(s.up, up_src, c.gate_bytes);
+        std::memcpy(s.up, up_src, c.up_bytes);
         std::memcpy(s.down, down_src, c.down_bytes);
         s.key = key;
         s.used = ++c.clock;
@@ -176,7 +177,7 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
         return &s;
     }
     const cudaError_t e1 = cudaMemcpy(s.gate, gate_src, c.gate_bytes, cudaMemcpyHostToDevice);
-    const cudaError_t e2 = cudaMemcpy(s.up, up_src, c.gate_bytes, cudaMemcpyHostToDevice);
+    const cudaError_t e2 = cudaMemcpy(s.up, up_src, c.up_bytes, cudaMemcpyHostToDevice);
     const cudaError_t e3 = cudaMemcpy(s.down, down_src, c.down_bytes, cudaMemcpyHostToDevice);
     if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
         err = std::string("filling an expert slot: ") +

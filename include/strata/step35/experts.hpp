@@ -23,7 +23,7 @@ namespace strata::step35::kernels {
 /// One expert's three matrices, resident.  `gate` and `up` are the same shape in this model; `down` is not.
 struct ExpertSlot {
     void* gate = nullptr;
-    void* up = nullptr;
+    void* up = nullptr;   // `up_bytes` of storage: the up matrix's own type need not be the gate's
     void* down = nullptr;
     int64_t key = -1;   ///< layer * 1e6 + expert, or -1 while the slot is empty
     bool pinned = false;///< a host slot that cudaHostAlloc gave us (cudaFreeHost), else malloc (free)
@@ -38,6 +38,7 @@ struct ExpertCache {
     int n_slots = 0;
     TierPolicy policy = TierPolicy::Lru;   // measured best: 41.7% of fetches served at 4 GB against FIFO's 37.2%
     size_t gate_bytes = 0;
+    size_t up_bytes = 0;    // == gate_bytes in every pack that stores gate and up the same way
     size_t down_bytes = 0;
     std::vector<ExpertSlot> slots;
     /// The level BELOW this one: a cache whose slots are pinned HOST memory.  A miss here asks it first, so the bytes
@@ -52,11 +53,14 @@ struct ExpertCache {
     std::vector<uint64_t> fetches;   ///< per slot: how many times it was filled (LFU)
 };
 
-/// Allocates `n_slots` experts of `gate_bytes` (twice: gate and up) and `down_bytes`.  A slot is filled on first use.
+/// Allocates `n_slots` experts of `gate_bytes`, `up_bytes` and `down_bytes`.  A slot is filled on first use.
+/// THE THREE ARE SEPARATE ON PURPOSE: the published Step-3.7 packs store the three matrices in different formats
+/// (bartowski's IQ2_XXS: gate/up IQ2_XXS, down IQ2_XS; the abliterated IQ1_M: gate/up IQ1_M, down IQ2_XXS), so a
+/// slot's bytes and the format each matrix is read with come from the file, per tensor, not from one type per expert.
 /// `host_pinned`: the slots live in pinned host memory (about 20 GB/s of copy, no page faults) instead of VRAM - the
 /// level below a VRAM tier, not a replacement for it.
-bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t down_bytes, std::string& err,
-                       bool host_pinned = false);
+bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t up_bytes, size_t down_bytes,
+                       std::string& err, bool host_pinned = false);
 /// "fifo", "lru", "lfu"; anything else leaves the policy alone and returns false.
 bool expert_cache_policy(ExpertCache& c, const std::string& name);
 void expert_cache_close(ExpertCache& c);

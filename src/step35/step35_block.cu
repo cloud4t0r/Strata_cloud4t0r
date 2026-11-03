@@ -108,7 +108,7 @@ MoeSmall* dense_cache_moe(DenseCache& c, int layer) {
 }
 
 bool dense_cache_moe_take(DenseCache& c, int layer, void* router, float* sbias, void* sg, void* su, void* sd,
-                          int t_sh, size_t bytes) {
+                          int t_sh, int t_shd, size_t bytes) {
     if (layer < 0 || (size_t) layer >= c.moe.size()) return false;
     if (c.moe_ready[(size_t) layer]) return false;   // the dense half is a different allocation: no clash
     if (c.used + bytes > c.budget) return false;                                // it stays streamed this pass
@@ -119,6 +119,7 @@ bool dense_cache_moe_take(DenseCache& c, int layer, void* router, float* sbias, 
     m.su = su;
     m.sd = sd;
     m.t_sh = t_sh;
+    m.t_shd = t_shd;
     m.bytes = bytes;
     c.moe_ready[(size_t) layer] = 1;
     c.used += bytes;
@@ -404,10 +405,14 @@ bool upload_moe_block(const GgufModel& file, int layer, MoeBlock& b, std::string
         b.expert_gate_bytes = bytes / (size_t) b.n_expert;
         b.t_exps = (int) file.find(pre + "ffn_gate_exps.weight")->type;
         b.exps_up = upload(file, pre + "ffn_up_exps.weight", bytes);
+        b.expert_up_bytes = bytes / (size_t) b.n_expert;
+        b.t_exps_up = (int) file.find(pre + "ffn_up_exps.weight")->type;
         b.exps_down = upload(file, pre + "ffn_down_exps.weight", bytes);
+        b.t_exps_down = (int) file.find(pre + "ffn_down_exps.weight")->type;
         b.expert_down_bytes = bytes / (size_t) b.n_expert;
         b.shexp_gate = upload(file, pre + "ffn_gate_shexp.weight", bytes);
         b.t_shexp = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
+        b.t_shexp_down = (int) file.find(pre + "ffn_down_shexp.weight")->type;
         b.shexp_up = upload(file, pre + "ffn_up_shexp.weight", bytes);
         b.shexp_down = upload(file, pre + "ffn_down_shexp.weight", bytes);
         b.loaded = true;
@@ -460,13 +465,13 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* q8, int n_scratch
     for (int k = 0; ok && k < b.top_k; ++k) {
         const size_t ex = (size_t) h_ids[(size_t) k];
         const uint8_t* wg = (const uint8_t*) b.exps_gate + ex * b.expert_gate_bytes;
-        const uint8_t* wu = (const uint8_t*) b.exps_up + ex * b.expert_gate_bytes;
+        const uint8_t* wu = (const uint8_t*) b.exps_up + ex * b.expert_up_bytes;
         const uint8_t* wd = (const uint8_t*) b.exps_down + ex * b.expert_down_bytes;
         ok = gemv((ggml_type) b.t_exps, wg, x, g, e, b.n_ff_exp, q8, nullptr);
-        if (ok) ok = gemv((ggml_type) b.t_exps, wu, x, u, e, b.n_ff_exp, q8, nullptr);
+        if (ok) ok = gemv((ggml_type) b.t_exps_up, wu, x, u, e, b.n_ff_exp, q8, nullptr);
         if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
         if (ok) k_silu_mul<<<(b.n_ff_exp + 255) / 256, 256>>>(act, u, b.n_ff_exp, b.clamp_exp);
-        if (ok) ok = gemv((ggml_type) b.t_exps, wd, act, d, b.n_ff_exp, e, q8, nullptr);
+        if (ok) ok = gemv((ggml_type) b.t_exps_down, wd, act, d, b.n_ff_exp, e, q8, nullptr);
         if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, h_w[(size_t) k], e);
     }
     // the shared expert, added unweighted
@@ -474,7 +479,7 @@ bool run_moe_block(const MoeBlock& b, float* h, int pos, void* q8, int n_scratch
     if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_up, x, u, e, b.n_ff_shexp, q8, nullptr);
     if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_shexp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
     if (ok) k_silu_mul<<<(b.n_ff_shexp + 255) / 256, 256>>>(act, u, b.n_ff_shexp, b.clamp_shexp);
-    if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_down, act, d, b.n_ff_shexp, e, q8, nullptr);
+    if (ok) ok = gemv((ggml_type) b.t_shexp_down, b.shexp_down, act, d, b.n_ff_shexp, e, q8, nullptr);
     if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, 1.0f, e);
     if (ok) k_add<<<(e + 255) / 256, 256>>>(h, acc, e);
     if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;
@@ -510,6 +515,7 @@ bool run_stream_block(const GgufModel& file, int layer, float* h, int pos, void*
         if (file.find(pre + "exp_probs_b.bias")) b.select_bias = (float*) upload(file, pre + "exp_probs_b.bias", bytes);
         b.shexp_gate = upload(file, pre + "ffn_gate_shexp.weight", bytes);
         b.t_shexp = (int) file.find(pre + "ffn_gate_shexp.weight")->type;
+        b.t_shexp_down = (int) file.find(pre + "ffn_down_shexp.weight")->type;
         b.shexp_up = upload(file, pre + "ffn_up_shexp.weight", bytes);
         b.shexp_down = upload(file, pre + "ffn_down_shexp.weight", bytes);
     } catch (const std::exception& e) {
@@ -526,11 +532,14 @@ bool run_stream_block(const GgufModel& file, int layer, float* h, int pos, void*
         return false;
     }
     const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) b.n_expert;
+    const size_t up_bytes = strata::tensor_payload_bytes(*tu) / (size_t) b.n_expert;
     const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) b.n_expert;
     const uint8_t* base_g = (const uint8_t*) file.shard(sg).tensor_data(*tg);
     const uint8_t* base_u = (const uint8_t*) file.shard(su).tensor_data(*tu);
     const uint8_t* base_d = (const uint8_t*) file.shard(sd).tensor_data(*td);
     const int t_exps = (int) tg->type;
+    const int t_exps_up = (int) tu->type;
+    const int t_exps_down = (int) td->type;
 
     if (!run_attention(b.attn, h, pos, q8, err)) return false;
 
@@ -548,7 +557,7 @@ bool run_stream_block(const GgufModel& file, int layer, float* h, int pos, void*
                     cudaMalloc((void**) &acc, (size_t) e * sizeof(float)) == cudaSuccess &&
                     cudaMalloc((void**) &ids, (size_t) b.top_k * sizeof(int32_t)) == cudaSuccess &&
                     cudaMalloc((void**) &w, (size_t) b.top_k * sizeof(float)) == cudaSuccess &&
-                    cudaMalloc(&dg, gate_bytes) == cudaSuccess && cudaMalloc(&du, gate_bytes) == cudaSuccess &&
+                    cudaMalloc(&dg, gate_bytes) == cudaSuccess && cudaMalloc(&du, up_bytes) == cudaSuccess &&
                     cudaMalloc(&dd, down_bytes) == cudaSuccess;
     if (!ok_alloc) {
         err = "out of device memory";
@@ -566,20 +575,20 @@ bool run_stream_block(const GgufModel& file, int layer, float* h, int pos, void*
     for (int k = 0; ok && k < b.top_k; ++k) {
         const size_t ex = (size_t) h_ids[(size_t) k];
         ok = cudaMemcpy(dg, base_g + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-        if (ok) ok = cudaMemcpy(du, base_u + ex * gate_bytes, gate_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(du, base_u + ex * up_bytes, up_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
         if (ok) ok = cudaMemcpy(dd, base_d + ex * down_bytes, down_bytes, cudaMemcpyHostToDevice) == cudaSuccess;
         if (ok) ok = gemv((ggml_type) t_exps, dg, x, g, e, b.n_ff_exp, q8, nullptr);
-        if (ok) ok = gemv((ggml_type) t_exps, du, x, u, e, b.n_ff_exp, q8, nullptr);
+        if (ok) ok = gemv((ggml_type) t_exps_up, du, x, u, e, b.n_ff_exp, q8, nullptr);
         if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_exp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
         if (ok) k_silu_mul<<<(b.n_ff_exp + 255) / 256, 256>>>(act, u, b.n_ff_exp, b.clamp_exp);
-        if (ok) ok = gemv((ggml_type) t_exps, dd, act, d, b.n_ff_exp, e, q8, nullptr);
+        if (ok) ok = gemv((ggml_type) t_exps_down, dd, act, d, b.n_ff_exp, e, q8, nullptr);
         if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, h_w[(size_t) k], e);
     }
     if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_gate, x, g, e, b.n_ff_shexp, q8, nullptr);
     if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_up, x, u, e, b.n_ff_shexp, q8, nullptr);
     if (ok) ok = cudaMemcpy(act, g, (size_t) b.n_ff_shexp * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
     if (ok) k_silu_mul<<<(b.n_ff_shexp + 255) / 256, 256>>>(act, u, b.n_ff_shexp, b.clamp_shexp);
-    if (ok) ok = gemv((ggml_type) b.t_shexp, b.shexp_down, act, d, b.n_ff_shexp, e, q8, nullptr);
+    if (ok) ok = gemv((ggml_type) b.t_shexp_down, b.shexp_down, act, d, b.n_ff_shexp, e, q8, nullptr);
     if (ok) k_acc_scaled<<<(e + 255) / 256, 256>>>(acc, d, 1.0f, e);
     if (ok) k_add<<<(e + 255) / 256, 256>>>(h, acc, e);
     if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = false;

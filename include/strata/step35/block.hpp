@@ -72,11 +72,12 @@ struct MoeBlock {
     void* shexp_up = nullptr;
     void* shexp_down = nullptr;
     int n_expert = 0, top_k = 0, n_ff_exp = 0, n_ff_shexp = 0;
-    int t_exps = 0, t_shexp = 0;
+    // one format per matrix: the published packs do not store gate, up and down the same way (see experts.hpp)
+    int t_exps = 0, t_exps_up = 0, t_exps_down = 0, t_shexp = 0, t_shexp_down = 0;
     float scale = 0;
     bool weights_norm = false;
     float clamp_exp = 0, clamp_shexp = 0;
-    size_t expert_gate_bytes = 0, expert_down_bytes = 0;   // one expert's share of each 3-D tensor
+    size_t expert_gate_bytes = 0, expert_up_bytes = 0, expert_down_bytes = 0;   // one expert's share of each 3-D tensor
     bool loaded = false;
 };
 
@@ -196,7 +197,7 @@ struct MoeSmall {
     void* sg = nullptr;
     void* su = nullptr;
     void* sd = nullptr;
-    int t_sh = 0;
+    int t_sh = 0, t_shd = 0;   // the shared expert's gate/up format, and its down matrix's own
     size_t bytes = 0;
 };
 
@@ -224,7 +225,7 @@ uint64_t dense_layers_bytes(const strata::GgufModel& file, int n_layers, int den
 MoeSmall* dense_cache_moe(DenseCache& c, int layer);
 /// Records the tensors a caller just uploaded so the next pass reuses them instead of uploading again.
 bool dense_cache_moe_take(DenseCache& c, int layer, void* router, float* sbias, void* sg, void* su, void* sd,
-                          int t_sh, size_t bytes);
+                          int t_sh, int t_shd, size_t bytes);
 /// The bytes a MoE block's small tensors take, per block and for the whole file (what "auto" has to budget for).
 uint64_t moe_small_bytes(const strata::GgufModel& file, int layer);
 uint64_t moe_small_total(const strata::GgufModel& file, int n_layers, int dense_layers);
