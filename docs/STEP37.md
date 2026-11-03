@@ -853,8 +853,8 @@ is someone else's requantisation. The ones worth naming, with the sizes the Hub'
 | pack | size | notes |
 |---|---|---|
 | `stepfun-ai/Step-3.7-Flash-GGUF` IQ3_XXS | 75.8 GB | the pack this page's figures were measured on |
-| `bartowski/Step-3.7-Flash-GGUF` IQ2_XXS | 55.0 GB | smallest with the base model's behaviour intact |
-| `Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF` IQ1_M | 48.4 GB | abliterated (expert-granular); its own mmproj |
+| `bartowski/Step-3.7-Flash-GGUF` IQ2_XXS | 55.0 GB | smallest with the base model's behaviour intact; keeps the 3 NextN blocks in the file |
+| `Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF` IQ1_M | 48.4 GB | abliterated (expert-granular); its own mmproj. **Measured broken, see below** |
 | `AesSedai/Step-3.7-Flash-GGUF` IQ2_S | 69.2 GB | 9% smaller than the release: not worth a download |
 | `hell0ks/Step-3.7-Flash-SOM-heretic-GGUF`, `PeterCxy/...-ARA-Heretic` | 105 GB | abliterated but LARGER: no gain here |
 
@@ -884,26 +884,43 @@ What that changes in bytes per expert, on the block sizes (arithmetic on `type_s
 | bartowski IQ2_XXS | 4.02 MiB | -30% | ~34 MB |
 | AEON IQ1_M | 3.48 MiB | -40% | ~29 MB |
 
-### The AEON pack, downloaded and measured
+### HOW TO TELL WHETHER A PACK WORKS, IN ONE MINUTE
 
-`Aeon-IQ1_M` (Vegss, revision 559c8d44, 48.4 GB in two shards, its own mmproj) is offered by `setup.py` beside the
-release. Both packs on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer split, `--dense-cache auto
---expert-cache auto`, the same prompt and the same 8 tokens:
+Any pack loads and produces numbers, so the question is whether it produces the RIGHT ones.  Greedy decoding from a
+plain prompt, no chat template and no sampler, settles it:
 
-| | IQ3_XXS | Aeon-IQ1_M |
-|---|---|---|
-| a decoded token, page cache dropped (two runs each) | 1.40 / 1.43 s | 0.52 / 0.53 s |
-| a decoded token, page cache warm | 0.045 s | 0.045-0.054 s |
-| a decoded token, 16 tokens in one request, warm | 0.045 s | 0.054 s |
-| experts resident in the two tiers | 4086 of 12096 (34%) | 6392 of 12096 (53%) |
-| one prompt position, fresh | 0.139 s | 0.139 s |
-| tier hits over a 4-request run | 84% | 95% |
+```sh
+# "The capital of France is" through either pack's tokenizer: 671,6102,294,8760,344
+printf 'GEN 16 671,6102,294,8760,344\nQUIT\n' | strata-step35 --serve --model <first shard> \
+    --max-context 8192 --dense-cache auto --expert-cache auto --temperature 0 | grep '^T '
+```
 
-**The smaller pack is 2.7x faster exactly when the disk is the bottleneck, and no faster when it is not.** With the page
-cache warm both decode at ~0.045 s a token: at a 95% hit rate the token is not waiting on the file any more, it is
-waiting on the matvecs. What the smaller file buys is that 95% - 48 GB has a chance of staying in 62 GB of RAM where
-76 GB does not - and that is the state a served model really lives in. What it costs is quality: IQ1_M is ~1.75 bits a
-weight, and the pack is abliterated on top of that.
+The release answers `11111 16 455 6102 294 10322 344 17575 16 455 6102 294 14251 344 16235 16`, which decodes to
+" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."  Any pack that answers the same ids is the same
+model; anything else is not.  A pack that answers `223` fifteen times is answering fifteen spaces.
+
+### Two packs bought, measured, and what they were worth
+
+Both were downloaded and run on this machine (2 x 16 GB, 62 GB of RAM), 32768 positions, the layer split,
+`--dense-cache auto --expert-cache auto`:
+
+| | stepfun IQ3_XXS (75.8 GB) | bartowski IQ2_XXS (55.0 GB) | Vegss AEON-IQ1_M (48.4 GB) |
+|---|---|---|---|
+| the test above | right ids | **the same 16 ids** | 15 spaces and a newline |
+| a decoded token, page cache dropped | 1.40 / 1.43 s | **0.92 s** | 0.52 / 0.53 s |
+| a decoded token, warm | 0.045 s | 0.044 s | 0.045-0.054 s |
+| experts resident in the two tiers | 4086 of 12096 (34%) | 5540 (46%) | 6392 (53%) |
+| tier hits over a 4-request run | 84% | 85% | 95% |
+
+**IQ2_XXS is the one to use.** Same answers, 1.5x a token when the disk decides, and 55 GB in a 62 GB machine has a
+real chance of staying in the page cache where 76 GB does not - which is the state a served model lives in.  Warm, the
+three are the same speed: at 85% of experts resident the token is waiting on the matvecs, not on the file.
+
+**The AEON pack is broken and `setup.py` says so.** It loads, `--inspect` passes, its hidden states are in the release's
+range, its tokenizer is right once `pre_for` uses the architecture's split instead of the `tekken` its metadata claims -
+and it still answers whitespace.  With the same engine, the same prompt and the same config the release and IQ2_XXS both
+answer the sentence above, so what is left is the pack: an expert-granular abliteration of a 180B mixture of experts,
+requantised to IQ1_M's ~1.75 bits.
 
 ### The tier was allocating three times what it said
 
