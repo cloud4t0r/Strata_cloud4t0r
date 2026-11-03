@@ -194,10 +194,25 @@ struct Geometry {
     bool moe(int64_t layer) const { return layer >= dense_layers; }
 };
 
+/// The TRUNK's block count.  `step35.block_count` counts every block in the file, and a pack may keep the NextN ones
+/// in it: bartowski's packs say 48 with `step35.nextn_predict_layers` = 3, where the release ships the trunk alone (45).
+/// A NextN block is a decoder layer plus `eh_proj` wiring and NOT a mixture of experts, so running it as one reads
+/// tensors that are not there.  The trunk is what this engine serves, so this is the count everything below uses.
+int trunk_blocks(const GgufModel& file) {
+    int64_t n = 0;
+    const MetaValue* bc = file.meta().get("step35.block_count");
+    if (bc != nullptr) n = bc->num();
+    if (const MetaValue* nx = file.meta().get("step35.nextn_predict_layers")) n -= nx->num();
+    return (int) std::max<int64_t>(0, n);
+}
+
 /// Step-3.7-Flash's own keys, from the file.  Returns false as soon as something is missing or inconsistent.
 bool read_metadata(const GgufModel& gm, Report& r, Geometry& g) {
     const std::string p = "step35.";
     get_int(gm, r, p + "block_count", g.n_layers);
+    // the per-layer arrays describe EVERY block in the file (NextN ones included); the trunk is what runs
+    const int64_t blocks_in_file = g.n_layers;
+    g.n_layers = (int64_t) trunk_blocks(gm);
     get_int(gm, r, p + "embedding_length", g.n_embd);
     get_int(gm, r, p + "context_length", g.ctx);
     get_int(gm, r, p + "feed_forward_length", g.ff_dense);
@@ -230,9 +245,9 @@ bool read_metadata(const GgufModel& gm, Report& r, Geometry& g) {
     if (g.n_layers <= 0) return false;
     // the three per-layer arrays must describe every block, or the layer loop below reads past their end
     auto sized = [&](const char* what, const std::vector<double>& a) {
-        if ((int64_t) a.size() == g.n_layers) return true;
+        if ((int64_t) a.size() == blocks_in_file) return true;
         r.fail(std::string("step35.") + what + " has " + std::to_string(a.size()) + " entries for " +
-               std::to_string(g.n_layers) + " blocks");
+               std::to_string(blocks_in_file) + " blocks");
         return false;
     };
     if (!sized("attention.head_count", g.n_head)) return false;
@@ -628,7 +643,7 @@ int gpu_all(const std::string& path, int32_t token, int pos) {
         size_t shard = 0;
         const strata::TensorInfo* emb = file.find("token_embd.weight", &shard);
         const int64_t n_embd = (int64_t) emb->shape[0];
-        const int64_t n_layers = (int64_t) file.meta().get("step35.block_count")->num();
+        const int64_t n_layers = (int64_t) trunk_blocks(file);
         const int64_t dense_layers = (int64_t) file.meta().get("step35.leading_dense_block_count")->num();
         std::vector<float> row((size_t) n_embd);
         const size_t row_bytes = ggml_row_size((ggml_type) emb->type, n_embd);
@@ -939,7 +954,7 @@ int gpu_seq(const std::string& path, const std::string& tokens_csv, int n_blocks
         }
         // `--layers` omitted is 0, and the help says the prompt goes through every block: a pass over zero blocks
         // prints an empty result and looks like a model that answers nothing.
-        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        const int n_layers_total = trunk_blocks(file);
         if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
         std::vector<float> out;
         std::vector<double> sums;
@@ -996,7 +1011,7 @@ int gpu_mtp(const std::string& path, const std::string& mtp_path, const std::str
             std::printf("strata-step35: --gpu-mtp needs --tokens <id,id,...>\n");
             return 2;
         }
-        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        const int n_layers_total = trunk_blocks(file);
         if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
         const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
         const int n_mtp = (int) mtp.meta().get("step35.nextn_predict_layers")->num();
@@ -1227,7 +1242,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
     try {
         strata::GgufModel file = strata::GgufModel::open(path);
         std::string err;
-        const int n_blocks = (int) file.meta().get("step35.block_count")->num();
+        const int n_blocks = trunk_blocks(file);
         const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
         const int n_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
         const int head_dim = (int) file.meta().get("step35.attention.key_length")->num();
@@ -1589,7 +1604,7 @@ int gpu_spec(const std::string& path, const std::string& mtp_path, const std::st
             return 2;
         }
         std::string err;
-        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        const int n_layers_total = trunk_blocks(file);
         if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
         const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
         const int n_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
@@ -1766,7 +1781,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             std::printf("strata-step35: --gpu-chat needs --tokens <id,id,...>\n");
             return 2;
         }
-        const int n_layers_total = (int) file.meta().get("step35.block_count")->num();
+        const int n_layers_total = trunk_blocks(file);
         if (n_blocks <= 0 || n_blocks > n_layers_total) n_blocks = n_layers_total;
         const int n_embd = (int) file.meta().get("step35.embedding_length")->num();
         const int n_head_kv = (int) file.meta().get("step35.attention.head_count_kv")->items[0].num();
