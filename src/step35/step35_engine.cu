@@ -797,8 +797,36 @@ void print_dense_cache(const kernels::DenseCache& cache) {
 
 /// The level BELOW the tier: pinned host memory, expert-granular, filled from the file on its own misses.  A miss in
 /// the tier then copies from RAM instead of from the page cache's coin toss over a 75 GB file.
+/// What the machine can lend right now, in bytes (0 when it cannot be read): MemAvailable on Linux, which counts what
+/// a new allocation can take without swapping - `free` alone does not.
+uint64_t available_ram_bytes() {
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+    char key[64] = {0};
+    unsigned long long value = 0;
+    char unit[16] = {0};
+    uint64_t found = 0;
+    while (std::fscanf(f, "%63s %llu %15s", key, &value, unit) == 3)
+        if (std::strcmp(key, "MemAvailable:") == 0) {
+            found = (uint64_t) value * 1024ull;
+            break;
+        }
+    std::fclose(f);
+    return found;
+#else
+    return 0;
+#endif
+}
+
 bool open_host_cache(const strata::GgufModel& file, int mib, int n_blocks, kernels::ExpertCache& cache, std::string& err,
                      std::FILE* out) {
+    if (mib == -1) {                                  // auto: a quarter of what the machine can lend now, at most 8 GiB
+        const uint64_t avail = available_ram_bytes();
+        mib = avail ? (int) (std::min<uint64_t>(avail / 4, 8ull << 30) / (1u << 20)) : 2048;
+        std::fprintf(out, "strata-step35: host cache auto: %d MiB of %llu MiB available\n", mib,
+                     (unsigned long long) (avail / (1u << 20)));
+    }
     if (mib <= 0) return true;
     const int dense = (int) file.meta().get("step35.leading_dense_block_count")->num();
     size_t shard = 0;
@@ -812,7 +840,24 @@ bool open_host_cache(const strata::GgufModel& file, int mib, int n_blocks, kerne
     const size_t gate_bytes = strata::tensor_payload_bytes(*tg) / (size_t) n_expert;
     const size_t down_bytes = strata::tensor_payload_bytes(*td) / (size_t) n_expert;
     const size_t per_expert = 2 * gate_bytes + down_bytes;
-    const int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
+    int n_slots = (int) ((size_t) mib * 1024 * 1024 / per_expert);
+    // Pinned memory is not swapped: asking for more than half of what the machine can lend does not slow the model
+    // down, it slows the DESKTOP down until it dies - measured here, 33.6 GB pinned on 62 GB took Cinnamon with it.
+    const uint64_t avail = available_ram_bytes();
+    uint64_t want = (uint64_t) n_slots * per_expert;
+    // Ceiling: a quarter of what the machine can lend, and never more than 8 GiB.  Pageable memory can be swapped,
+    // but taking it still shrinks the page cache the experts come from - and a desktop that has to swap is a desktop
+    // that stutters.
+    const uint64_t cap = avail > 0 ? std::min<uint64_t>(avail / 4, 8ull << 30) : 0;
+    if (cap > 0 && want > cap) {
+        n_slots = (int) (cap / per_expert);
+        want = (uint64_t) n_slots * per_expert;
+        std::fprintf(out, "strata-step35: host cache: %d MiB asked, clamped to %d MiB (a quarter of the %llu MiB the "
+                          "machine can lend, ceiling 8 GiB)\n",
+                     mib, (int) ((uint64_t) n_slots * per_expert / (1u << 20)),
+                     (unsigned long long) (avail / (1u << 20)));
+        mib = (int) ((uint64_t) n_slots * per_expert / (1u << 20));
+    }
     if (n_slots <= 0) return true;
     if (!kernels::expert_cache_open(cache, n_slots, gate_bytes, down_bytes, err, true)) return false;
     std::fprintf(out, "strata-step35: host expert cache: %d slot(s) of %zu KB = %.1f GB of RAM\n", cache.n_slots,
@@ -1202,20 +1247,15 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
         if (split > 0)
             std::fprintf(stderr, "strata-step35: layer split: layers 0-%d on card 0, %d-%d on card 1\n", split - 1,
                          split, n_blocks - 1);
-        kernels::ExpertCache host_tier[2];
-        if (host_mib > 0) {
-            for (int d = 0; d < (split > 0 ? 2 : 1); ++d) {
-                cudaSetDevice(d);
-                if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier[d], err, stderr)) {
-                    std::printf("ERR %s\n", err.c_str());
-                    std::fflush(stdout);
-                    cudaSetDevice(0);
-                    return 1;
-                }
+        kernels::ExpertCache host_tier;
+        if (host_mib != 0) {
+            if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier, err, stderr)) {
+                std::printf("ERR %s\n", err.c_str());
+                std::fflush(stdout);
+                return 1;
             }
-            cudaSetDevice(0);
-            if (tier[0].n_slots > 0) tier[0].below = &host_tier[0];
-            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier[1];
+            if (tier[0].n_slots > 0) tier[0].below = &host_tier;
+            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier;
         }
         kernels::ExpertCache* tierp = tier[0].n_slots > 0 ? &tier[0] : nullptr;
         kernels::DenseCache* densep = dense[0].budget > 0 ? &dense[0] : nullptr;
@@ -1477,8 +1517,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                              (unsigned long long) (tier[d].hits + tier[d].misses));
         kernels::head_close(head);
         kernels::session_destroy(trunk);
-        for (int d = 0; d < 2; ++d)
-            if (host_mib > 0) kernels::expert_cache_close(host_tier[d]);
+        if (host_mib != 0) kernels::expert_cache_close(host_tier);
         kernels::expert_cache_close(tier[0]);
         kernels::dense_cache_close(dense[0]);
         if (split > 0) {
@@ -1765,19 +1804,16 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
         cudaSetDevice(0);
         // the level below: one host cache per card's tier (they hold the same experts, so one would do, but a split's
         // two tiers must not fight over one LRU)
-        kernels::ExpertCache host_tier[2];
-        if (host_mib > 0) {
-            for (int d = 0; d < (split > 0 ? 2 : 1); ++d) {
-                cudaSetDevice(d);
-                if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier[d], err, stdout)) {
-                    std::printf("strata-step35: %s\n", err.c_str());
-                    cudaSetDevice(0);
-                    return 1;
-                }
+        // ONE host cache, shared by both cards' tiers: its keys are (layer, expert), and each layer lives on one card,
+        // so a single LRU is correct - and asking for one per card was exactly twice the RAM (33.6 GB pinned on 62 GB).
+        kernels::ExpertCache host_tier;
+        if (host_mib != 0) {
+            if (!open_host_cache(file, (int) host_mib, n_blocks, host_tier, err, stdout)) {
+                std::printf("strata-step35: %s\n", err.c_str());
+                return 1;
             }
-            cudaSetDevice(0);
-            if (tier[0].n_slots > 0) tier[0].below = &host_tier[0];
-            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier[1];
+            if (tier[0].n_slots > 0) tier[0].below = &host_tier;
+            if (split > 0 && tier[1].n_slots > 0) tier[1].below = &host_tier;
         }
         kernels::ExpertCache* tierp = tier[0].n_slots > 0 ? &tier[0] : nullptr;
         kernels::DenseCache* densep = dense[0].budget > 0 ? &dense[0] : nullptr;
@@ -1930,8 +1966,7 @@ int gpu_chat(const std::string& path, const std::string& tokens_csv, const std::
             print_tier(tier[1], 0.0);
             print_dense_cache(dense[1]);
         }
-        for (int d = 0; d < 2; ++d)
-            if (host_mib > 0) kernels::expert_cache_close(host_tier[d]);
+        if (host_mib != 0) kernels::expert_cache_close(host_tier);
         kernels::expert_cache_close(tier[0]);
         kernels::dense_cache_close(dense[0]);
         if (split > 0) {
@@ -1999,7 +2034,10 @@ void usage() {
         "      of reading it over the bus - what lets a context bigger than the card run at all.\n"
         "      --host-cache MiB puts a second level BEHIND the expert tier, in pinned RAM: a miss in the card's tier\n"
         "      then copies from memory instead of from the file.  Keep it under the free RAM (the model's 75 GB does\n"
-        "      not fit; a third of it is what the page cache would hold anyway, but chosen expert by expert).\n"
+        "      not fit; a third of it is what the page cache would hold anyway, but chosen expert by expert).  `auto`\n"
+        "      takes a quarter of what the machine can lend (ceiling 8 GiB), and anything above is clamped to that.\n"
+        "      The memory is PAGEABLE on purpose: pinned memory cannot be swapped, and gigabytes of it take a desktop\n"
+        "      down - measured, twice, with Cinnamon as the victim.  It is off unless asked for.\n"
         "      [--temperature T] [--top-k K] [--top-p P] [--repeat-penalty R] [--seed S] sample instead of taking\n"
         "      the argmax; T=0 (the default) is greedy and ignores the rest.  --gpu-spec stays greedy: accepting a\n"
         "      draft drawn from a distribution needs its own rejection rule, which is not written yet.\n"
@@ -2219,7 +2257,8 @@ int run(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--kv-host") == 0) {
             kv_host = true;
         } else if (std::strcmp(argv[i], "--host-cache") == 0) {
-            host_mib = std::strtoll(argv[++i], nullptr, 10);
+            const std::string v = argv[++i];
+            host_mib = v == "auto" ? -1 : std::strtoll(v.c_str(), nullptr, 10);
         } else if (std::strcmp(argv[i], "--layer-split") == 0) {
             const std::string v = argv[++i];
             layer_split = v == "auto" ? -1 : std::strtoll(v.c_str(), nullptr, 10);

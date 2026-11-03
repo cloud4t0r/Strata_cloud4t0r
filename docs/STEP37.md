@@ -824,28 +824,26 @@ its positions in columns of eight. Measured on the same 116 positions: **0.295 s
 slower. The tier already serves the repeats, and the gather of every position's row, the 8-column matvecs and the
 scattered accumulation cost more than the reads they save. Written down here so nobody spends the day rediscovering it.
 
-## An expert cache in RAM, behind the VRAM tier
+## An expert cache in RAM, behind the VRAM tier (opt-in, off by default)
 
-`--host-cache MiB` puts a second level **behind** the expert tier: its slots are pinned host memory, filled from the file
+`--host-cache MiB|auto` puts a second level **behind** the expert tier: its slots are host memory, filled from the file
 on their own misses, and a miss in the card's tier is then served from RAM instead of from the file. The tier is asked
-first (`ExpertCache::below`), so nothing in the kernels or in the block code changed - the same `expert_cache_fetch`,
-one level down.
+first (`ExpertCache::below`), so nothing in the kernels or the block code changed.
 
-What it is for: the page cache's choices are made page by page over a 75 GB file on a 62 GB machine, and they are
-undone by whatever else the machine reads. This one chooses **expert by expert**, in memory the engine owns.
+**It is off unless asked for, and it has a history worth reading.** The first version used `cudaHostAlloc`, i.e. PINNED
+memory, in one cache per card: 2 x 16.8 GB on a 62 GB machine. Pinned pages cannot be swapped, and the desktop - Cinnamon
+- died twice while it ran. Three things changed and all three matter more than the speed:
 
-Measured with the page cache **dropped before every request** (`echo 3 > /proc/sys/vm/drop_caches`), 116 positions, 45
-blocks, 8192 context, the same prompt read twice by the same engine:
+- **one** host cache, shared by both cards' tiers (its keys are (layer, expert), and each layer lives on one card);
+- **pageable** memory, never pinned: the kernel can take it back, so a desktop cannot be starved by it;
+- a ceiling of a **quarter of what the machine can lend**, and never more than 8 GiB; `auto` picks exactly that, and a
+  larger request is clamped with a line saying so.
 
-| second read, page cache gone | prompt read |
-|---|---|
-| without `--host-cache` | **774 ms** (5.5 GB off the NVMe, ~7 GB/s) |
-| `--host-cache 8000` | **207 ms** (the same bytes out of pinned RAM, ~27 GB/s) |
-
-**3.7x**, and it is the case that matters for a served model: the first request fills the cache, and every later one
-that touches the same experts does not go back to the disk. With a **warm page cache the two are identical** (0.122 s
-per position either way) - the cache has nothing to add when the file is already in memory, which is why it is opt-in
-and not the default.
+What it buys, measured **with pinned memory** before it was removed: with the page cache dropped before every request,
+a repeated 116-position prompt read in 207 ms against 774 ms off the NVMe - 3.7x. **That figure no longer applies**: the
+pageable copy is a few GB/s rather than ~27, and with a warm page cache the two paths are identical (0.122 s per
+position). What it is for is the case a served model lives in - a first request fills the cache, and later ones do not
+go back to the disk when the machine has read something else since.
 
 ## Tests
 

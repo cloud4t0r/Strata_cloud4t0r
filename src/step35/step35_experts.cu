@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 
 namespace strata::step35::kernels {
@@ -34,11 +35,11 @@ bool expert_cache_open(ExpertCache& c, int n_slots, size_t gate_bytes, size_t do
     bool pinned = false;
     auto alloc = [&](void** p, size_t bytes) {
         if (!host_pinned) return cudaMalloc(p, bytes) == cudaSuccess;
-        if (cudaHostAlloc(p, bytes, cudaHostAllocDefault) == cudaSuccess) {
-            pinned = true;
-            return true;
-        }
-        *p = std::malloc(bytes);   // pinning a lot of memory can be refused: pageable still beats the file
+        // PAGEABLE, on purpose.  cudaHostAlloc locks the pages: they cannot be swapped, and asking for gigabytes of
+        // them on a desktop starves it until the session dies - measured on this machine, twice, with Cinnamon as the
+        // victim.  A pageable copy is slower (a few GB/s against ~27) and still beats the disk, and the kernel keeps
+        // the right to take the memory back instead of taking the desktop down.
+        *p = std::malloc(bytes);
         pinned = false;
         return *p != nullptr;
     };
@@ -163,6 +164,16 @@ ExpertSlot* expert_cache_fetch(ExpertCache& c, int layer, int expert, const uint
     if (s.key >= 0) {
         c.where.erase(s.key);   // the key leaves with the bytes: a stale entry would send a fetch to a reused slot
         ++c.evictions;
+    }
+    if (c.host) {   // a host cache's slot IS host memory: the three copies are memcpy, not a device transfer
+        std::memcpy(s.gate, gate_src, c.gate_bytes);
+        std::memcpy(s.up, up_src, c.gate_bytes);
+        std::memcpy(s.down, down_src, c.down_bytes);
+        s.key = key;
+        s.used = ++c.clock;
+        ++c.fetches[(size_t) idx];
+        c.where[key] = idx;
+        return &s;
     }
     const cudaError_t e1 = cudaMemcpy(s.gate, gate_src, c.gate_bytes, cudaMemcpyHostToDevice);
     const cudaError_t e2 = cudaMemcpy(s.up, up_src, c.gate_bytes, cudaMemcpyHostToDevice);
