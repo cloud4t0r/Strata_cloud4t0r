@@ -725,7 +725,7 @@ bool open_tier(const strata::GgufModel& file, int mib, kernels::ExpertCache& tie
 /// and the working buffers are out of the way.  The blocks come first - 1.9 GB buys the larger half of a token - and the
 /// tier takes the rest.  `tier_mib` / `dense_mib` are -1 for auto on the command line; both are replaced in place.
 void auto_budgets(const strata::GgufModel& file, int n_blocks, int dense_layers, const kernels::Session& session,
-                  int& tier_mib, int& dense_mib, bool kv_host) {
+                  int& tier_mib, int& dense_mib, bool kv_host, std::FILE* out = stdout) {
     if (tier_mib >= 0 && dense_mib >= 0) return;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b == 0) return;
@@ -744,8 +744,9 @@ void auto_budgets(const strata::GgufModel& file, int n_blocks, int dense_layers,
     // what the dense cache will really take: its budget if the person set one, the blocks' size if it is auto
     const uint64_t dense_take = std::min<uint64_t>(dense_mib >= 0 ? ((uint64_t) dense_mib << 20) : dense_need, room);
     if (tier_mib < 0) tier_mib = (int) ((room - dense_take) >> 20);
-    std::printf("strata-step35: auto budgets: %.2f GB free, %.2f GB of K/V, %.1f GB reserved -> dense %d MiB, tier %d MiB\n",
-                (double) free_b / 1e9, (double) kv / 1e9, (double) reserve / 1e9, dense_mib, tier_mib);
+    std::fprintf(out, "strata-step35: auto budgets: %.2f GB free, %.2f GB of K/V, %.1f GB reserved -> dense %d MiB, "
+                      "tier %d MiB\n",
+                 (double) free_b / 1e9, (double) kv / 1e9, (double) reserve / 1e9, dense_mib, tier_mib);
 }
 
 /// The blocks' dense weights, resident: sized like the tier (MiB on the command line), and reported with what it kept.
@@ -1088,7 +1089,7 @@ int dump_embeddings(const std::string& path, const std::string& tokens_csv, cons
 /// `STOP` to end a request early, `QUIT` to end the process), and this function speaks exactly that and nothing
 /// more: the weights, the cache, the head and the expert tier stay loaded between requests, and a request whose
 /// prompt extends the one before decodes only what is new.
-int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib,
+int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int tier_mib, int dense_mib,
           const std::string& tier_policy, bool kv_host, int image_token) {
     (void)mtp_path;   // drafting in a request is not wired: the protocol has no field for it
     try {
@@ -1109,24 +1110,45 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 swa->items[(size_t) l].num() != 0)
                 windows[(size_t) l] = window;
 
-        kernels::ExpertCache tier;
-        if (!open_tier(file, tier_mib, tier, err, stderr, tier_policy)) {   // stderr: stdout is the protocol and nothing else
-            std::printf("ERR %s\n", err.c_str());
-            std::fflush(stdout);
-            return 1;
-        }
-        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
         kernels::Session trunk;
         if (!kernels::session_create(trunk, n_blocks, n_kv, head_dim, max_ctx, err, windows, kv_host)) {
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
         }
+        // "auto" is resolved HERE, as on the command-line paths: before this it reached the caches as -1, which they
+        // read as "off" - a served model ran with no dense cache and no expert tier, every expert from the file.
+        auto_budgets(file, n_blocks, (int) file.meta().get("step35.leading_dense_block_count")->num(), trunk, tier_mib,
+                     dense_mib, kv_host, stderr);
+        kernels::ExpertCache tier;
+        if (!open_tier(file, tier_mib, tier, err, stderr, tier_policy)) {   // stderr: stdout is the protocol and nothing else
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        kernels::DenseCache dense;
+        if (!open_dense_cache(file, dense_mib, n_blocks, dense, err)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+        kernels::ExpertCache* tierp = tier.n_slots > 0 ? &tier : nullptr;
+        kernels::DenseCache* densep = dense.budget > 0 ? &dense : nullptr;
         kernels::Head head;
         if (!kernels::head_open(file, head, err)) {
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             return 1;
+        }
+        // What the engine sees, on stderr (stdout is the protocol): this path runs on ONE card, so a config that names
+        // two is worth a line here rather than a slow mystery - the runtime may hand it the other one.
+        {
+            int n_dev = 0;
+            cudaDeviceProp prop {};
+            if (cudaGetDeviceCount(&n_dev) == cudaSuccess && n_dev > 0 && cudaGetDeviceProperties(&prop, 0) == cudaSuccess)
+                std::fprintf(stderr,
+                             "strata-step35: device 0 of %d visible: %s (%.1f GB); this engine runs one card\n", n_dev,
+                             prop.name, (double) prop.totalGlobalMem / 1e9);
         }
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
@@ -1281,8 +1303,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                     std::vector<float> part;
                     std::vector<double> csum;
                     ok = kernels::run_prompt_dense(file, chunk, (int) off, n_blocks, part, csum, err, &trunk, tierp,
-                                                   nullptr,
-                                                   geni ? &image_rows : nullptr, geni ? &image_row : nullptr);
+                                                   densep, geni ? &image_rows : nullptr, geni ? &image_row : nullptr);
                     if (ok) out = part;
                     if (ok) {
                         const long long ms =
@@ -1327,7 +1348,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
                 const std::vector<int32_t> one(1, tok);
                 std::vector<float> dout;
                 std::vector<double> one_sums;
-                if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, one_sums, err, &trunk, tierp)) {
+                if (!kernels::run_prompt_dense(file, one, pos, n_blocks, dout, one_sums, err, &trunk, tierp, densep)) {
                     ok = false;
                     break;
                 }
@@ -1360,6 +1381,7 @@ int serve(const std::string& path, const std::string& mtp_path, int max_ctx, int
         kernels::head_close(head);
         kernels::session_destroy(trunk);
         kernels::expert_cache_close(tier);
+        kernels::dense_cache_close(dense);
         return 0;
     } catch (const std::exception& ex) {
         std::printf("ERR %s\n", ex.what());
@@ -2090,7 +2112,9 @@ int run(int argc, char** argv) {
     if (want_spec)
         return gpu_spec(trunk, mtp, tokens, (int) layers, (int) max_new, (int) drafts, (int) tier_mib,
                         (int) dense_mib, tier_policy);
-    if (want_serve) return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, tier_policy, kv_host, (int) image_token);
+    if (want_serve)
+        return serve(trunk, mtp, (int) max_ctx, (int) tier_mib, (int) dense_mib, tier_policy,
+                     kv_host, (int) image_token);
     if (want_gpu_mtp)
         return gpu_mtp(trunk, mtp, tokens, (int) layers, (int) drafts, (int) tier_mib, (int) dense_mib, tier_policy);
     if (want_chat)
