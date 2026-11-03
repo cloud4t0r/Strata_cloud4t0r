@@ -97,6 +97,7 @@ WIN = os.name == "nt"
 # download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "stepfun-ai/Step-3.7-Flash-GGUF": "0b69336d2fd2adfdef9c66e425f7778196c31482",                      # 2026-06-03
+    "Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF": "559c8d448924f55ab7b470e936b0b4b02bdaae7c",  # 2026-11-02
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
@@ -730,6 +731,15 @@ STEP35_FILES = {
     # the picture reader (a 47-block ViT, projector_type step3vl), read by strata-vision (llama.cpp's mtmd)
     "mmproj-step3.7-flash-f16.gguf": (3972828768, "5f25d11f92235c69682ca820af5f4cb125ae1142c8c33c018d0b3c9000a2ec1c"),
 }
+# Vegss's requantisation of Step-3.7-Flash, abliterated (expert-granular abliteration of the base model, then IQ1_M):
+# 48.4 GB against the release's 75.8, and the only pack that is both smaller and abliterated.  Sizes and sha256 are the
+# Hub's own (the LFS oids of the file list at the revision above).
+STEP35_AEON_FILES = {
+    "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-00001-of-00002.gguf": (44685617120, "6739fbc535ff169b8a66fed8f61a3fc5bb0591817a73ceb39c7eacc0db461bd5"),
+    "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-00002-of-00002.gguf": (3708200736, "7c8b56b51f520d160096d5ee61d16e2a1396a9613b0e98f7427489ce73682bc8"),
+    # its picture reader: a 47-block ViT, same projector family (step3vl), read by strata-vision
+    "mmproj-step37-flash-f16.gguf": (4399308992, "efe6c3221883d7d620c4a3239b1bb83ec58833037a96e4bff6d1434eec3be31f"),
+}
 OWN_PATH_FAMILIES = {
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; GGUFs with the MTP layer by Unsloth", "arch": "qwen35moe",
                "about": "35B mixture of experts with 3B active (256 experts, top-8): a smaller cousin of "
@@ -839,7 +849,21 @@ OWN_PATH_FAMILIES = {
                # RAM: the engine keeps no copy of the experts (they stay in the GGUF and are read per position), so
                # what RAM buys is the page cache - 24 GB keeps a third of the 75.8 GB file warm; the engine's own
                # footprint was measured at 2.2 GB.
-               "models": {"IQ3_XXS": {"about": "3-bit i-quant, the release's only offering so far (75.8 GB)", "ram_gb": 24}},
+               "models": {
+                   "IQ3_XXS": {"about": "3-bit i-quant, the release's only offering so far (75.8 GB)", "ram_gb": 24},
+                   # another repository, another quantiser: the fields below replace the family's for this size only
+                   # (own_path_src).  IQ1_M stores the three expert matrices at 1.75 / 1.75 / 2.06 bits against
+                   # IQ3_XXS's 3.06 / 3.06 / 3.06, so an expert is 3.48 MiB instead of 5.88 - 40% fewer bytes read per
+                   # position - and the card's tier holds ~60% more of them (docs/STEP37.md).
+                   "Aeon-IQ1_M": {"about": "abliterated (expert-granular), IQ1_M: 48.4 GB, the smallest pack and the "
+                                           "only abliterated one", "ram_gb": 24,
+                                  "hf": hf("Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"),
+                                  "file": "Step-3.7-Flash-AEON-Ultimate-Abliterated-IQ1_M-0000{i}-of-00002.gguf",
+                                  "shards": 2, "sha256": STEP35_AEON_FILES,
+                                  "mmproj": "mmproj-step37-flash-f16.gguf",
+                                  "mmproj_hf": hf("Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"),
+                                  "license": "StepFun's model licence, and Vegss's abliteration of it: "
+                                             "https://huggingface.co/Vegss/Step-3.7-Flash-AEON-Ultimate-Abliterated-GGUF"}},
                "sha256": STEP35_FILES,
                # the K/V cache: 2112 B per layer per position, 45 layers, but only the 12 full-attention blocks keep
                # every position - the 33 sliding ones keep a 1536-cell ring, 0.11 GB whatever the context
@@ -8377,12 +8401,29 @@ def own_path_split_misfit(fam: dict, ctx: int, avail: list, split: int):
     return None
 
 
+def own_path_src(fam: dict, model: str) -> dict:
+    """The family's own fields with THIS SIZE's overrides.  A size does not have to come from the family's repository:
+    Step-3.7-Flash's release is stepfun's two-shard IQ3_XXS, and the abliterated IQ1_M is Vegss's, with its own file
+    names, its own pin and its own picture reader.  A model entry can carry `hf`, `file`, `shards`, `sha256`,
+    `mmproj`, `mmproj_hf` and `license`; everything else stays the family's."""
+    md = (fam.get("models") or {}).get(model) or {}
+    if not md:
+        return fam
+    out = dict(fam)
+    for k in ("hf", "file", "shards", "sha256", "mmproj", "mmproj_hf", "license"):
+        if md.get(k) is not None:
+            out[k] = md[k]
+    return out
+
+
 def own_path_files(fam: dict, model: str) -> list:
     """The GGUF file names of one size of an own-path family, in order: one file (Qwen3.6), or its shards ("shards":
     MiniMax-M2's two; the engine opens the first and finds the rest beside it)."""
+    fam = own_path_src(fam, model)
     return [fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 1) + 1)]
 def own_path_bytes(fam: dict, model: str) -> int:
     """The download of one size of an own-path family: every file of it, pinned sizes."""
+    fam = own_path_src(fam, model)
     return sum(fam["sha256"][f][0] for f in own_path_files(fam, model))
 def own_path_ram_need(fam: dict, model: str, low_ram: bool = True, avail: float = None,
                       total: float = None, asked: float = None) -> int:
@@ -8720,6 +8761,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
                                      str(names.index(rec) + 1), a.yes)) - 1]
+    fam = own_path_src(fam, model)        # this size's repository, file names, pin and picture reader
     need = own_path_ram_need(fam, model, low_ram, ram_free, ram, asked)
     if ram < need:
         confirm_risk(f"{model} needs about {need} GB of RAM" + ("" if low_ram else " in the normal mode") +
@@ -9778,6 +9820,7 @@ def preview_family(a) -> int:
     if a.check:
         return 0
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
+    fam = own_path_src(fam, model)
     say(f"  Its license: {fam['license']}")
     want = [fam["file"].format(q=model)]
     if a.vision in ("yes", "gpu", "cpu"):

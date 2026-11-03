@@ -1369,18 +1369,25 @@ class Runner:
             return False
         if not fam:
             return False
+        # every pinned pack of the family, not one hardcoded name: the release is stepfun's IQ3_XXS and the
+        # abliterated pack is Vegss's IQ1_M, in a repository and under file names of its own
         for folder in folders:
-            if (folder / "Step-3.7-flash-IQ3_XXS-00001-of-00002.gguf").exists():
+            for model in (fam.get("models") or {}):
+                src = mod.own_path_src(fam, model) if hasattr(mod, "own_path_src") else fam
+                names = mod.own_path_files(src, model) if hasattr(mod, "own_path_files") else []
+                if not names or not (folder / names[0]).exists():
+                    continue
                 if s.family and s.family != "step35":
                     raise LaunchError(f"These are Step-3.7-Flash's files, not {s.family} {s.model}'s.",
                                       "Leave --family out, or use --family step35.", 2)
-                missing = [n for n in fam["sha256"] if not (folder / n).exists()]
+                missing = [n for n in names if not (folder / n).exists()]
                 if missing:
-                    raise LaunchError(f"Step-3.7-Flash IQ3_XXS is in two parts and {len(missing)} of them are not in "
+                    raise LaunchError(f"Step-3.7-Flash {model} comes in parts and {len(missing)} of them are not in "
                                       f"{folder} (first missing: {missing[0]}).",
-                                      "Put both parts in the folder. Nothing was downloaded or changed.", 5)
-                s.family, s.model, s.model_path = "step35", (s.model or "IQ3_XXS"), str(folder)
-                self.emit("model", "These are Step-3.7-Flash's files; the engine reads them where they are.", None)
+                                      "Put every part in the folder. Nothing was downloaded or changed.", 5)
+                s.family, s.model, s.model_path = "step35", (s.model or model), str(folder)
+                self.emit("model", f"These are Step-3.7-Flash {model}'s files; the engine reads them where they are.",
+                          None)
                 return True
         return False
 

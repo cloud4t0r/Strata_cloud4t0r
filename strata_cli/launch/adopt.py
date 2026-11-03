@@ -170,11 +170,20 @@ def _plan_step35(*, model_dir: Path, context: int, model_name: str, log: Path, b
         args += ["--expert-cache", str(tier_mib)]
     cfg = {"exe": "component:strata-engine", "args": args, "cwd": str(Path(model_dir)), "tokenizer": str(tokenizer),
            "model_name": model_name, "arch": "step35", "log": str(log), "lib_dirs": [], "port": 8080}
-    # pictures: the mmproj beside the shards (or one folder up, as the tokenizer is), read by strata-vision
-    mmproj = Path(model_dir) / (family_mmproj or "mmproj-step3.7-flash-f16.gguf")
-    if not mmproj.exists():
-        mmproj = Path(model_dir).parent / (family_mmproj or "mmproj-step3.7-flash-f16.gguf")
-    if mmproj.exists():
+    # pictures: the mmproj beside the shards (or one folder up, as the tokenizer is), read by strata-vision.  Any
+    # mmproj*.gguf will do: each pack of this family ships its own (the release's mmproj-step3.7-flash-f16.gguf, the
+    # abliterated pack's mmproj-step37-flash-f16.gguf), and the family's default name is only tried first.
+    mmproj = None
+    for folder in (Path(model_dir), Path(model_dir).parent):
+        named = folder / family_mmproj if family_mmproj else None
+        if named is not None and named.is_file():
+            mmproj = named
+            break
+        found = sorted(folder.glob("mmproj*.gguf"))
+        if found:
+            mmproj = found[0]
+            break
+    if mmproj is not None and mmproj.exists():
         cfg["vision"] = True
         cfg["mmproj"] = str(mmproj)
     elif notes is not None:
