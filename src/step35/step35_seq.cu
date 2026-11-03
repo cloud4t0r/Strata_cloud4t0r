@@ -369,7 +369,11 @@ bool logits_last(const strata::GgufModel& file, const float* h, std::vector<floa
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0,
                       int n_blocks, std::vector<float>& out, std::vector<double>& sums, std::string& err,
                       Session* session, ExpertCache* experts, DenseCache* blocks, const std::vector<float>* image_rows,
-                      const std::vector<int32_t>* image_row) {
+                      const std::vector<int32_t>* image_row, int split_at, ExpertCache* experts2,
+                      DenseCache* blocks2) {
+    // This function owns the device it allocates on: the caller may have left the second card current (the head lives
+    // there when the layers are split), and a buffer allocated there and used on card 0 is a memory fault, not a warning.
+    cudaSetDevice(0);
     const int n_pos = (int) tokens.size();
     const int64_t n_embd = (int64_t) file.meta().get("step35.embedding_length")->num();
     const int dense_layers = (int) file.meta().get("step35.leading_dense_block_count")->num();
@@ -404,13 +408,46 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     }
 
     float* d_h = nullptr;
+    float* d_h2 = nullptr;   // the residual stream on the second card, once the split is crossed
     if (cudaMalloc(&d_h, out.size() * sizeof(float)) != cudaSuccess) {
         err = "out of device memory";
         return false;
     }
+    if (split_at > 0) {
+        cudaSetDevice(1);
+        const bool ok2 = cudaMalloc(&d_h2, out.size() * sizeof(float)) == cudaSuccess;
+        cudaSetDevice(0);
+        if (!ok2) {
+            err = "out of device memory on the second card";
+            cudaFree(d_h);
+            return false;
+        }
+    }
     cudaMemcpy(d_h, out.data(), out.size() * sizeof(float), cudaMemcpyHostToDevice);
 
+    int cur_dev = 0;
     for (int layer = 0; layer < n_blocks; ++layer) {
+        // A layer split: this block runs on card 1, and the residual stream crosses once, through the host (16 KB at
+        // one position), because the two cards need no peer mapping for that.
+        const int dev = (split_at > 0 && layer >= split_at) ? 1 : 0;
+        if (dev != cur_dev) {
+            if (dev == 1) {
+                std::vector<float> hop(out.size());
+                if (cudaMemcpy(hop.data(), d_h, out.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = "cannot read the residual stream back to cross to the second card";
+                    return false;
+                }
+                cudaSetDevice(1);
+                if (cudaMemcpy(d_h2, hop.data(), out.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "cannot bring the residual stream to the second card";
+                    return false;
+                }
+                d_h = d_h2;
+            }
+            cur_dev = dev;
+        } else {
+            cudaSetDevice(dev);
+        }
         const bool is_moe = layer >= dense_layers;
         // the dense weights: resident when the cache holds this block (2 GB buys the larger half of a pass), uploaded
         // and freed here when it does not
@@ -418,7 +455,8 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         bool own_block = true;
         {
             ProfileScope t(profile().block_calls, profile().block_ns);
-            const DenseBlock* kept = blocks ? dense_cache_get(*blocks, layer, !is_moe, err) : nullptr;
+            DenseCache* blk_cache = (dev == 1) ? blocks2 : blocks;
+            const DenseBlock* kept = blk_cache ? dense_cache_get(*blk_cache, layer, !is_moe, err) : nullptr;
             if (kept != nullptr) {
                 b = *kept;
                 own_block = false;
@@ -540,7 +578,8 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
             int t_sh = 0;
             // The router, its bias and the shared expert are ~11 MB a block and were uploaded once per pass per block:
             // 41% of a token, measured.  With a dense cache they are kept like the block's own weights.
-            MoeSmall* small = blocks ? dense_cache_moe(*blocks, layer) : nullptr;
+            DenseCache* moe_cache = (dev == 1) ? blocks2 : blocks;
+            MoeSmall* small = moe_cache ? dense_cache_moe(*moe_cache, layer) : nullptr;
             if (small != nullptr) {
                 router = small->router;
                 sbias = small->sbias;
@@ -557,8 +596,8 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     sg = upload(file, pre + "ffn_gate_shexp.weight", rb);
                     su = upload(file, pre + "ffn_up_shexp.weight", rb);
                     sd = upload(file, pre + "ffn_down_shexp.weight", rb);
-                    if (blocks)   // kept for the next pass when the budget allows it
-                        dense_cache_moe_take(*blocks, layer, router, sbias, sg, su, sd, t_sh,
+                    if (moe_cache)   // kept for the next pass when the budget allows it
+                        dense_cache_moe_take(*moe_cache, layer, router, sbias, sg, su, sd, t_sh,
                                              (size_t) moe_small_bytes(file, layer));
                 } catch (const std::exception& ex) {
                     err = ex.what();
@@ -603,9 +642,10 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                     // WITH A TIER: the three matrices are already on the card, or they are filled once and stay.
                     // Without one (the default) this is the same three copies it always was.
                     const void *wg = dg, *wu = du, *wd = dd;
-                    if (experts != nullptr) {
+                    ExpertCache* this_tier = (dev == 1) ? experts2 : experts;
+                    if (this_tier != nullptr) {
                         bool hit = false;
-                        ExpertSlot* slot = expert_cache_fetch(*experts, layer, (int) ex, base_g + ex * gate_bytes,
+                        ExpertSlot* slot = expert_cache_fetch(*this_tier, layer, (int) ex, base_g + ex * gate_bytes,
                                                               base_u + ex * gate_bytes, base_d + ex * down_bytes, hit,
                                                               err);
                         if (slot == nullptr) {
@@ -637,7 +677,8 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
                 if (ok) k_add_n<<<(e + 255) / 256, 256>>>(hp, eacc, e);
             }
             // the five the cache may own are freed by `dense_cache_close`, not here
-            const bool owned = blocks && (size_t) layer < blocks->moe_ready.size() && blocks->moe_ready[(size_t) layer];
+            const bool owned = moe_cache && (size_t) layer < moe_cache->moe_ready.size() &&
+                               moe_cache->moe_ready[(size_t) layer];
             for (void* q : {owned ? nullptr : router, owned ? nullptr : (void*) sbias, owned ? nullptr : sg,
                             owned ? nullptr : su, owned ? nullptr : sd, (void*) logits, (void*) eg, (void*) eu,
                             (void*) eact, (void*) ed, (void*) eacc, (void*) ids, (void*) wts, dg, du, dd})
@@ -659,7 +700,13 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
     }
     out.resize((size_t) n_pos * e);
     cudaMemcpy(out.data(), d_h, out.size() * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_h);
+    if (d_h2 != nullptr) {
+        cudaSetDevice(1);
+        cudaFree(d_h2);
+        cudaSetDevice(0);
+    } else {
+        cudaFree(d_h);
+    }
     return true;
 }
 

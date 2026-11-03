@@ -185,6 +185,37 @@ bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int c
     return true;
 }
 
+/// Which device the caller is on: the position buffers must live where the layer runs.
+bool session_steps_on(Session& s, int device, int32_t*& step, int32_t*& steps, std::string& err) {
+    if (device <= 0) {
+        step = s.step;
+        steps = s.steps;
+        return step != nullptr;
+    }
+    if (s.step_by_dev.empty()) {
+        s.step_by_dev.assign(8, nullptr);
+        s.steps_by_dev.assign(8, nullptr);
+    }
+    if ((size_t) device >= s.step_by_dev.size()) {
+        s.step_by_dev.resize((size_t) device + 1, nullptr);
+        s.steps_by_dev.resize((size_t) device + 1, nullptr);
+    }
+    if (s.step_by_dev[(size_t) device] == nullptr) {
+        if (!cuda_ok(cudaMalloc((void**) &s.step_by_dev[(size_t) device], (size_t) kStepCount * sizeof(int32_t)),
+                     "allocate step on a second card", err))
+            return false;
+        if (!cuda_ok(cudaMemset(s.step_by_dev[(size_t) device], 0, (size_t) kStepCount * sizeof(int32_t)),
+                     "zero step on a second card", err))
+            return false;
+        if (!cuda_ok(cudaMalloc((void**) &s.steps_by_dev[(size_t) device], (size_t) s.capacity * kStepCount * sizeof(int32_t)),
+                     "allocate step array on a second card", err))
+            return false;
+    }
+    step = s.step_by_dev[(size_t) device];
+    steps = s.steps_by_dev[(size_t) device];
+    return true;
+}
+
 void session_destroy(Session& s) {
     for (KvLayer& l : s.layers) {
         if (l.k_q_host) {
@@ -200,6 +231,10 @@ void session_destroy(Session& s) {
     }
     s.layers.clear();
     s.windows.clear();
+    for (int32_t* p : s.step_by_dev) cudaFree(p);
+    for (int32_t* p : s.steps_by_dev) cudaFree(p);
+    s.step_by_dev.clear();
+    s.steps_by_dev.clear();
     cudaFree(s.step);
     cudaFree(s.steps);
     s.step = nullptr;
@@ -238,13 +273,18 @@ bool session_append(Session& s, int layer, int pos0, int n_tok, const float* kcu
         host[(size_t) j * kStepCount + kStepNKv] = pos + 1;
         host[(size_t) j * kStepCount + kStepWidth] = pos + 1;   // no selection here: the width is the prefix
     }
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    int32_t* step_dev = nullptr;
+    int32_t* steps_dev = nullptr;
+    if (!session_steps_on(s, dev, step_dev, steps_dev, err)) return false;
     {
         ProfileScope t(profile().steps_calls, profile().steps_ns);
-        if (!cuda_ok(cudaMemcpy(s.steps, host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+        if (!cuda_ok(cudaMemcpy(steps_dev, host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
                      "upload positions", err))
             return false;
     }
-    strata::kernels::kv_append_q8_steps(l.k_q, l.v_q, l.k_scale, l.v_scale, l.table, s.steps, kStepCount, kcur,
+    strata::kernels::kv_append_q8_steps(l.k_q, l.v_q, l.k_scale, l.v_scale, l.table, steps_dev, kStepCount, kcur,
                                         vcur, s.n_head_kv * s.head_dim, n_tok, shapes_of(s), nullptr, nullptr);
     if (!cuda_ok(cudaGetLastError(), "append cells", err)) return false;
     if (pos0 + n_tok > s.n_cached) s.n_cached = pos0 + n_tok;
@@ -276,9 +316,14 @@ bool session_attend(Session& s, int layer, const float* q, float* out, int pos0,
     // One writer for the position the attention reads: the last row's.  A per-row host scalar would freeze at the
     // first row in a captured graph, which is exactly the failure qsa.hpp's step buffer exists to prevent.
     const int32_t last = pos0 + n_tok - 1;
+    int dev2 = 0;
+    if (cudaGetDevice(&dev2) != cudaSuccess) dev2 = 0;
+    int32_t* step_dev = nullptr;
+    int32_t* steps_unused = nullptr;
+    if (!session_steps_on(s, dev2, step_dev, steps_unused, err)) return false;
     {
         ProfileScope t(profile().position_calls, profile().position_ns);
-        if (!cuda_ok(cudaMemcpy(s.step, &last, sizeof(int32_t), cudaMemcpyHostToDevice), "upload position", err))
+        if (!cuda_ok(cudaMemcpy(step_dev, &last, sizeof(int32_t), cudaMemcpyHostToDevice), "upload position", err))
             return false;
     }
 
@@ -288,7 +333,7 @@ bool session_attend(Session& s, int layer, const float* q, float* out, int pos0,
     kv.k_scale = l.k_scale;
     kv.v_scale = l.v_scale;
     kv.page_table = l.table;
-    kv.step = s.step;
+    kv.step = step_dev;
     kv.page_size = s.page_size;
     kv.n_head_kv = s.n_head_kv;
     kv.head_dim = s.head_dim;

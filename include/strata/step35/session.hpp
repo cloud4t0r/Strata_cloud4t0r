@@ -68,8 +68,12 @@ struct Session {
     /// the price of reading it over the bus.  It is what lets a context bigger than the card run at all.
     bool host_pools = false;
     std::vector<int> windows;   ///< per layer: the sliding window, 0 for a full-attention block
-    int32_t* step = nullptr;   ///< (kStepCount,) i32 on device: what the kernels read the position from
-    int32_t* steps = nullptr;   ///< (capacity * kStepCount,) i32: one step buffer per prefilled position
+    int32_t* step = nullptr;    ///< device 0: (kStepCount,) i32, what the kernels read the position from
+    int32_t* steps = nullptr;   ///< device 0: (capacity * kStepCount,) i32, one step buffer per prefilled position
+    /// The same two buffers on the OTHER cards, allocated on first use: a layer split runs the layers of one card on
+    /// that card, and the position buffers it reads have to be there too.  Index 0 is `step`/`steps` above.
+    std::vector<int32_t*> step_by_dev;
+    std::vector<int32_t*> steps_by_dev;
     std::vector<KvLayer> layers;   ///< one entry per layer, allocated on first use
 };
 
@@ -91,6 +95,9 @@ int session_layer_cells(const Session& s, int layer);
 bool session_create(Session& s, int n_layers, int n_head_kv, int head_dim, int capacity, std::string& err,
                     const std::vector<int>& per_layer_window = {}, bool host_pools = false);
 void session_destroy(Session& s);
+
+/// The step buffers of `device`, allocated the first time that device is used (device 0 is `step`/`steps`).
+bool session_steps_on(Session& s, int device, int32_t*& step, int32_t*& steps, std::string& err);
 
 /// Takes the K and V of `n_tok` positions (already normed and rotated, exactly as the attention wants them),
 /// starting at sequence position `pos0`, and writes their cells.  K/V are `[n_tok][n_head_kv][head_dim]` fp32 on

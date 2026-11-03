@@ -107,7 +107,8 @@ bool embed_rows(const strata::GgufModel& file, const std::vector<int32_t>& token
 bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>& tokens, int pos0, int n_blocks,
                       std::vector<float>& out, std::vector<double>& sums, std::string& err,
                       Session* session = nullptr, ExpertCache* experts = nullptr, DenseCache* blocks = nullptr,
-                      const std::vector<float>* image_rows = nullptr, const std::vector<int32_t>* image_row = nullptr);
+                      const std::vector<float>* image_rows = nullptr, const std::vector<int32_t>* image_row = nullptr,
+                      int split_at = 0, ExpertCache* experts2 = nullptr, DenseCache* blocks2 = nullptr);
 
 /// The vocabulary logits of ONE position: `h` is one row of the last block's output on the HOST (n_embd floats),
 /// `logits` receives the file's `output.weight` applied to `rms_norm(h, output_norm)` - n_vocab floats, also on the
