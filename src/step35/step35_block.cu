@@ -242,6 +242,8 @@ bool upload_block(const GgufModel& file, int layer, DenseBlock& b, std::string& 
         if (with_ffn) {
             b.ffn_gate = upload(file, pre + "ffn_gate.weight", bytes);
             b.t_ffn = (int) file.find(pre + "ffn_gate.weight")->type;
+            b.t_ffn_up = (int) file.find(pre + "ffn_up.weight")->type;
+            b.t_ffn_down = (int) file.find(pre + "ffn_down.weight")->type;
             b.ffn_up = upload(file, pre + "ffn_up.weight", bytes);
             b.ffn_down = upload(file, pre + "ffn_down.weight", bytes);
         }
@@ -319,10 +321,10 @@ bool run_dense_block(const DenseBlock& b, float* h, int pos, void* scratch_q8, i
     cudaMemcpy(x, h, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice);
     per_head_rms_norm(x, 1, e, b.ffn_norm, b.eps, nullptr);
     gemv((ggml_type) b.t_ffn, b.ffn_gate, x, g, e, b.ff, scratch_q8, nullptr);
-    gemv((ggml_type) b.t_ffn, b.ffn_up, x, u, e, b.ff, scratch_q8, nullptr);
+    gemv((ggml_type) b.t_ffn_up, b.ffn_up, x, u, e, b.ff, scratch_q8, nullptr);
     cudaMemcpy(a, g, (size_t) b.ff * sizeof(float), cudaMemcpyDeviceToDevice);
     k_silu_mul<<<(b.ff + 255) / 256, 256>>>(a, u, b.ff, 0.0f);
-    gemv((ggml_type) b.t_ffn, b.ffn_down, a, d, b.ff, e, scratch_q8, nullptr);
+    gemv((ggml_type) b.t_ffn_down, b.ffn_down, a, d, b.ff, e, scratch_q8, nullptr);
     k_add<<<(e + 255) / 256, 256>>>(h, d, e);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("a kernel failed: ") + cudaGetErrorString(cudaGetLastError());

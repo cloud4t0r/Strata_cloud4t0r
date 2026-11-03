@@ -859,7 +859,14 @@ STRATA_TQP_FMT(149)
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149) \
                         X(16) X(17) X(18) X(21) X(22) X(29)
 #endif
+// Q6_K is the plain matvec's too, behind the same flag as the gate/up lists: Step-3.7-Flash's packs other than the
+// release store whole attention projections in it (bartowski's IQ2_XXS: attn_v Q6_K on a quarter of the blocks), and
+// `iq_mmvq` answered "type 14 is not supported" before this.
+#ifdef STRATA_Q6K_EXPERTS
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+#else
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+#endif
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 

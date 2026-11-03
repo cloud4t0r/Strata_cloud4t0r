@@ -267,10 +267,10 @@ bool mtp_step(MtpContext& ctx, int k, int slot, int pos, int32_t token, const fl
         if (ok) ok = cudaMemcpy(ctx.x, ctx.s, (size_t) e * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
         if (ok) per_head_rms_norm(ctx.x, 1, e, b.ffn_norm, eps, nullptr);
         if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_gate, ctx.x, ctx.g, e, b.ff, 1, ctx.q8, err) &&
-                     proj((ggml_type) b.t_ffn, b.ffn_up, ctx.x, ctx.u, e, b.ff, 1, ctx.q8, err);
+                     proj((ggml_type) b.t_ffn_up, b.ffn_up, ctx.x, ctx.u, e, b.ff, 1, ctx.q8, err);
         if (ok) ok = cudaMemcpy(ctx.act, ctx.g, (size_t) b.ff * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
         if (ok) k_silu_mul_n<<<(b.ff + 255) / 256, 256>>>(ctx.act, ctx.u, b.ff, 0.0f);
-        if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_down, ctx.act, ctx.d, b.ff, e, 1, ctx.q8, err);
+        if (ok) ok = proj((ggml_type) b.t_ffn_down, b.ffn_down, ctx.act, ctx.d, b.ff, e, 1, ctx.q8, err);
         if (ok) k_add_n<<<(e + 255) / 256, 256>>>(ctx.s, ctx.d, e);
         if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
         if (ok) {
@@ -563,10 +563,10 @@ bool run_prompt_dense(const strata::GgufModel& file, const std::vector<int32_t>&
         if (ok && !is_moe) {
             // ---- the dense feed-forward
             ok = proj((ggml_type) b.t_ffn, b.ffn_gate, x, g, e, b.ff, n_pos, d_q8, err);
-            if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_up, x, u, e, b.ff, n_pos, d_q8, err);
+            if (ok) ok = proj((ggml_type) b.t_ffn_up, b.ffn_up, x, u, e, b.ff, n_pos, d_q8, err);
             if (ok) cudaMemcpy(act, g, (size_t) n_pos * b.ff * sizeof(float), cudaMemcpyDeviceToDevice);
             if (ok) k_silu_mul_n<<<(n_pos * b.ff + 255) / 256, 256>>>(act, u, n_pos * b.ff, 0.0f);
-            if (ok) ok = proj((ggml_type) b.t_ffn, b.ffn_down, act, d, b.ff, e, n_pos, d_q8, err);
+            if (ok) ok = proj((ggml_type) b.t_ffn_down, b.ffn_down, act, d, b.ff, e, n_pos, d_q8, err);
             if (ok) k_add_n<<<(n_pos * e + 255) / 256, 256>>>(d_h, d, n_pos * e);
         } else if (ok) {
             // ---- the mixture of experts, ONE POSITION AT A TIME (each position routes on its own)

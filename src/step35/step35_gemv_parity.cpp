@@ -159,6 +159,11 @@ int main() {
     gemv_case(GGML_TYPE_IQ3_XXS, 11264, 16);   // the dense FFN's down projection
     gemv_case(GGML_TYPE_IQ2_S, 4096, 16);      // q or k, IQ2_S in the release
     gemv_case(GGML_TYPE_Q8_0, 4096, 64);       // every tensor of the MTP file is Q8_0, its head included
+    // Q6_K: not in the release, but whole projections in the other packs (bartowski's IQ2_XXS stores attn_v in it on a
+    // quarter of the blocks, at the release's own 8192 output rows)
+    gemv_case(GGML_TYPE_Q6_K, 4096, 8192);
+    gemv_case(GGML_TYPE_Q6_K, 4096, 1024);     // attn_v
+    gemv_case(GGML_TYPE_Q6_K, 11264, 4096);    // the dense FFN's down projection
 
     if (failures) {
         std::printf("step35_gemv_parity: %d check(s) failed\n", failures);
