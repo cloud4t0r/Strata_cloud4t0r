@@ -4571,6 +4571,7 @@ class Service:
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
+        self.systemone = None                         # serve/systemone.py's DecideService when the model is a decider
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
@@ -7943,7 +7944,7 @@ def make_handler(svc: Service):
                 return
             reserved = False
             try:
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/systemone"):
                     reserved = svc.reserve_inference()
                     if reserved is None:
                         error = {"type": "server_error", "code": "server_draining",
@@ -8002,6 +8003,9 @@ def make_handler(svc: Service):
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/systemone":                   # the System One decision protocol (v3 only)
+                    self._systemone(req)
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
@@ -8088,6 +8092,38 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+
+        def _systemone(self, req):
+            """POST /v1/systemone: the System One decision protocol, version 3 (serve/systemone.py).
+
+            The checkpoint was trained and evaluated on v3; llama-server's older /v1/systemone speaks v1 for other
+            decision models, and an answer computed from the v1 prompt would be wrong, not merely old.  So a v1 body
+            is a 400 that names the version, never a guess.
+            """
+            # M1 skeleton: the engine has no decide() yet, so this is a 501 below.  When M4 adds it, this route must
+            # take svc.fifo and svc.begin_request the way the chat paths do (one decision at a time, in the metrics).
+            service = getattr(svc, "systemone", None)
+            if service is None:
+                self._json(404, {"error": {"type": "invalid_request_error",
+                                           "message": "this model is not a decision model (no decider.json)"}})
+                return
+            from serve import systemone
+            try:
+                body = service.decide(req)
+            except systemone.EngineUnavailable as e:
+                self._json(501, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            except systemone.RequestError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            except (EngineDied, EngineStarting, EngineStuck, GpuBusy, EngineNonFinite) as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            except (ValueError, RuntimeError) as e:      # a row count, a non-finite readout or a bad probability
+                self._json(500, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            svc.last_request_at = time.time()
+            self._json(200, body)
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
@@ -9930,6 +9966,20 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
         svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        if svc.model_arch == "qwen35":                   # the decision model: /v1/systemone (serve/systemone.py)
+            from serve import systemone
+            try:
+                svc.systemone = systemone.service_from_config(
+                    cfg, svc.tok, svc.template, svc.engine,
+                    max_context=getattr(svc.engine, "max_context", 0) or 0)
+            except systemone.ConfigError as exc:
+                print(f"[strata] /v1/systemone is off: {exc}", flush=True)
+                svc.systemone = None
+            if svc.systemone is None:
+                print("[strata] /v1/systemone: no decider.json in the tokenizer folder; the route is off",
+                      flush=True)
+            else:
+                print("[strata] /v1/systemone: the decision protocol (version 3) is on", flush=True)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
