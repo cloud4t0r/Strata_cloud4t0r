@@ -866,8 +866,28 @@ de direction. Le noyau applique
 l'appariement du GGUF (`kh = v % head_k`), celui que §10.8 a corrigé côté référence : l'inverser ici aurait donné
 un cosinus de 0,38 sans qu'aucune norme ne bouge.
 
-Reste pour M2 : l'attention non-causale (GQA 16/4, tête de 256, sans masque causal, RoPE partiel) ; ensuite M3
-(assemblage des 32 blocs) et M4 (tête de lecture et `DEC`).
+### 10.11 M2 — l'attention non-causale sur GPU (5 novembre 2026)
+
+| Étape | Noyau | Ce qu'il fait |
+|---|---|---|
+| q/k | `norm_rope_kernel` | RMSNorm par tête (q et k séparément), puis RoPE partiel sur 64 des 256 dimensions, paires (i, i+32) |
+| `attn` | `attention_kernel` | GQA 16/4, **sans masque causal** : chaque token voit toute la séquence ; softmax sur tous les tokens, puis porte `sigmoid` par tête |
+| `mixer` | `iq_mmvq` | `attn_output` |
+
+Résultat sur le bloc 3 du cas `noul` (98 tokens, premier bloc d'attention pleine), RX 6800 (gfx1030) :
+
+| Étape | Cosinus | Écart relatif | Écart max |
+|---|---:|---:|---:|
+| `attn` (avant projection) | **0,99993438** | 0,0115 | 2,4 × 10⁻² |
+| `mixer` (après `attn_output`) | **0,99993348** | 0,0117 | 2,3 × 10⁻² |
+
+Le même ordre d'écart que les autres projections (quantification d'activation). Le noyau applique bien le
+`kvh = h / (H / KV)` de la GQA et la disposition `[q | gate]` par tête du GGUF : une erreur là donne des scores
+plausibles mais faux, et c'est le genre de faute que ce test attrape.
+
+**M2 est terminé** : les quatre familles de noyaux (normes et projections denses, GDN, attention non-causale) sont
+portées et comparées à la référence, bloc par bloc. Reste M3 (assemblage des 32 blocs, embeddings et norme finale)
+et M4 (tête de lecture, `DEC`, serveur).
 
 ### 10.5 Ce que cette étude ne prétend pas
 

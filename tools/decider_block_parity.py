@@ -42,7 +42,7 @@ def parse_args(argv=None):
     parser.add_argument("--gguf", required=True, help="the Q8_0 GGUF both sides read")
     parser.add_argument("--case", default="noul", help="a golden case name (default: noul)")
     parser.add_argument("--block", type=int, default=0, help="the block to compare (default: 0)")
-    parser.add_argument("--stage", choices=("mlp", "gdn"), default="mlp",
+    parser.add_argument("--stage", choices=("mlp", "gdn", "attn"), default="mlp",
                         help="which kernel of the block (default: mlp; a GDN block is 0, 1, 2, ... not 3, 7, ...)")
     parser.add_argument("--dump-dir", default=None, help="where the stages are written; reused when they exist")
     parser.add_argument("--goldens", default=str(DEFAULT_GOLDENS))
@@ -65,7 +65,7 @@ def load_case(path: str, name: str) -> dict:
 def ensure_dump(args, prompt: dict) -> Path:
     directory = Path(args.dump_dir or f"/tmp/decider-block-{args.case}-{args.block}")
     directory.mkdir(parents=True, exist_ok=True)
-    if args.stage == "gdn":
+    if args.stage in ("gdn", "attn"):
         needed = [directory / f"xn_attn_{args.block}.f32", directory / f"mixer_{args.block}.f32"]
     else:
         needed = [directory / f"x_post_{args.block}.f32", directory / f"mlp_{args.block}.f32"]
@@ -121,12 +121,13 @@ def main(argv=None) -> int:
         ok = compare("mlp", load(directory / f"mlp_gpu_{args.block}.f32"),
                      load(directory / f"mlp_{args.block}.f32"), PROJECTION_TOLERANCE) and ok
     else:
-        conv_out = directory / f"conv_gpu_{args.block}.f32"
-        core_out = directory / f"core_gpu_{args.block}.f32"
-        gpu("gdn", "mixer", f"xn_attn_{args.block}.f32",
-            ["--conv-out", str(conv_out), "--core-out", str(core_out)])
-        for name, tolerance in (("conv", PROJECTION_TOLERANCE), ("core", PROJECTION_TOLERANCE),
-                                ("mixer", PROJECTION_TOLERANCE)):
+        stages = ["conv", "core", "mixer"] if args.stage == "gdn" else ["attn", "mixer"]
+        extra = ["--conv-out", str(directory / f"conv_gpu_{args.block}.f32"),
+                 "--core-out", str(directory / f"core_gpu_{args.block}.f32")] if args.stage == "gdn" \
+            else ["--attn-out", str(directory / f"attn_gpu_{args.block}.f32")]
+        gpu(args.stage, "mixer", f"xn_attn_{args.block}.f32", extra)
+        for name in stages:
+            tolerance = PROJECTION_TOLERANCE
             reference = directory / f"{name}_{args.block}.f32"
             if reference.exists():
                 ok = compare(name, load(directory / f"{name}_gpu_{args.block}.f32"), load(reference), tolerance) and ok

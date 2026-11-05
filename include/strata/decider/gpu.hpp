@@ -33,4 +33,10 @@ bool mlp(const std::string& gguf, int64_t block, const std::string& in_path, con
 bool gdn(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
          std::string& err, const std::string& conv_path = {}, const std::string& core_path = {});
 
+/// Runs block `block`'s full-attention mixer: per-head Q/K norms, partial RoPE, NON-CAUSAL grouped-query
+/// attention, the per-head gate and the output projection.  `in_path` is "xn_attn_N.f32"; `out_path` receives
+/// "mixer_N.f32", and `attn_path` the attention output before the projection ("attn_N.f32").
+bool attention(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
+               std::string& err, const std::string& attn_path = {});
+
 }  // namespace strata::decider::gpu

@@ -229,6 +229,7 @@ void attention(const Model& m, const Layer& l, const std::vector<float>& qn, con
         }
     }
     trace_vec(" attn", attn.data(), attn.size());
+    if (g_stage) g_stage(g_stage_block, "attn", attn);
     std::vector<float> flat((size_t) H * D);
     for (int64_t t = 0; t < T; ++t) {
         for (int64_t h = 0; h < H; ++h)
