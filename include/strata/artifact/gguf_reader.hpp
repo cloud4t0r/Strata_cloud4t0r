@@ -321,6 +321,11 @@ private:
 
 enum class MetaType : uint32_t { U8 = 0, I8, U16, I16, U32, I32, F32, BOOL, STRING, ARRAY, U64, I64, F64 };
 
+/// How many entries of a metadata array are kept in memory.  Above this the array is sampled: the tokenizer's
+/// vocabulary and merge tables (a quarter of a million entries each) are only ever read by count.  4096 covers
+/// every small array in the families Strata reads, the decider's 255 readout codes included.
+constexpr uint64_t kArraySample = 4096;
+
 struct MetaValue {
     MetaType type = MetaType::U32;
     uint64_t u = 0;                // integer payloads
@@ -381,10 +386,14 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        // A SMALL ARRAY IS KEPT WHOLE.  The tokenizer's tables hold a quarter of a million entries and only their
+        // count and a sample are ever read, so they are sampled; but 64 is not enough for every array: the decider's
+        // `pplx_decider.token_ids` is 255 readout codes and each one is a row of the head.  A sampled array made
+        // that readout answer over its first 64 codes only - plausible numbers, silently wrong.
+        v.items.reserve((size_t) std::min<uint64_t>(v.count, kArraySample));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < kArraySample) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
         }
         break;
     }

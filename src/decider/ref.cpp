@@ -379,6 +379,9 @@ bool load(const std::string& path, Model& m, std::string& err) {
         if (!tokens || tokens->type != MetaType::ARRAY) fail("missing tokenizer.ggml.tokens");
         m.n_vocab = (int64_t) tokens->count;
         const MetaValue* codes = g.get("pplx_decider.token_ids");
+        if (codes->items.size() != (size_t) codes->count)
+            fail("the reader kept " + std::to_string(codes->items.size()) + " of the " +
+                 std::to_string(codes->count) + " readout codes: the head would answer over a prefix only");
         for (const MetaValue& id : codes->items) m.codes.push_back((int64_t) id.u);
         const MetaValue* recurrent = g.get("qwen35.attention.recurrent_layers");
         for (const MetaValue& v : recurrent->items) m.recurrent.push_back(v.u ? 1 : 0);

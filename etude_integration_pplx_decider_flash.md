@@ -772,7 +772,7 @@ OpenMP (le résultat ne dépend pas du nombre de threads). Aucun GPU.
 
 L'écart restant est celui de la quantification Q8_0 contre le checkpoint BF16, pas une erreur de structure.
 
-**Trois pièges silencieux trouvés en chemin** — tous les trois donnaient des nombres plausibles :
+**Quatre pièges silencieux trouvés en chemin** — tous donnaient des nombres plausibles :
 
 1. **Le `+1` des normes est déjà replié dans le GGUF.** `Qwen3_5RMSNorm` applique `x · (1 + w)` et le convertisseur
    écrit `1 + w` (moyenne d'`attn_norm` : 1,14). Appliquer encore `1 + w` double chaque vecteur normé : le bloc 0
@@ -784,9 +784,17 @@ L'écart restant est celui de la quantification Q8_0 contre le checkpoint BF16, 
    `[v_per_k][head_k][dim]`. La référence PyTorch fait `repeat_interleave(2)` (tête v `h` ↔ tête k `h/2`) ; dans
    le GGUF, la tête v `g` appartient à la tête k **`g % head_k`**. Avec l'appariement de la référence, la sortie
    garde la bonne norme et perd la bonne direction (cosinus 0,38 contre l'oracle) — et rien ne le signale.
+4. **Le lecteur GGUF ne gardait que 64 entrées de chaque tableau de métadonnées.** `MetaValue::items` est un
+   échantillon (`v.count` reste complet) : les tables du tokenizer font 248 000 entrées et seuls leur nombre et un
+   extrait sont lus. Mais `pplx_decider.token_ids` fait **255** entrées — une par ligne de la tête — et la référence
+   répondait donc sur les **64 premiers codes** seulement, en silence. Les 12 questions à moins de 64 options
+   passaient ; le cas à 255 options a produit 64 logits. Corrigé : le lecteur garde entier tout tableau de 4 096
+   entrées ou moins (`kArraySample`), et la référence refuse désormais un `items` incomplet.
 
 Le troisième point corrige ce que §2.3 disait du piège n°2 : le sens dépend du fichier lu. Un moteur qui lit le
-GGUF doit utiliser `g % head_k` ; c'est ce que les noyaux devront faire.
+GGUF doit utiliser `g % head_k` ; c'est ce que les noyaux devront faire. Le quatrième est une propriété du
+lecteur, pas du modèle, mais il produit exactement le même genre de faute : des nombres plausibles sur un
+sous-ensemble silencieusement tronqué.
 
 **Méthode.** `--trace` imprime la somme et la norme du hidden après les embeddings, après chaque bloc et après la
 norme finale ; comparé aux hooks du paquet de référence (mêmes chiffres, bloc par bloc), il localise la divergence
