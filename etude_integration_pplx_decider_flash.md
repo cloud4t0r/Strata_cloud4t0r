@@ -765,10 +765,16 @@ OpenMP (le résultat ne dépend pas du nombre de threads). Aucun GPU.
 
 | | |
 |---|---|
-| Choix le plus probable | **13 / 13 identiques** à la référence |
+| Choix le plus probable | **12 / 13 identiques** ; le 13e (255 options) est un **ex-aequo à 3 × 10⁻⁶** |
 | Pire écart de logit | **0,176** (cas hostile-marker), typiquement 0,02–0,08 |
-| Pire écart de probabilité | **0,026** (le vendeur annonce 0,016 pour son propre Q8_0 sur ses 13 questions) |
-| Coût | ~70 s par cas court sur ce CPU ; 11 min pour 9 cas |
+| Pire écart de probabilité | **0,026** (le vendeur annonce 0,016 pour son propre Q8_0 sur ses 13 questions) ; **0,0003** sur le cas 255 options |
+| Coût | ~70 s par cas court sur ce CPU ; 32 min pour le cas de 3 426 tokens |
+
+Sur le cas `max-options` (255 options, un état qui ne veut rien dire), la référence sépare elle-même les deux
+meilleures options de **3 × 10⁻⁶** — le modèle est indécis, et n'importe quel arrondi change le gagnant. L'outil ne
+traite donc le choix le plus probable comme un critère que si la référence sépare son gagnant du second par plus
+que la tolérance ; en deçà, il affiche « ex-aequo » et ne compte pas d'échec. L'écart de probabilité, lui, reste
+excellent (0,0003), donc la tête de lecture sur 255 lignes est bien câblée.
 
 L'écart restant est celui de la quantification Q8_0 contre le checkpoint BF16, pas une erreur de structure.
 

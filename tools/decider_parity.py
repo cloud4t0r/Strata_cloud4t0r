@@ -105,12 +105,19 @@ def main(argv=None) -> int:
             worst_probability = max(worst_probability, probability_difference)
             best_want = max(range(count), key=want_probabilities.__getitem__)
             best_got = max(range(count), key=got_probabilities.__getitem__)
+            # The winning option is only a criterion when the reference itself separates it from the runner-up by
+            # more than the tolerance: with 255 near-uniform options the top two sit 3e-6 apart, and any rounding
+            # flips the argmax without anything being wrong (the max-options case does exactly that).
+            runner_up = sorted(want_probabilities, reverse=True)[1] if count > 1 else 0.0
+            margin = want_probabilities[best_want] - runner_up
+            tie = margin <= args.tolerance
             line = (f"  {case['name']:20s} {key:10s} logits {logit_difference:7.4f}  "
-                    f"p {probability_difference:7.4f}  choice {best_got} vs {best_want}")
+                    f"p {probability_difference:7.4f}  choice {best_got} vs {best_want}"
+                    + (f"  (tie, margin {margin:.2g})" if tie and best_got != best_want else ""))
             print(line, flush=True)
             if logit_difference > args.logit_report:
                 print(f"      worst logit: got {max(got):.4f} / want {max(want):.4f}", flush=True)
-            if probability_difference > args.tolerance or best_got != best_want:
+            if probability_difference > args.tolerance or (best_got != best_want and not tie):
                 case_failures.append(key)
         if case_failures:
             failures += 1
