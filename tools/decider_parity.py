@@ -14,6 +14,7 @@ which option wins.
 
     python tools/decider_parity.py --gguf <decider-flash-v1.2-q8_0.gguf> --binary build/strata-decider
     python tools/decider_parity.py --gguf ... --cases noul,choice     # a subset
+    python tools/decider_parity.py --gguf ... --gpu build/strata-decider-gpu   # the GPU, not a server
 """
 from __future__ import annotations
 
@@ -32,6 +33,11 @@ DEFAULT_BINARY = ROOT / "build-tests" / "strata-decider"
 #: normally changes which option wins, so 0.03 separates the two without hiding a real one.
 DEFAULT_TOLERANCE = 0.03
 
+#: The GPU runs the engine's arithmetic: every projection quantizes its activations to q8_1, 32 blocks deep.  The
+#: measured drift against the checkpoint's own logits is 0.042 worst over the 13 golden questions, about twice the
+#: CPU reference's 0.026 - the reference dequantizes the weights and computes in float32, the engine does not.
+GPU_TOLERANCE = 0.05
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -39,10 +45,13 @@ def parse_args(argv=None):
     parser.add_argument("--binary", default=str(DEFAULT_BINARY), help=f"strata-decider (default: {DEFAULT_BINARY})")
     parser.add_argument("--goldens", default=str(DEFAULT_GOLDENS), help=f"default: {DEFAULT_GOLDENS}")
     parser.add_argument("--cases", default=None, help="comma separated case names (default: all)")
-    parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE,
-                        help=f"maximum probability difference (default: {DEFAULT_TOLERANCE})")
+    parser.add_argument("--tolerance", type=float, default=None,
+                        help=f"maximum probability difference (default: {DEFAULT_TOLERANCE} against the CPU "
+                             f"reference, {GPU_TOLERANCE} with --gpu)")
     parser.add_argument("--logit-report", type=float, default=0.25,
                         help="print the worst logit difference above this (default: 0.25)")
+    parser.add_argument("--gpu", default=None, metavar="BINARY",
+                        help="run strata-decider-gpu --stage full on the GGUF instead of the CPU reference")
     return parser.parse_args(argv)
 
 
@@ -52,6 +61,15 @@ def softmax(values, temperature: float) -> list[float]:
     exps = [math.exp(value - top) for value in scaled]
     total = sum(exps)
     return [value / total for value in exps]
+
+
+def run_gpu(binary: str, gguf: str, ids: list[int], markers: list[int]) -> list[list[float]]:
+    command = [binary, "--gguf", gguf, "--stage", "full", "--tokens", ",".join(map(str, ids)),
+               "--markers", ",".join(map(str, markers))]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"strata-decider-gpu --stage full failed ({result.returncode}):\n{result.stderr[-2000:]}")
+    return json.loads(result.stdout)["logits"]
 
 
 def run_reference(binary: str, gguf: str, ids: list[int], markers: list[int]) -> list[list[float]]:
@@ -64,6 +82,8 @@ def run_reference(binary: str, gguf: str, ids: list[int], markers: list[int]) ->
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.tolerance is None:
+        args.tolerance = GPU_TOLERANCE if args.gpu else DEFAULT_TOLERANCE
     goldens = json.loads(Path(args.goldens).read_text(encoding="utf-8"))
     temperature = goldens["temperature"]
     wanted = set(args.cases.split(",")) if args.cases else None
@@ -88,7 +108,10 @@ def main(argv=None) -> int:
 
         logits_by_key: dict[str, list[float]] = {}
         for key, one, prompt in runs:
-            logits = run_reference(args.binary, args.gguf, prompt["input_ids"], prompt["markers"])
+            if args.gpu:
+                logits = run_gpu(args.gpu, args.gguf, prompt["input_ids"], prompt["markers"])
+            else:
+                logits = run_reference(args.binary, args.gguf, prompt["input_ids"], prompt["markers"])
             for index, question_key in enumerate(one["questions"]):
                 logits_by_key[question_key] = logits[index]
 

@@ -12,19 +12,17 @@
 // reductions go through shared memory, the rest stays in registers.  It is one block per head because the state
 // is per head and the sequence is sequential - 32 heads run in parallel, the tokens inside a head do not.
 #include "gpu_common.cuh"
+#include "gpu_kernels.cuh"
 
 #include "strata/decider/gpu.hpp"
 
 namespace strata::decider::gpu {
-namespace {
+namespace kernels {
 
 using namespace detail;
 
-constexpr int kTile = 8;      // the state tile a thread holds, per side
-constexpr int kHeads = 16;    // threads per side of the block: 16 x 8 = 128 = the head width
-
 /// y[t][c] = silu(sum_j w[c][j] * x[t-(K-1)+j][c]): the causal depthwise convolution, tap j = 0 oldest.
-__global__ void conv1d_silu_kernel(const float* x, const float* w, float* y, int T, int C, int K) {
+__global__ void conv1d_silu(const float* x, const float* w, float* y, int T, int C, int K) {
     const long long index = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= (long long) T * C) return;
     const int t = (int) (index / C), c = (int) (index % C);
@@ -36,11 +34,8 @@ __global__ void conv1d_silu_kernel(const float* x, const float* w, float* y, int
     y[index] = acc / (1.0f + expf(-acc));
 }
 
-/// softplus with the reference's threshold, so a large a + dt_bias does not overflow to infinity.
-__device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
-
 /// The delta rule for one value head over the whole sequence: S is [KD][VD], kept in registers.
-__global__ void gdn_scan_kernel(const float* conv, const float* a, const float* b, const float* ssm_a,
+__global__ void gdn_scan(const float* conv, const float* a, const float* b, const float* ssm_a,
                                 const float* dt, float* core, int T, int VH, int KH, int KD, int VD, int key_dim,
                                 int conv_dim, float scale, float eps) {
     const int h = blockIdx.x;
@@ -139,7 +134,7 @@ __global__ void gdn_scan_kernel(const float* conv, const float* a, const float* 
 }
 
 /// The gated norm: out = rms(x) * w * silu(z), one block per (token, value head) row of VD.
-__global__ void gated_norm_kernel(const float* x, const float* z, const float* w, float* out, int n, float eps) {
+__global__ void gated_norm(const float* x, const float* z, const float* w, float* out, int n, float eps) {
     const int row = blockIdx.x;
     const float* xr = x + (size_t) row * n;
     float ss = 0.0f;
@@ -160,6 +155,14 @@ __global__ void gated_norm_kernel(const float* x, const float* z, const float* w
     }
 }
 
+}  // namespace kernels
+
+namespace {
+using namespace detail;
+using kernels::conv1d_silu;
+using kernels::gdn_scan;
+using kernels::gated_norm;
+using kernels::kHeads;
 }  // namespace
 
 bool gdn(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
@@ -228,17 +231,17 @@ bool gdn(const std::string& gguf, int64_t block, const std::string& in_path, con
         gemm_q8(d_beta.data, d_x.data, d_bv.data, (int) E, (int) VH, (int) T, d_q8.data, nullptr);
 
         const long long cells = (long long) T * conv_dim;
-        conv1d_silu_kernel<<<(unsigned) ((cells + 255) / 256), 256>>>(d_mixed.data, d_convw.data, d_conv.data,
+        conv1d_silu<<<(unsigned) ((cells + 255) / 256), 256>>>(d_mixed.data, d_convw.data, d_conv.data,
                                                                      (int) T, (int) conv_dim, (int) K);
-        check(cudaGetLastError(), "conv1d_silu_kernel");
-        gdn_scan_kernel<<<(unsigned) VH, dim3(kHeads, kHeads)>>>(d_conv.data, d_av.data, d_bv.data, d_a.data,
+        check(cudaGetLastError(), "conv1d_silu");
+        gdn_scan<<<(unsigned) VH, dim3(kHeads, kHeads)>>>(d_conv.data, d_av.data, d_bv.data, d_a.data,
                                                                  d_dt.data, d_core.data, (int) T, (int) VH, (int) KH,
                                                                  (int) KD, (int) VD, (int) key_dim, (int) conv_dim,
                                                                  scale, (float) eps);
-        check(cudaGetLastError(), "gdn_scan_kernel");
-        gated_norm_kernel<<<(unsigned) (T * VH), 128>>>(d_core.data, d_zv.data, d_norm.data, d_normed.data, (int) VD,
+        check(cudaGetLastError(), "gdn_scan");
+        gated_norm<<<(unsigned) (T * VH), 128>>>(d_core.data, d_zv.data, d_norm.data, d_normed.data, (int) VD,
                                                         (float) eps);
-        check(cudaGetLastError(), "gated_norm_kernel");
+        check(cudaGetLastError(), "gated_norm");
         gemm_q8(d_outw.data, d_normed.data, d_out.data, (int) value_dim, (int) E, (int) T, d_q8.data, nullptr);
         check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 

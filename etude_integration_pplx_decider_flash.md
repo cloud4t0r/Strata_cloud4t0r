@@ -886,8 +886,40 @@ Le même ordre d'écart que les autres projections (quantification d'activation)
 plausibles mais faux, et c'est le genre de faute que ce test attrape.
 
 **M2 est terminé** : les quatre familles de noyaux (normes et projections denses, GDN, attention non-causale) sont
-portées et comparées à la référence, bloc par bloc. Reste M3 (assemblage des 32 blocs, embeddings et norme finale)
-et M4 (tête de lecture, `DEC`, serveur).
+portées et comparées à la référence, bloc par bloc.
+
+### 10.12 M3 — le modèle entier sur GPU (5 novembre 2026)
+
+`strata-decider-gpu --stage full --tokens … --markers …` exécute **les 32 blocs** : embeddings par ligne (Q8_0
+déquantifié sur GPU), puis par bloc la norme d'entrée, le mixeur (GDN ou attention), le résiduel, la norme
+post-attention, le SwiGLU dense et le résiduel ; enfin la norme finale et la tête de lecture.
+
+**Vérification bloc par bloc** (`--trace` des deux côtés, somme et norme du hidden après chaque bloc) :
+
+| Bloc | Norme GPU | Norme CPU | Écart |
+|---:|---:|---:|---:|
+| 0 | 23,3870 | 23,3962 | 0,039 % |
+| 3 | 44,4541 | 44,4448 | 0,021 % |
+| 15 | 100,2967 | 100,2890 | 0,008 % |
+| 31 | 778,7454 | 780,4890 | 0,223 % |
+
+Pire écart sur les 32 blocs : **0,223 %**. La dérive est donc bien l'accumulation de la quantification des
+activations en q8_1, bloc après bloc — pas une erreur de structure.
+
+**Contre l'oracle** (`tools/decider_parity.py --gpu`, 10 cas, 13 questions) : **12 options identiques sur 13**,
+le 13e étant l'ex-aequo à 255 options. Pire écart de probabilité **0,0417** (cas `noul`), contre 0,026 pour la
+référence CPU : le moteur paie la quantification d'activation à chaque projection, sur 32 blocs. C'est le prix
+assumé du chemin `iq_mmvq`, et c'est la première mesure de bout en bout du modèle sur GPU.
+
+Coût observé : **1 min 34 pour les 10 cas** (dont le chargement des 5,16 Go de poids à chaque exécution) ; ce n'est
+pas une mesure de performance (pas de warm-up, pas de batch), juste de quoi savoir que la chaîne tourne.
+
+Un défaut trouvé en route, qui ne plantait qu'au deuxième cas : le scratch q8_1 était dimensionné sur `E` et la
+largeur du GDN (8 192), alors que la projection `ffn_down` prend `n_ff` = **9 216**. Débordement de 9 Ko, faute de
+mémoire GPU au cas suivant. Corrigé : le scratch prend la plus large des entrées de projection.
+
+Reste M4 : la tête de lecture sur GPU (aujourd'hui 255 lignes lues à l'hôte, 0,05 % du calcul), l'opération `DEC`
+du protocole serveur, et le branchement dans `strata`/`--serve`.
 
 ### 10.5 Ce que cette étude ne prétend pas
 

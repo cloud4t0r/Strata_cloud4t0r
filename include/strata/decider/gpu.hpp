@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::decider::gpu {
 
@@ -38,5 +39,10 @@ bool gdn(const std::string& gguf, int64_t block, const std::string& in_path, con
 /// "mixer_N.f32", and `attn_path` the attention output before the projection ("attn_N.f32").
 bool attention(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
                std::string& err, const std::string& attn_path = {});
+
+/// The whole model: embeddings, the 32 blocks, the final norm and the readout at the markers.  Returns the raw
+/// logits (255 per marker, before temperature), the same shape `strata-decider --ref` prints.
+bool logits(const std::string& gguf, const std::vector<int32_t>& tokens, const std::vector<int32_t>& markers,
+            std::vector<std::vector<float>>& out, std::string& err, bool trace = false);
 
 }  // namespace strata::decider::gpu

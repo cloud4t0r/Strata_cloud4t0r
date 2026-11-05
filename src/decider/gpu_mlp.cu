@@ -7,17 +7,18 @@
 // Everything the sequence needs goes through ONE matrix product per projection: `gemm_q8` hands iq_mmvq as many
 // columns as it takes, so a 98-token sequence is 13 calls of the same weights, not 98.
 #include "gpu_common.cuh"
+#include "gpu_kernels.cuh"
 
 #include "strata/decider/gpu.hpp"
 
 namespace strata::decider::gpu {
-namespace {
+namespace kernels {
 
 using namespace detail;
 
 /// out = x / rms(x) * w, one block per row.  `w` is the GGUF's own tensor: the +1 of the model's zero-centered
 /// norms is already folded into it (the CPU reference documents why).
-__global__ void rmsnorm_kernel(const float* x, const float* w, float* y, int n, float eps) {
+__global__ void rmsnorm(const float* x, const float* w, float* y, int n, float eps) {
     const int row = blockIdx.x;
     const float* xr = x + (size_t) row * n;
     float ss = 0.0f;
@@ -34,14 +35,27 @@ __global__ void rmsnorm_kernel(const float* x, const float* w, float* y, int n, 
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * scale * w[i];
 }
 
+/// x += y, the residual stream.
+__global__ void add_in_place(float* x, const float* y, size_t n) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
 /// h = silu(gate) * up, elementwise over the whole [tokens][n_ff] block.
-__global__ void swiglu_kernel(const float* gate, const float* up, float* out, size_t n) {
+__global__ void swiglu(const float* gate, const float* up, float* out, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
     out[i] = (g / (1.0f + expf(-g))) * up[i];
 }
 
+}  // namespace kernels
+
+namespace {
+using namespace detail;
+using kernels::rmsnorm;
+using kernels::swiglu;
+using kernels::add_in_place;
 }  // namespace
 
 bool mlp(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
@@ -83,13 +97,13 @@ bool mlp(const std::string& gguf, int64_t block, const std::string& in_path, con
         Device<uint8_t> d_q8(scratch);
 
         const int threads = 256;
-        rmsnorm_kernel<<<(unsigned) T, threads>>>(d_x.data, d_post.data, d_xn.data, (int) E, (float) eps);
-        check(cudaGetLastError(), "rmsnorm_kernel");
+        rmsnorm<<<(unsigned) T, threads>>>(d_x.data, d_post.data, d_xn.data, (int) E, (float) eps);
+        check(cudaGetLastError(), "rmsnorm");
         gemm_q8(d_gate.data, d_xn.data, d_g.data, (int) E, (int) FF, (int) T, d_q8.data, nullptr);
         gemm_q8(d_up.data, d_xn.data, d_u.data, (int) E, (int) FF, (int) T, d_q8.data, nullptr);
         const size_t cells = (size_t) T * FF;
-        swiglu_kernel<<<(unsigned) ((cells + threads - 1) / threads), threads>>>(d_g.data, d_u.data, d_h.data, cells);
-        check(cudaGetLastError(), "swiglu_kernel");
+        swiglu<<<(unsigned) ((cells + threads - 1) / threads), threads>>>(d_g.data, d_u.data, d_h.data, cells);
+        check(cudaGetLastError(), "swiglu");
         gemm_q8(d_down.data, d_h.data, d_out.data, (int) FF, (int) E, (int) T, d_q8.data, nullptr);
         check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 

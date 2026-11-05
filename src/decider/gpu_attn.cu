@@ -10,11 +10,12 @@
 // concatenated - and the GGUF's k/v are plain [kv_heads][head_dim].  RoPE is partial (the first 64 of 256 dims)
 // with the rotate-half pairing (i, i + 32), which is what the reference package's rotate_half does.
 #include "gpu_common.cuh"
+#include "gpu_kernels.cuh"
 
 #include "strata/decider/gpu.hpp"
 
 namespace strata::decider::gpu {
-namespace {
+namespace kernels {
 
 using namespace detail;
 
@@ -23,7 +24,7 @@ constexpr int kMaxTokens = 4096;
 
 /// RMSNorm over one head, then partial RoPE.  One block per (token, head); `row_stride` is the distance between
 /// two heads of the same token (2 * head_dim for q, whose head carries the gate too; head_dim for k).
-__global__ void norm_rope_kernel(float* buffer, const float* w, int per_t, int row_stride, int D, int n_rot,
+__global__ void norm_rope(float* buffer, const float* w, int per_t, int row_stride, int D, int n_rot,
                                  float theta, float eps) {
     const int row = blockIdx.x;
     const int t = row / per_t, sub = row % per_t;
@@ -55,7 +56,7 @@ __global__ void norm_rope_kernel(float* buffer, const float* w, int per_t, int r
 /// Non-causal GQA: one block per query head, the tokens walked in order.  Each key's score is one thread's dot
 /// product over the head width; the softmax is over ALL tokens (no mask: the batch is one unpadded sequence), and
 /// the output is multiplied by the head's gate before it leaves.
-__global__ void attention_kernel(const float* qg, const float* k, const float* v, float* attn, int T, int H, int KV,
+__global__ void attention(const float* qg, const float* k, const float* v, float* attn, int T, int H, int KV,
                                  int D, float scale) {
     const int h = blockIdx.x;
     const int kvh = h / (H / KV);
@@ -94,6 +95,13 @@ __global__ void attention_kernel(const float* qg, const float* k, const float* v
     }
 }
 
+}  // namespace kernels
+
+namespace {
+using namespace detail;
+using kernels::norm_rope;
+using kernels::attention;
+using kernels::kMaxTokens;
 }  // namespace
 
 bool attention(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
@@ -153,18 +161,18 @@ bool attention(const std::string& gguf, int64_t block, const std::string& in_pat
         gemm_q8(d_v.data, d_x.data, d_kv.data + (size_t) T * KV * D, (int) E, (int) (KV * D), (int) T, d_q8.data,
                 nullptr);
 
-        norm_rope_kernel<<<(unsigned) (T * H), (unsigned) D>>>(d_qg.data, d_qn.data, (int) H, (int) (2 * D), (int) D,
+        norm_rope<<<(unsigned) (T * H), (unsigned) D>>>(d_qg.data, d_qn.data, (int) H, (int) (2 * D), (int) D,
                                                                (int) n_rot, (float) theta, (float) eps);
-        check(cudaGetLastError(), "norm_rope_kernel q");
-        norm_rope_kernel<<<(unsigned) (T * KV), (unsigned) D>>>(d_kv.data, d_kn.data, (int) KV, (int) D, (int) D,
+        check(cudaGetLastError(), "norm_rope q");
+        norm_rope<<<(unsigned) (T * KV), (unsigned) D>>>(d_kv.data, d_kn.data, (int) KV, (int) D, (int) D,
                                                                 (int) n_rot, (float) theta, (float) eps);
-        check(cudaGetLastError(), "norm_rope_kernel k");
+        check(cudaGetLastError(), "norm_rope k");
 
         const size_t shared_bytes = (size_t) (2 * D + T) * sizeof(float);
-        attention_kernel<<<(unsigned) H, 256, shared_bytes>>>(d_qg.data, d_kv.data,
+        attention<<<(unsigned) H, 256, shared_bytes>>>(d_qg.data, d_kv.data,
                                                               d_kv.data + (size_t) T * KV * D, d_attn.data, (int) T,
                                                               (int) H, (int) KV, (int) D, scale);
-        check(cudaGetLastError(), "attention_kernel");
+        check(cudaGetLastError(), "attention");
         gemm_q8(d_o.data, d_attn.data, d_out.data, (int) (H * D), (int) E, (int) T, d_q8.data, nullptr);
         check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
