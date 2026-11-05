@@ -27,6 +27,8 @@ using strata::TensorInfo;
 /// The active trace (null unless --trace), so a block can report its own stages while it is being debugged.
 TraceFn g_trace;
 std::string g_prefix;
+StageFn g_stage;          ///< the active stage dump (null unless --dump-dir), for the block functions
+int64_t g_stage_block = 0;
 
 void trace_vec(const char* stage, const float* v, size_t n) {
     if (!g_trace) return;
@@ -278,6 +280,7 @@ void gated_delta_net(const Model& m, const Layer& l, const std::vector<float>& s
     }
     trace_vec(" mixed", mixed.data(), mixed.size());
     trace_vec(" conv", conv.data(), conv.size());
+    if (g_stage) g_stage(g_stage_block, "conv", conv);
 
     // The delta rule, one state per value head: S[h] is [KD][VD].
     //
@@ -330,6 +333,7 @@ void gated_delta_net(const Model& m, const Layer& l, const std::vector<float>& s
     }
 
     trace_vec(" core", core.data(), core.size());
+    if (g_stage) g_stage(g_stage_block, "core", core);
 
     trace_vec(" z", z.data(), z.size());
     // The gated norm, per value head, then o_proj.
@@ -404,6 +408,7 @@ bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vecto
             if (p < 0 || p >= T) fail("marker " + std::to_string(p) + " is outside the sequence");
 
         g_trace = trace;
+        g_stage = stage;
         auto report = [&](const char* stage, const std::vector<float>& v) {
             if (!trace) return;
             double sum = 0.0, ss = 0.0;
@@ -426,6 +431,7 @@ bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vecto
         for (int64_t l = 0; l < m.n_layers; ++l) {
             const std::string p = "blk." + std::to_string(l) + ".";
             g_prefix = "L" + std::to_string(l);
+            g_stage_block = l;
             Layer L;
             L.attn_norm = &tensor(g, p + "attn_norm.weight");
             L.post_norm = &tensor(g, p + "post_attention_norm.weight");

@@ -836,8 +836,38 @@ Un piège de harnais, à noter : la première version passait `xn_post` (déjà 
 seconde fois — facteur 3,16 exactement (`sqrt(2560/256)`), cosinus 0,976, et rien qui plante. Un test de noyau doit
 recevoir l'entrée **avant** la norme (`x_post`), sinon il ne teste pas la norme et mesure deux fois.
 
-Reste pour M2 : la convolution et la règle delta du GDN (le scan séquentiel), puis l'attention non-causale ; ensuite
-M3 (assemblage des 32 blocs) et M4 (tête de lecture et `DEC`).
+### 10.10 M2 — le Gated DeltaNet sur GPU (5 novembre 2026)
+
+Le bloc le plus délicat du modèle, porté et comparé :
+
+| Étape | Noyau | Ce qu'il fait |
+|---|---|---|
+| `conv` | `conv1d_silu_kernel` | convolution causale depthwise à 4 taps, tap 0 = le plus ancien, puis SiLU |
+| `core` | `gdn_scan_kernel` | la règle delta : `S ← S·exp(g)`, `kv = Sᵀk`, `δ = (v−kv)·β`, `S ← S + k⊗δ`, `o = Sᵀq` |
+| `mixer` | `gated_norm_kernel` + `iq_mmvq` | norme RMS par tête de valeur × SiLU(z), puis `ssm_out` |
+
+Le scan tient **un état 128 × 128 par tête de valeur** : un bloc CUDA par tête, 16 × 16 threads, chacun portant
+une tuile 8 × 8 en registres ; les deux réductions de colonnes (`Sᵀk`, `Sᵀq`) passent par la mémoire partagée
+(8 Ko), le reste ne quitte pas les registres. Les 32 têtes tournent en parallèle, les tokens d'une tête sont
+séquentiels — c'est la nature de la récurrence.
+
+Résultat sur le bloc 0 du cas `noul` (98 tokens), RX 6800 (gfx1030) :
+
+| Étape | Cosinus | Écart relatif | Écart max |
+|---|---:|---:|---:|
+| `conv` (convolution + SiLU) | **0,99999893** | 0,00135 | 2,8 × 10⁻² |
+| `core` (règle delta, 98 pas de récurrence) | **0,99999952** | 0,00105 | 9,2 × 10⁻⁴ |
+| `mixer` (norme + `ssm_out`) | **0,99991417** | 0,0130 | 2,5 × 10⁻² |
+
+Le scan est donc à **0,1 %** de la référence après 98 pas de récurrence — la partie qu'on pouvait le plus craindre.
+Le 1,3 % du `mixer` vient de la dernière projection (`iq_mmvq` quantifie les activations en q8_1, la référence
+calcule en float32) ; les normes tombent à 0,04 % l'une de l'autre (23,143 contre 23,133), ce qui écarte une erreur
+de direction. Le noyau applique
+l'appariement du GGUF (`kh = v % head_k`), celui que §10.8 a corrigé côté référence : l'inverser ici aurait donné
+un cosinus de 0,38 sans qu'aucune norme ne bouge.
+
+Reste pour M2 : l'attention non-causale (GQA 16/4, tête de 256, sans masque causal, RoPE partiel) ; ensuite M3
+(assemblage des 32 blocs) et M4 (tête de lecture et `DEC`).
 
 ### 10.5 Ce que cette étude ne prétend pas
 

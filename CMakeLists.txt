@@ -988,7 +988,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # PPLX Decider Flash's GPU kernels: one stage of one block at a time, compared against the CPU reference
   # (strata-decider --ref --dump-dir).  The dense MLP is here first; the Gated DeltaNet scan, the non-causal
   # attention and the readout follow, then the engine assembles them.
-  add_library(strata_decider_gpu STATIC src/decider/gpu_mlp.cu)
+  add_library(strata_decider_gpu STATIC src/decider/gpu_mlp.cu src/decider/gpu_gdn.cu)
   target_include_directories(strata_decider_gpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                             PRIVATE ${_strata_gpu_include_directories} "${STRATA_GGML_DIR}/ggml/include")
   target_link_libraries(strata_decider_gpu PRIVATE strata_decider_core strata_kernels strata_warnings

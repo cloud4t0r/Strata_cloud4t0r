@@ -18,11 +18,12 @@ namespace {
 
 int usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s --gguf <file.gguf> --block N --in <hidden.f32> --out <out.f32>\n"
+                 "usage: %s --gguf <file.gguf> --block N --stage mlp|gdn --in <hidden.f32> --out <out.f32>\n"
                  "\n"
-                 "  --in   the block's post-attention normalised hidden state, raw f32 [tokens][n_embd], as\n"
-                 "         `strata-decider --ref --dump-dir DIR --dump-block N` writes it (xn_post_N.f32)\n"
-                 "  --out  receives the block's MLP output, same layout (the reference's mlp_N.f32)\n",
+                 "  --in   the stage's input, raw f32 [tokens][n_embd], as `strata-decider --ref --dump-dir DIR\n"
+                 "         --dump-block N` writes it: x_post_N.f32 for the MLP, xn_attn_N.f32 for the GDN\n"
+                 "  --out  receives the stage's output, same layout (mlp_N.f32, mixer_N.f32)\n"
+                 "  --xn-out / --conv-out / --core-out  also write an intermediate stage, to localise a difference\n",
                  argv0);
     return 2;
 }
@@ -30,7 +31,7 @@ int usage(const char* argv0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string gguf, in_path, out_path, xn_path;
+    std::string gguf, in_path, out_path, xn_path, conv_path, core_path, stage = "mlp";
     long long block = -1;
     for (int i = 1; i + 1 < argc; ++i) {
         const std::string flag = argv[i];
@@ -39,11 +40,18 @@ int main(int argc, char** argv) {
         else if (flag == "--out") out_path = argv[++i];
         else if (flag == "--block") block = std::atoll(argv[++i]);
         else if (flag == "--xn-out") xn_path = argv[++i];
+        else if (flag == "--conv-out") conv_path = argv[++i];
+        else if (flag == "--core-out") core_path = argv[++i];
+        else if (flag == "--stage") stage = argv[++i];
     }
     if (gguf.empty() || in_path.empty() || out_path.empty() || block < 0) return usage(argv[0]);
     std::string err;
     try {
-        if (!strata::decider::gpu::mlp(gguf, (int64_t) block, in_path, out_path, err, xn_path)) {
+        const bool ok = stage == "gdn"
+                            ? strata::decider::gpu::gdn(gguf, (int64_t) block, in_path, out_path, err, conv_path,
+                                                        core_path)
+                            : strata::decider::gpu::mlp(gguf, (int64_t) block, in_path, out_path, err, xn_path);
+        if (!ok) {
             std::fprintf(stderr, "strata-decider-gpu: %s\n", err.c_str());
             return 1;
         }

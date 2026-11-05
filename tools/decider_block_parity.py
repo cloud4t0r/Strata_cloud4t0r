@@ -42,6 +42,8 @@ def parse_args(argv=None):
     parser.add_argument("--gguf", required=True, help="the Q8_0 GGUF both sides read")
     parser.add_argument("--case", default="noul", help="a golden case name (default: noul)")
     parser.add_argument("--block", type=int, default=0, help="the block to compare (default: 0)")
+    parser.add_argument("--stage", choices=("mlp", "gdn"), default="mlp",
+                        help="which kernel of the block (default: mlp; a GDN block is 0, 1, 2, ... not 3, 7, ...)")
     parser.add_argument("--dump-dir", default=None, help="where the stages are written; reused when they exist")
     parser.add_argument("--goldens", default=str(DEFAULT_GOLDENS))
     parser.add_argument("--binary", default=str(DEFAULT_BINARY), help=f"strata-decider (default: {DEFAULT_BINARY})")
@@ -63,7 +65,10 @@ def load_case(path: str, name: str) -> dict:
 def ensure_dump(args, prompt: dict) -> Path:
     directory = Path(args.dump_dir or f"/tmp/decider-block-{args.case}-{args.block}")
     directory.mkdir(parents=True, exist_ok=True)
-    needed = [directory / f"x_post_{args.block}.f32", directory / f"mlp_{args.block}.f32"]
+    if args.stage == "gdn":
+        needed = [directory / f"xn_attn_{args.block}.f32", directory / f"mixer_{args.block}.f32"]
+    else:
+        needed = [directory / f"x_post_{args.block}.f32", directory / f"mlp_{args.block}.f32"]
     if all(path.exists() for path in needed):
         print(f"reusing {directory}", flush=True)
         return directory
@@ -95,20 +100,39 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     prompt = load_case(args.goldens, args.case)
     directory = ensure_dump(args, prompt)
-    out = directory / f"mlp_gpu_{args.block}.f32"
-    xn_out = directory / f"xn_gpu_{args.block}.f32"
-    command = [args.gpu_binary, "--gguf", args.gguf, "--block", str(args.block),
-               "--in", str(directory / f"x_post_{args.block}.f32"), "--out", str(out), "--xn-out", str(xn_out)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise SystemExit(f"strata-decider-gpu failed:\n{result.stderr[-2000:]}")
 
     def load(path: Path) -> np.ndarray:
         return np.fromfile(path, dtype=np.float32)
 
-    ok = compare("xn_post", load(xn_out), load(directory / f"xn_post_{args.block}.f32"), NORM_TOLERANCE)
-    ok = compare("mlp", load(out), load(directory / f"mlp_{args.block}.f32"), PROJECTION_TOLERANCE) and ok
-    print(f"\ndecider_block_parity: block {args.block} of {args.case}: {'ok' if ok else 'FAILED'}")
+    def gpu(stage: str, name: str, source: str, extra: list[str]) -> np.ndarray:
+        out = directory / f"{name}_gpu_{args.block}.f32"
+        command = [args.gpu_binary, "--gguf", args.gguf, "--block", str(args.block), "--stage", stage,
+                   "--in", str(directory / source), "--out", str(out)] + extra
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(f"strata-decider-gpu failed:\n{result.stderr[-2000:]}")
+        return load(out)
+
+    ok = True
+    if args.stage == "mlp":
+        xn_out = directory / f"xn_gpu_{args.block}.f32"
+        gpu("mlp", "mlp", f"x_post_{args.block}.f32", ["--xn-out", str(xn_out)])
+        ok = compare("xn_post", load(xn_out), load(directory / f"xn_post_{args.block}.f32"), NORM_TOLERANCE)
+        ok = compare("mlp", load(directory / f"mlp_gpu_{args.block}.f32"),
+                     load(directory / f"mlp_{args.block}.f32"), PROJECTION_TOLERANCE) and ok
+    else:
+        conv_out = directory / f"conv_gpu_{args.block}.f32"
+        core_out = directory / f"core_gpu_{args.block}.f32"
+        gpu("gdn", "mixer", f"xn_attn_{args.block}.f32",
+            ["--conv-out", str(conv_out), "--core-out", str(core_out)])
+        for name, tolerance in (("conv", PROJECTION_TOLERANCE), ("core", PROJECTION_TOLERANCE),
+                                ("mixer", PROJECTION_TOLERANCE)):
+            reference = directory / f"{name}_{args.block}.f32"
+            if reference.exists():
+                ok = compare(name, load(directory / f"{name}_gpu_{args.block}.f32"), load(reference), tolerance) and ok
+            else:
+                print(f"  --   {name:10s} the reference wrote no dump for it", flush=True)
+    print(f"\ndecider_block_parity: block {args.block} {args.stage} of {args.case}: {'ok' if ok else 'FAILED'}")
     return 0 if ok else 1
 
 

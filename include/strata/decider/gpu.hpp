@@ -26,4 +26,11 @@ namespace strata::decider::gpu {
 bool mlp(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
          std::string& err, const std::string& xn_path = {});
 
+/// Runs block `block`'s Gated DeltaNet mixer: the causal convolution, the delta-rule scan, the gated norm and the
+/// output projection.  `in_path` is the mixer's input ("xn_attn_N.f32" from the reference), `out_path` receives
+/// what the reference calls "mixer_N.f32"; `conv_path` and `core_path`, when given, receive the convolution's
+/// output and the scan's output before the gated norm - the two stages a difference is localised to.
+bool gdn(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,
+         std::string& err, const std::string& conv_path = {}, const std::string& core_path = {});
+
 }  // namespace strata::decider::gpu
