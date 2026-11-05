@@ -136,6 +136,9 @@
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_HAVE_DECIDER)
+#include "strata/decider/engine.hpp"
+#endif
 #if defined(STRATA_HAVE_MINIMAXM2)
 #include "strata/minimaxm2/engine.hpp"
 #endif
@@ -3306,6 +3309,9 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_STEP35)
             std::printf(" step35");
 #endif
+#if defined(STRATA_HAVE_DECIDER)
+            std::printf(" qwen35");      // the decision model's architecture: it is not a chat model
+#endif
             std::printf("\n");
             return 0;
         }
@@ -3356,7 +3362,8 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HAVE_QWEN35) || defined(STRATA_HAVE_MINIMAXM2) || defined(STRATA_HAVE_STEP35)
+#if defined(STRATA_HAVE_QWEN35) || defined(STRATA_HAVE_MINIMAXM2) || defined(STRATA_HAVE_STEP35) || \
+    defined(STRATA_HAVE_DECIDER)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) and a MiniMax-M2 file (GGUF
     // architecture minimax-m2) run on their own engine paths (src/qwen35, src/minimaxm2), decided here from the
     // file's header before any of this engine's state exists; every other file goes on below exactly as before.
@@ -3378,6 +3385,9 @@ int main(int argc, char** argv) {
 #endif
 #if defined(STRATA_HAVE_STEP35)
         if (family == strata::ModelFamily::Step35) return strata::step35::run(argc, argv);
+#endif
+#if defined(STRATA_HAVE_DECIDER)
+        if (family == strata::ModelFamily::Decider) return strata::decider::run(argc, argv);
 #endif
         break;
     }

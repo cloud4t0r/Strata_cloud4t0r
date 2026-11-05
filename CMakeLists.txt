@@ -993,13 +993,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # PPLX Decider Flash's GPU kernels: one stage of one block at a time, compared against the CPU reference
   # (strata-decider --ref --dump-dir).  The dense MLP is here first; the Gated DeltaNet scan, the non-causal
   # attention and the readout follow, then the engine assembles them.
-  add_library(strata_decider_gpu STATIC src/decider/gpu_mlp.cu src/decider/gpu_gdn.cu src/decider/gpu_attn.cu src/decider/gpu_model.cu)
+  add_library(strata_decider_gpu STATIC src/decider/gpu_mlp.cu src/decider/gpu_gdn.cu src/decider/gpu_attn.cu src/decider/gpu_model.cu
+                             src/decider/decider_engine.cpp)
   target_include_directories(strata_decider_gpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                             PRIVATE ${_strata_gpu_include_directories} "${STRATA_GGML_DIR}/ggml/include")
   target_link_libraries(strata_decider_gpu PRIVATE strata_decider_core strata_kernels strata_warnings
                         ${_strata_gpu_runtime_target})
   add_executable(strata-decider-gpu src/decider/gpu_main.cpp)
   target_link_libraries(strata-decider-gpu PRIVATE strata_decider_gpu ${_strata_gpu_runtime_target})
+  # the family switch hands a qwen35 file to this path (`strata --serve --native <gguf>`), the way step35 is handed
+  # over: STRATA_HAVE_DECIDER is what `strata --families` and setup.py's check read
+  target_link_libraries(strata PRIVATE strata_decider_gpu)
+  target_compile_definitions(strata PRIVATE STRATA_HAVE_DECIDER=1)
   # the two block pieces strata_kernels does not carry: per-head RMSNorm and the NEOX partial RoPE with
   # llama3's frequency factors.  The positions are far on purpose - a pairing mistake is invisible near 0
   add_executable(step35_rope_parity src/step35/step35_rope_parity.cpp)

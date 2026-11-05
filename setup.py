@@ -1042,7 +1042,13 @@ OWN_PATH_FAMILIES = {
                 # a token: q/k/v, the GDN's convolution and delta-rule buffers, the SwiGLU's three n_ff rows), and
                 # that is what the offered context is chosen against.
                 "kv_bytes_per_token": 0,
-                "vram_budget": {"dense_gib": 4.9, "fixed_gib": 1.0, "extra_bytes_per_token": 320000},
+                # the context costs the activation buffers (~0.3 MiB a token: q/k/v, the GDN's convolution and
+                # delta-rule buffers, the SwiGLU's three n_ff rows) and no cache; experts_gib is 0 because there is
+                # no expert tier.  Measured on the RX 6800: 8K and 16K fit a 16 GiB card, 32K needs ~15.8 GiB of
+                # buffers and weights together and does not.
+                "vram_budget": {"dense_gib": 4.9, "fixed_gib": 1.5, "experts_gib": 0.0,
+                                "extra_bytes_per_token": 320000},
+                "extra_contexts": [16384],
                 # the checkpoint's training length; past it the vendor ran a few spot checks, not a validation
                 "context_cap": 32768,
                 "mtp": 0,
