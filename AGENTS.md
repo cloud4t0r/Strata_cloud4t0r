@@ -1,8 +1,9 @@
 # AGENTS.md
 
-Version 0.2.10, engine 0.1.56. The public model families are DeepSeekV4.1-Flash-1017,
-Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. This fork also carries MiniMax-M2 and Step-3.7-Flash (Linux, compiled from
-source; see docs/MINIMAX_M2.md and docs/STEP37.md). DeepSeek V4.1-Flash runs in the app and in the Terminal
+Version 0.2.11, engine 0.1.57. The public model families are DeepSeekV4.1-Flash-1017,
+Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. This fork also carries MiniMax-M2, Step-3.7-Flash and PPLX Decider Flash
+(Linux, compiled from source; see docs/MINIMAX_M2.md, docs/STEP37.md and the decider's integration study,
+etude_integration_pplx_decider_flash.md). DeepSeek V4.1-Flash runs in the app and in the Terminal
 (`strata launch --family deepseek41 --model ist-das-2.00bpw`; sets in
 [docs/MODELS.md](docs/MODELS.md#deepseek-v41-flash)). Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
 source-backed claims. Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.

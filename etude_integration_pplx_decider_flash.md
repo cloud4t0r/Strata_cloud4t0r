@@ -1,6 +1,6 @@
 # Étude d'intégration — `pplx-decider-flash-v1.2` dans Strata
 
-Branche : `cloud4t0r_new_models` (Strata 0.2.10, moteur 0.1.56)
+Branche : `cloud4t0r_new_models` (Strata 0.2.11, moteur 0.1.57 après la fusion d'amont du 5 novembre 2026)
 Date : 4 novembre 2026
 Objet : porter le modèle de décision **PPLX Decider Flash v1.2** (Perplexity, 4,8 B) dans le fork
 `Strata_cloud4t0r`, avec un chemin moteur dédié, un endpoint `/v1/systemone` et l'installation par `setup.py`.
