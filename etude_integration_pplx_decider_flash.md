@@ -225,7 +225,7 @@ silencieusement les probabilités.
 | # | Piège | Ce que fait la référence | Ce que fait le code Strata existant | Test qui l'attrape |
 |---|---|---|---|---|
 | 1 | **Ordre q/porte dans `attn_q`** | `chunk(q_proj(...).view(…, 2·head_dim), 2, -1)` → **entrelacé par tête** | aucun équivalent dense | comparaison des logits du bloc 3 |
-| 2 | **Appariement des têtes GDN** | `repeat_interleave(h_v/h_k)` → `k = v // 2` (**INTERLEAVE**) | `gdn.hpp` documente `h % h_k` (**MODULO**) pour Flash-Next | parité du bloc 0 avec l'oracle |
+| 2 | **Appariement des têtes GDN** | `repeat_interleave(h_v/h_k)` → `k = v // 2` (**INTERLEAVE**) | le GGUF est **réordonné** par le convertisseur : `k = v % h_k` (**MODULO**), cf. §10.8 | parité du bloc 0 avec l'oracle |
 | 3 | **Porte de sortie GDN** | `Qwen3_5RMSNormGated` → **SiLU(z)** | `layer.hpp` : sigmoïde pour `qwen4exp`, **SiLU pour qwen3.5** | parité du bloc 0 |
 | 4 | **Normes « zero-centered »** | `x · (1 + weight)` | GGUF stocke déjà `1 + weight` (vérifié : `attn_norm` moyenne 1,14, min 0,98 ; `output_norm` moyenne 3,20) | `--inspect` : refuser une norme dont la moyenne est ~0 |
 | 5 | **Suffixe assistant** | `add_generation_prompt=True` + `enable_thinking=False` | aucun | égalité **token par token** du prompt |
@@ -238,6 +238,9 @@ Deux pièges supplémentaires, moins visibles :
   la récurrence diverge ou s'éteint.
 - **`output.weight` est indexé par le vocabulaire**, pas par le rang du code. Il faut lire les lignes
   `token_ids`, pas les lignes 0…254 (la ligne 0 est nulle).
+- **`ssm_conv1d.weight` est `[K, conv_dim]` avec le tap contigu** (dim 0 = les 4 taps). Le lire comme une matrice
+  ligne-major `[K][C]`, à la manière d'une projection, prend les mauvais flottants et rend une convolution 2,5×
+  trop petite — sans erreur. Vérifié en §10.8.
 
 ---
 
@@ -750,6 +753,48 @@ décider ne doit pas le prétendre.
 
 Reste pour finir M2 : les noyaux denses (RMSNorm, GDN, SwiGLU), `--ref` CPU float64 et la parité par bloc contre
 les goldens — puis M3 (attention non-causale) et M4 (tête de lecture et `DEC`).
+
+### 10.8 M2 — la référence CPU, et la parité contre l'oracle (5 novembre 2026)
+
+`strata-decider --ref <gguf> --tokens <ids> --markers <pos>` exécute **tout le forward sur CPU** : embeddings,
+32 blocs (24 GDN causaux + 8 attentions pleines non-causales), norme finale, tête de lecture aux marqueurs. Les
+poids sont déquantifiés ligne par ligne via les type traits de ggml, et les projections sont parallélisées par
+OpenMP (le résultat ne dépend pas du nombre de threads). Aucun GPU.
+
+**Résultat contre l'oracle** (`tools/decider_parity.py`, 10 cas, 13 questions) :
+
+| | |
+|---|---|
+| Choix le plus probable | **13 / 13 identiques** à la référence |
+| Pire écart de logit | **0,176** (cas hostile-marker), typiquement 0,02–0,08 |
+| Pire écart de probabilité | **0,026** (le vendeur annonce 0,016 pour son propre Q8_0 sur ses 13 questions) |
+| Coût | ~70 s par cas court sur ce CPU ; 11 min pour 9 cas |
+
+L'écart restant est celui de la quantification Q8_0 contre le checkpoint BF16, pas une erreur de structure.
+
+**Trois pièges silencieux trouvés en chemin** — tous les trois donnaient des nombres plausibles :
+
+1. **Le `+1` des normes est déjà replié dans le GGUF.** `Qwen3_5RMSNorm` applique `x · (1 + w)` et le convertisseur
+   écrit `1 + w` (moyenne d'`attn_norm` : 1,14). Appliquer encore `1 + w` double chaque vecteur normé : le bloc 0
+   sortait à la norme 521 au lieu de 23, et le modèle restait « cohérent ».
+2. **`ssm_conv1d.weight` est `[K, conv_dim]` avec le tap contigu.** La lire comme une matrice ligne-major `[K][C]`
+   (comme une projection) prend les mauvais flottants : la convolution sortait 2,5× trop petite, sans erreur.
+3. **Le GGUF réordonne les têtes de valeur du GDN.** Le convertisseur llama.cpp (`_reorder_v_heads`) passe les
+   lignes de `in_proj_qkv`/`in_proj_z`/`in_proj_a`/`in_proj_b`/`out_proj`/`conv1d` de `[head_v][dim]` à
+   `[v_per_k][head_k][dim]`. La référence PyTorch fait `repeat_interleave(2)` (tête v `h` ↔ tête k `h/2`) ; dans
+   le GGUF, la tête v `g` appartient à la tête k **`g % head_k`**. Avec l'appariement de la référence, la sortie
+   garde la bonne norme et perd la bonne direction (cosinus 0,38 contre l'oracle) — et rien ne le signale.
+
+Le troisième point corrige ce que §2.3 disait du piège n°2 : le sens dépend du fichier lu. Un moteur qui lit le
+GGUF doit utiliser `g % head_k` ; c'est ce que les noyaux devront faire.
+
+**Méthode.** `--trace` imprime la somme et la norme du hidden après les embeddings, après chaque bloc et après la
+norme finale ; comparé aux hooks du paquet de référence (mêmes chiffres, bloc par bloc), il localise la divergence
+au bloc près. C'est ce qui a permis de trouver les trois pièges sans dump de tenseurs.
+
+**Ce que cette étape ne fait pas.** Aucun noyau GPU, aucune mesure de vitesse (les 70 s sont du CPU mono-machine),
+et la vision n'est pas touchée. Les noyaux de M2 seront comparés à cette référence, bloc par bloc, avant d'être
+comparés à l'oracle.
 
 ### 10.5 Ce que cette étude ne prétend pas
 

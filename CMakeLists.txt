@@ -339,10 +339,16 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # PPLX Decider Flash (GGUF architecture qwen35): the decision model's own entry point.  It carries the tensor audit
 # today (--inspect, no GPU); the engine - the 32 blocks on CUDA/HIP, the readout at the markers and the server's DEC
 # operation - is M2-M4 of the integration study and lands in this target.
-# the host-side part of the decider (the tensor audit), which the engine and the tests share
-add_library(strata_decider_core STATIC src/decider/inspect.cpp)
-target_include_directories(strata_decider_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(strata_decider_core PUBLIC strata_artifact)
+# the host-side part of the decider (the tensor audit and the CPU reference), which the engine and the tests share
+add_library(strata_decider_core STATIC src/decider/inspect.cpp src/decider/ref.cpp)
+target_include_directories(strata_decider_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                            PRIVATE "${STRATA_GGML_DIR}/ggml/include")
+target_link_libraries(strata_decider_core PUBLIC strata_artifact ggml-base)
+# the reference's projections are row-parallel; without OpenMP it still runs, one row at a time
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(strata_decider_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
 add_executable(strata-decider src/decider/decider_main.cpp)
 target_link_libraries(strata-decider PRIVATE strata_decider_core)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
