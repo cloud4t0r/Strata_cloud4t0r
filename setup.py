@@ -96,6 +96,7 @@ WIN = os.name == "nt"
 # day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops the
 # download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
+    "perplexity-ai/pplx-decider-flash-gguf-v1.2": "2514d5f0b7fbbe1ee1bfec9ffb5801a60289b4cc",   # 2026-11-04
     "stepfun-ai/Step-3.7-Flash-GGUF": "0b69336d2fd2adfdef9c66e425f7778196c31482",                      # 2026-06-03
     "bartowski/Step-3.7-Flash-GGUF": "e4f2a9e7e65462dcea257e1450db8361f906fb31",                     # 2026-11-02
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
@@ -740,6 +741,11 @@ M2_KV_LABELS = {
 }
 # Step-3.7-Flash (GGUF architecture step35): stepfun-ai's release, IQ3_XXS.  Sizes and sha256 are the Hub's (the LFS
 # oids of the API's file list) and both match the copies on this machine.
+# PPLX Decider Flash v1.2 (GGUF architecture qwen35): the release's only size, and the one file it is.
+DECIDER_FILES = {
+    "decider-flash-v1.2-q8_0.gguf": (5157837472, "ffb27ade8976765b0e6943a0b7f5f3fd0f7042d45ad90256a76d608bcd3942c2"),
+}
+
 STEP35_FILES = {
     "Step-3.7-flash-IQ3_XXS-00001-of-00002.gguf": (46645813024, "ce04c744be266f05a23ff683ab0086e20b8de8aee816f17aa5dd5738f675cc5d"),
     "Step-3.7-flash-IQ3_XXS-00002-of-00002.gguf": (29112867936, "aeedcdaa32646f1bdf199309503a63bcd1f597940f5c73c9562923554a47e31d"),
@@ -914,6 +920,28 @@ OWN_PATH_FAMILIES = {
                # the NextN blocks exist but the serving path does not draft with them yet (docs/STEP37.md): no --mtp
                "mtp": 0,
                "state_gb": 0.0},
+    # PPLX Decider Flash v1.2: a decision model, not a chat model (GGUF architecture qwen35).  Its engine answers
+    # POST /v1/systemone; no text is generated, so there is no chat, no MTP, no drafter and no expert tier.
+    "decider": {"title": "PPLX Decider Flash v1.2", "by": "Perplexity", "arch": "qwen35",
+                "about": "a 4.8B decision model: it reads one state and a set of questions and answers with a "
+                         "probability per option (noul, choice, score), through POST /v1/systemone. It generates no "
+                         "text, so it is not a chat model",
+                "hf": hf("perplexity-ai/pplx-decider-flash-gguf-v1.2"),
+                "file": "decider-flash-v1.2-q8_0.gguf", "tag": "decider-",
+                "name": "pplx-decider-flash-v1.2",
+                "license": "Apache 2.0: https://huggingface.co/perplexity-ai/pplx-decider-flash-v1.2",
+                "models": {"Q8_0": {"about": "8-bit, the release's only size (5.2 GB)", "ram_gb": 8}},
+                "sha256": DECIDER_FILES,
+                # NO K/V CACHE.  Every request reads the whole sequence once and the attention keeps no history, so
+                # nothing per token is cached.  What grows with the context is the activation buffers (about 0.3 MiB
+                # a token: q/k/v, the GDN's convolution and delta-rule buffers, the SwiGLU's three n_ff rows), and
+                # that is what the offered context is chosen against.
+                "kv_bytes_per_token": 0,
+                "vram_budget": {"dense_gib": 4.9, "fixed_gib": 1.0, "extra_bytes_per_token": 320000},
+                # the checkpoint's training length; past it the vendor ran a few spot checks, not a validation
+                "context_cap": 32768,
+                "mtp": 0,
+                "vision": False, "state_gb": 0.0},
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
@@ -9206,10 +9234,21 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(pack)],
             env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))
+    if family == "decider":
+        # decider.json: the v3 protocol's codes, marker and temperature, read from the GGUF.  serve/systemone.py
+        # loads it from the tokenizer folder and turns /v1/systemone on; without it the route stays off.
+        run([sys.executable, str(ROOT / "tools" / "decider_config.py"), "--gguf", str(gguf),
+             "--out", str(pack / "tokenizer")])
+        ok(f"decision protocol: {pack / 'tokenizer' / 'decider.json'}")
     ok(f"tokenizer: {pack / 'tokenizer'}")
 
     step(7, "writing the start script")
-    args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if family == "decider":
+        # the decision engine takes the file and nothing else: it reads a whole sequence per request, so there is no
+        # --max-context to plan, no prompt chunk to size and no drafter to feed
+        args = ["--native", str(gguf)]
+    else:
+        args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
     # a family whose engine has options of its own: written after the common ones, from the family's entry
     args += [str(x) for x in fam.get("engine_args", [])]
     if fam.get("kv_used"):                          # the K / V cache's element (--m2-kv; int8 unless asked otherwise)

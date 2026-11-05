@@ -953,9 +953,42 @@ La différence de 0,042 est la dérive de quantification déjà mesurée en §10
 Le serveur n'active la route que si `arch` vaut `qwen35` **et** qu'un `decider.json` est dans le dossier
 tokenizer — c'est déjà le cas depuis M1, donc rien à changer côté protocole.
 
-**Reste M5** : `setup.py` (`OWN_PATH_FAMILIES["decider"]`, écriture de `decider.json`, `strata launch --family
-decider`), `strata --families` avec `STRATA_HAVE_DECIDER`, la ligne du catalogue et de l'app, et les tests
-Terminal. Le modèle n'est pas encore installable par un utilisateur.
+### 10.14 M5 — l'installation (5 novembre 2026, partiel)
+
+| Fichier | Ce qui a été ajouté |
+|---|---|
+| `setup.py` | entrée `OWN_PATH_FAMILIES["decider"]` : titre, `arch: qwen35`, dépôt HF, fichier, licence Apache 2.0, `sha256` (5 157 837 472 o, `ffb27ade…`), `context_cap: 32768`, `vram_budget` (le contexte coûte des buffers d'activation, pas un cache K/V), `mtp: 0`, `vision: False` |
+| `setup.py` | la révision du dépôt GGUF est épinglée (`2514d5f0…`), comme les autres familles |
+| `setup.py` | à l'installation, `tools/decider_config.py` écrit `decider.json` à côté du tokenizer — c'est ce fichier qui allume `/v1/systemone` |
+| `setup.py` | les arguments du moteur sont `--native <gguf>` et rien d'autre : ni `--max-context`, ni `--prefill`, ni `--mtp` |
+| `strata_cli/launch/catalog.py` | `context_cap` respecté : le plan propose 32K, pas 128K |
+| `strata_cli/launch/runner.py` | la ligne « drafting » du plan dit la vérité : *a decision model generates no text, so nothing is drafted* |
+| `strata_control/drafting.py` | `NO_DRAFTER_FAMILIES` : Auto vaut `off` pour le décideur, jamais MTP |
+| `packaging/package_terminal.py` | `tools/decider_config.py` ajouté au bundle (le test `test_bundle_tools_paths.py` l'a attrapé) |
+
+`strata launch --plan --family decider --model Q8_0` rend maintenant :
+
+```text
+Plan for 'Q8_0 32K':
+  model     decider Q8_0
+  context   32K    pictures off    parallel fit to your card
+  download  Nothing to download: the model is already on this computer.
+  drafting  off (a decision model generates no text, so nothing is drafted)
+```
+
+**Ce qui reste de M5** (et qui n'est pas fait) :
+
+- la ligne « download » du plan ne compte pas le GGUF pour les familles à chemin propre — c'est déjà le cas de
+  Step-3.7-Flash, pas une régression du décideur ;
+- `strata --families` n'annonce pas `qwen35` : la macro `STRATA_HAVE_DECIDER` n'existe pas, parce que `strata`
+  ne dispatche pas encore la famille vers le moteur de décision (le serveur lance `strata-decider-gpu` par son
+  `exe`) ;
+- `strata_cli/launch/adopt.py` n'a pas de plan « decider » (adopter des fichiers déjà présents) ;
+- aucun test Terminal propre au décideur, et l'installation `--yes` n'a pas été essayée de bout en bout (elle
+  demande un paquet moteur dans le feed, comme `step35`).
+
+Le modèle est donc **installable par le code**, mais pas encore **livrable** : c'est le même reste que pour
+Step-3.7-Flash à son époque (build source d'abord, paquet moteur ensuite).
 
 ### 10.5 Ce que cette étude ne prétend pas
 

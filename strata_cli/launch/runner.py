@@ -2546,6 +2546,8 @@ class Runner:
         from strata_control import drafting
         if self.s.family == "step35":       # the NextN blocks run (--gpu-mtp) but nothing drafts with them in serving yet
             return "Drafting: off (Step-3.7-Flash's NextN blocks are not used by the serving path yet)"
+        if self.s.family == "decider":      # a decision model generates no text: there is nothing to draft
+            return "Drafting: off (a decision model generates no text, so nothing is drafted)"
         if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
             if sys.platform == "darwin":
                 return "Drafting: off (DeepSeek's drafter was not faster on a Mac)"

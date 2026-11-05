@@ -338,13 +338,26 @@ class Catalog:
     def contexts(self) -> list[int]:
         return [int(c) for c in self.tables()[2]]
 
+    def own_context_cap(self, family: str | None) -> int | None:
+        """The context ceiling an own-path family declares ("context_cap" in setup.py's OWN_PATH_FAMILIES): the decider's
+        checkpoint was trained to 32768, so 128K is not offered for it.  None when the family sets no cap."""
+        s = self.strata.setup_module() if hasattr(self.strata, "setup_module") else None
+        entry = (getattr(s, "OWN_PATH_FAMILIES", None) or {}).get(family or "") if s is not None else None
+        cap = int(entry["context_cap"]) if entry and entry.get("context_cap") else None
+        return cap
+
     def contexts_for(self, family: str | None, model: str | None = None) -> list[int]:
         """The context sizes to offer for this model: DeepSeek-V4.1-Flash goes up to 1M (its installed pack's own limit when it has one), the
         others keep the shared list."""
         if family and self.strata.multi_family(family):
             from strata_control import dsv41_context
             return dsv41_context.choices(self.pack_limit(family, model))
-        return self.contexts()
+        contexts = self.contexts()
+        cap = self.own_context_cap(family)
+        if cap:
+            capped = [c for c in contexts if c <= cap]
+            return capped or [cap]
+        return contexts
 
     def pack_limit(self, family: str | None, model: str | None) -> int | None:
         """The installed DeepSeek pack's own context limit (ds4.txt), None when it is not installed or the file does not say."""

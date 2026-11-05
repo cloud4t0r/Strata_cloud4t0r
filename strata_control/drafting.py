@@ -245,6 +245,8 @@ DEFAULT_CONTEXT = 131072     # --max-context when the arguments name none (the 1
 #: (UD-IQ4_XS, UD-Q4_K_XL...; DFlash2 numbers measured on UD-Q4_K_XL on Strix, R9700 and M5 Max). Not Swift (UkisAI's fine-tune), Coder (ISTA-DASLab's coding version) or NVFP4:
 #: no DFlash2 acceptance numbers for them, they start the MTP.
 SUPPORTED_FAMILIES = ("qwen", "gyro", "unsloth")
+#: Families whose engine has no drafter at all: the decider generates no text, so Auto is "off", never the MTP.
+NO_DRAFTER_FAMILIES = ("decider",)
 #: The model_name setup.py (and metal/setup_mac.py) write: f"{family name}-{model.lower()}": qwen3.8-flash-next-iq3_s, qwen3.8-flash-next-gyro-gyro-s,
 #: qwen3.8-flash-next-unsloth-ud-q4_k_xl. (Coder is qwen3.8-flash-next-coder-iq1_m, NVFP4 qwen3.8-flash-next-nvfp4-nvfp4: neither matches.) Mirrored in
 #: apps/host/server/native-settings.mjs; tests/drafting.test.mjs keeps the two the same.
@@ -658,6 +660,8 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
         return "off"
     if asked == "mtp":
         return "mtp"
+    if family and str(family).lower() in NO_DRAFTER_FAMILIES:
+        return "off"
     return "dflash2" if can_run_dflash2(model_name, family, backend, archs) else "mtp"
 
 
