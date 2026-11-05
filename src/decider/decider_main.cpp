@@ -30,6 +30,7 @@ int usage(const char* argv0) {
                  "  --ref      run the CPU reference and print the readout's raw logits (255 per marker) as JSON\n"
                  "             --tokens   the sequence's token ids, comma separated\n"
                  "             --markers  the readout positions, comma separated\n"
+                 "             --trace    print the hidden state's sum and norm after each block (to stderr)\n"
                  "\n"
                  "The engine (blocks on GPU, readout, /v1/systemone) is not built yet: see the integration study.\n",
                  argv0, argv0);
