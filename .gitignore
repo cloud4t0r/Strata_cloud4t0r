@@ -102,3 +102,6 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# GPU core dumps (a faulted kernel can write one next to the binary: 5 GB and never useful to the repository)
+gpucore.*
