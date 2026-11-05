@@ -335,6 +335,16 @@ target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
+
+# PPLX Decider Flash (GGUF architecture qwen35): the decision model's own entry point.  It carries the tensor audit
+# today (--inspect, no GPU); the engine - the 32 blocks on CUDA/HIP, the readout at the markers and the server's DEC
+# operation - is M2-M4 of the integration study and lands in this target.
+# the host-side part of the decider (the tensor audit), which the engine and the tests share
+add_library(strata_decider_core STATIC src/decider/inspect.cpp)
+target_include_directories(strata_decider_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_decider_core PUBLIC strata_artifact)
+add_executable(strata-decider src/decider/decider_main.cpp)
+target_link_libraries(strata-decider PRIVATE strata_decider_core)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
@@ -360,6 +370,14 @@ if(STRATA_BUILD_TESTS)
   add_executable(step35_metadata_test tests/core/step35_metadata_test.cpp)
   target_link_libraries(step35_metadata_test PRIVATE strata_artifact)
   add_test(NAME step35_metadata_test COMMAND step35_metadata_test)
+  # PPLX Decider Flash (qwen35): the family, non-causal full attention, the v3 readout protocol, the layer pattern
+  add_executable(decider_metadata_test tests/core/decider_metadata_test.cpp)
+  target_link_libraries(decider_metadata_test PRIVATE strata_artifact)
+  add_test(NAME decider_metadata_test COMMAND decider_metadata_test)
+  # the tensor audit the engine reads the file through (`strata-decider --inspect`), on a scaled-down schema
+  add_executable(decider_inspect_test tests/core/decider_inspect_test.cpp)
+  target_link_libraries(decider_inspect_test PRIVATE strata_decider_core)
+  add_test(NAME decider_inspect_test COMMAND decider_inspect_test)
   # how --batch cuts a prompt read into pieces (a layer split with no slot decoding must still reach a BYIELD)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)

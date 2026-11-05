@@ -732,6 +732,96 @@ inline std::string check_architecture_step35(const GgufFile& g) {
     return {};
 }
 
+/// PPLX Decider Flash's guard (GGUF architecture `qwen35`): the keys the official file carries, the two properties
+/// that make it a decider rather than a chat model, and the counts that must agree.  The first property is
+/// `qwen35.attention.causal == false`: the 8 full-attention layers read the whole sequence, and a causal engine
+/// would still answer - with probabilities that are quietly wrong.  The second is the v3 readout protocol
+/// (`pplx_decider.*`), whose codes and token ids must pair up: the head is indexed by vocabulary id, not by rank,
+/// and 255 codes are not the alphabetical run (`JN`, `JQ` are missing).  Every check here names the key it refuses,
+/// because the engine cannot tell a plausible probability from a right one.
+inline std::string check_architecture_qwen35(const GgufFile& g) {
+    static const char* const keys[] = {
+        "qwen35.block_count", "qwen35.context_length", "qwen35.embedding_length", "qwen35.feed_forward_length",
+        "qwen35.attention.head_count", "qwen35.attention.head_count_kv", "qwen35.attention.key_length",
+        "qwen35.attention.value_length", "qwen35.attention.layer_norm_rms_epsilon", "qwen35.rope.dimension_count",
+        "qwen35.rope.freq_base", "qwen35.full_attention_interval", "qwen35.ssm.conv_kernel",
+        "qwen35.ssm.state_size", "qwen35.ssm.group_count", "qwen35.ssm.time_step_rank", "qwen35.ssm.inner_size",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not a number";
+    }
+    const MetaValue* causal = g.get("qwen35.attention.causal");
+    if (!causal) return "missing qwen35.attention.causal: a causal qwen35 file is a chat model, not a decider";
+    if (causal->type != MetaType::BOOL) return "qwen35.attention.causal is not a boolean";
+    if (causal->u != 0) return "qwen35.attention.causal is true: a causal qwen35 file is a chat model, not a decider";
+    const MetaValue* blocks = g.get("qwen35.block_count");
+    if (blocks->u == 0) return "qwen35.block_count is zero";
+    const MetaValue* interval = g.get("qwen35.full_attention_interval");
+    if (interval->u < 2) return "qwen35.full_attention_interval must be at least 2 (the GDN / attention pattern)";
+    if (interval->u >= blocks->u) return "qwen35.full_attention_interval is not smaller than qwen35.block_count";
+    const MetaValue* heads = g.get("qwen35.attention.head_count");
+    const MetaValue* kv = g.get("qwen35.attention.head_count_kv");
+    if (heads->u == 0 || kv->u == 0 || heads->u % kv->u != 0)
+        return "qwen35.attention.head_count does not split into head_count_kv";
+    // mRoPE sections count PAIRS: 2 * sum == dimension_count (the official file: 11+11+10+0 pairs for 64 dims)
+    const MetaValue* sections = g.get("qwen35.rope.dimension_sections");
+    if (!sections || sections->type != MetaType::ARRAY) return "missing qwen35.rope.dimension_sections";
+    uint64_t pairs = 0;
+    for (const MetaValue& item : sections->items) pairs += item.u;
+    if (2 * pairs != g.get("qwen35.rope.dimension_count")->u)
+        return "qwen35.rope.dimension_sections sum to " + std::to_string(pairs) + " pairs, not half of rope.dimension_count";
+    if (g.get("qwen35.rope.dimension_count")->u > g.get("qwen35.attention.key_length")->u)
+        return "qwen35.rope.dimension_count is bigger than qwen35.attention.key_length";
+    // the GDN recurrence: inner_size is the value heads' width, one state row per head
+    if (g.get("qwen35.ssm.inner_size")->u !=
+        g.get("qwen35.ssm.time_step_rank")->u * g.get("qwen35.ssm.state_size")->u)
+        return "qwen35.ssm.inner_size is not time_step_rank * state_size";
+    // one entry per block, and the pattern the kernels compile (a full layer every `interval`, the rest GDN)
+    const MetaValue* recurrent = g.get("qwen35.attention.recurrent_layers");
+    if (!recurrent || recurrent->type != MetaType::ARRAY) return "missing qwen35.attention.recurrent_layers";
+    if (recurrent->count != blocks->u)
+        return "qwen35.attention.recurrent_layers has " + std::to_string(recurrent->count) + " entries for " +
+               std::to_string(blocks->u) + " blocks";
+    for (uint64_t i = 0; i < recurrent->count; ++i) {
+        const bool full = (i + 1) % interval->u == 0;
+        if ((recurrent->items[i].u != 0) == full)
+            return "qwen35.attention.recurrent_layers disagrees with full_attention_interval on block " +
+                   std::to_string(i);
+    }
+    // the readout protocol: v3 only, and the codes must pair with the head's vocabulary ids
+    const MetaValue* version = g.get("pplx_decider.protocol_version");
+    if (!version) return "missing pplx_decider.protocol_version: this is not a decision checkpoint";
+    if (!version->is_num() || version->u != 3)
+        return "pplx_decider.protocol_version is not 3 (this build serves v3, not v1)";
+    const MetaValue* tpl = g.get("pplx_decider.template");
+    if (!tpl || tpl->type != MetaType::STRING) return "missing pplx_decider.template";
+    if (tpl->s != "joint-question-inline-readout-v1")
+        return "pplx_decider.template is '" + tpl->s + "', this build serves joint-question-inline-readout-v1";
+    const MetaValue* marker = g.get("pplx_decider.marker");
+    if (!marker || marker->type != MetaType::STRING || marker->s.empty()) return "missing pplx_decider.marker";
+    const MetaValue* temperature = g.get("pplx_decider.temperature");
+    if (!temperature || !temperature->is_num() || !(temperature->num() > 0))
+        return "pplx_decider.temperature must be a positive number";
+    const MetaValue* codes = g.get("pplx_decider.codes");
+    const MetaValue* ids = g.get("pplx_decider.token_ids");
+    if (!codes || codes->type != MetaType::ARRAY || codes->elem != MetaType::STRING)
+        return "missing pplx_decider.codes";
+    if (!ids || ids->type != MetaType::ARRAY) return "missing pplx_decider.token_ids";
+    if (codes->count != ids->count)
+        return "pplx_decider.codes has " + std::to_string(codes->count) + " entries for " +
+               std::to_string(ids->count) + " token ids";
+    if (codes->count == 0 || codes->count > 255)
+        return "pplx_decider.codes has " + std::to_string(codes->count) + " entries; the readout head has 255 rows";
+    for (const MetaValue& code : codes->items) {
+        if (code.type != MetaType::STRING || code.s.empty()) return "pplx_decider.codes holds an empty code";
+        for (const char c : code.s)
+            if (c < 'A' || c > 'Z') return "pplx_decider.codes holds '" + code.s + "', which is not uppercase A-Z";
+    }
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE// architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
 // shape is refused with the key that differs rather than silently mis-run.
@@ -920,6 +1010,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
     if (family == ModelFamily::MiniMaxM2) return check_architecture_minimax_m2(f);
     if (family == ModelFamily::Step35) return check_architecture_step35(f);
+    if (family == ModelFamily::Decider) return check_architecture_qwen35(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

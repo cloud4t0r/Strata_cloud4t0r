@@ -709,6 +709,48 @@ Fichiers ajoutés : `serve/decider-goldens.json` (91 Ko, le contrat de M1–M4) 
 `tools/decider_goldens.py --verify` reste inutilisable tant que le moteur n'a pas `decide` : la route répond
 toujours 501.
 
+### 10.7 M2 — le squelette moteur (5 novembre 2026)
+
+Le premier morceau de M2, celui qui ne demande pas encore de noyaux : la famille, le garde-fou et l'audit des
+tenseurs. Tout est du C++ hôte, testé sans GPU.
+
+| Fichier | Rôle |
+|---|---|
+| `include/strata/artifact/model_family.hpp` | `ModelFamily::Decider` : arch `qwen35`, titre « PPLX Decider Flash », et un refus qui dit la vraie raison (« decision model, not a chat model: it has no lm_head ») |
+| `include/strata/artifact/gguf_reader.hpp` | `check_architecture_qwen35` : `attention.causal == false` **obligatoire**, protocole v3, appariement `codes`/`token_ids`, motif des couches contre `full_attention_interval`, mRoPE en paires (`2 × somme == dimension_count`), `ssm.inner_size == time_step_rank × state_size` |
+| `include/strata/decider/inspect.hpp`, `src/decider/inspect.cpp` | l'audit des 427 tenseurs : nom, forme et type de chaque poids, dérivés des métadonnées, plus le refus de tout tenseur que le moteur n'ignore pas |
+| `src/decider/decider_main.cpp` | `strata-decider --inspect <fichier>` ; toute autre commande dit que le moteur n'est pas encore là (code 2) |
+| `tests/core/decider_metadata_test.cpp` | 22 vérifications : la famille, et les refus (causal, v2, template, codes, motif, GQA, mRoPE, inner_size) |
+| `tests/core/decider_inspect_test.cpp` | 9 vérifications sur un modèle synthétique de 8 blocs : schéma complet accepté, poids manquant / mauvaise largeur / mauvais type / tenseur inattendu / id hors vocabulaire refusés |
+| `tests/core/gguf_fixture.hpp` | les booléens GGUF (type 7) et leurs tableaux, et un message d'erreur qui nomme la forme et le type |
+
+Vérifié ici :
+
+```sh
+cmake -S . -B build-tests -G Ninja -DSTRATA_BUILD_TESTS=ON \
+      -DSTRATA_ENABLE_HIP=OFF -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_SYCL=OFF
+cmake --build build-tests --target decider_metadata_test decider_inspect_test strata-decider
+ctest --test-dir build-tests -R "decider|step35_metadata|model_family"   # 4/4
+./build-tests/strata-decider --inspect decider-flash-v1.2-q8_0.gguf
+```
+
+Sur le GGUF officiel, l'audit passe et rend :
+
+```text
+  geometry: 32 blocks (24 GDN + 8 full), embedding 2560, ffn 9216, heads 16/4 x 256, GDN 16 qk / 32 v x 128 (inner 4096, conv 4)
+  tensors: 427 (424 per block + 3 global), all shapes and types match
+  readout: 255 codes, ids inside the 248320-token vocabulary, temperature 1.553909
+  attention: non-causal full layers, causal GDN (protocol v3, marker <|fim_suffix|>)
+  architecture guard: PASS
+```
+
+Le lecteur compile aussi dans l'arbre HIP (`cmake --build build-hip --target strata-gguf`). `strata --families`
+n'annonce **pas** `qwen35` : la macro `STRATA_HAVE_DECIDER` n'existe pas encore, et une build qui ne sait pas
+décider ne doit pas le prétendre.
+
+Reste pour finir M2 : les noyaux denses (RMSNorm, GDN, SwiGLU), `--ref` CPU float64 et la parité par bloc contre
+les goldens — puis M3 (attention non-causale) et M4 (tête de lecture et `DEC`).
+
 ### 10.5 Ce que cette étude ne prétend pas
 
 - Aucune mesure de vitesse ou de VRAM n'a été faite sur la 9070 : les chiffres de §4.2 sont des

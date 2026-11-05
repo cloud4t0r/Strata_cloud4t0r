@@ -38,7 +38,16 @@ inline Kv u16(const std::string& k, uint64_t v) { Kv r = make_kv(k, 2); r.u = v;
 inline Kv i32(const std::string& k, uint64_t v) { Kv r = make_kv(k, 5); r.u = v; return r; }
 inline Kv u32(const std::string& k, uint64_t v) { Kv r = make_kv(k, 4); r.u = v; return r; }
 inline Kv f32(const std::string& k, float v) { Kv r = make_kv(k, 6); r.f = v; return r; }
+/// GGUF bool (type 7): one byte, 0 or 1.
+inline Kv boolean(const std::string& k, bool v) { Kv r = make_kv(k, 7); r.u = v ? 1 : 0; return r; }
 inline Kv u32s(const std::string& k, std::vector<uint64_t> v) { Kv r = make_kv(k, 9); r.arr = std::move(v); return r; }
+/// An array of GGUF bools (elem type 7): 0/1 per entry, as `qwen35.attention.recurrent_layers` is written.
+inline Kv bools(const std::string& k, std::vector<uint64_t> v) {
+    Kv r = make_kv(k, 9);
+    r.elem = 7;
+    r.arr = std::move(v);
+    return r;
+}
 inline Kv strs(const std::string& k, std::vector<std::string> v) {
     Kv r = make_kv(k, 9);
     r.elem = 8;
@@ -101,6 +110,7 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         else if (k.type == 2) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
         else if (k.type == 4 || k.type == 5) { const uint32_t v = (uint32_t) k.u; put(&v, 4); }
         else if (k.type == 6) put(&k.f, 4);
+        else if (k.type == 7) { const uint8_t v = k.u ? 1 : 0; put(&v, 1); }
         else if (k.type == 9 && k.elem == 4) {
             put32(4);
             put64(k.arr.size());
@@ -109,6 +119,13 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
             put32(8);
             put64(k.sarr.size());
             for (const auto& x : k.sarr) puts(x);
+        } else if (k.type == 9 && k.elem == 7) {
+            put32(7);
+            put64(k.arr.size());
+            for (uint64_t x : k.arr) {
+                const uint8_t v = x ? 1 : 0;
+                put(&v, 1);
+            }
         } else throw std::runtime_error("fixture: unsupported metadata type");
     }
     Written w;
@@ -119,7 +136,12 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         info.shape = t.shape;
         info.type = t.type;
         const uint64_t n = strata::tensor_payload_bytes(info);
-        if (n == 0) throw std::runtime_error("fixture: " + t.name + " has no whole-block byte count");
+        if (n == 0) {
+            std::string shape;
+            for (uint64_t d : t.shape) shape += (shape.empty() ? "" : "x") + std::to_string(d);
+            throw std::runtime_error("fixture: " + t.name + " has no whole-block byte count (shape " + shape +
+                                     ", type " + std::to_string(t.type) + ")");
+        }
         puts(t.name);
         put32((uint32_t) t.shape.size());
         for (uint64_t d : t.shape) put64(d);
