@@ -668,8 +668,46 @@ Ce qui n'est **pas** encore fait, et qui est volontaire :
 - aucune réponse factice n'est servie en production : le squelette préfère un 501 à un nombre inventé. Les moteurs
   factices ne vivent que dans les tests.
 
-**Prochaine étape : M0 sur la machine CUDA** (`python tools/decider_goldens.py --out decider-goldens.json`), puis
-M2 (blocs denses) une fois les logits de référence en main.
+**M0 a depuis été fait sur CPU (voir §10.6).** Prochaine étape : M2 (blocs denses) une fois les logits de référence
+en main.
+
+### 10.6 M0 — les goldens, et la parité du tokenizer (5 novembre 2026)
+
+M0 ne demande pas de GPU : le paquet de référence tourne en float32 sur CPU, et la machine cible (Ryzen 9 5950X,
+64 Go) suffit. Fait ici, sans carte graphique :
+
+| Étape | Commande | Résultat |
+|---|---|---|
+| checkpoint de référence | `snapshot_download` de `perplexity-ai/pplx-decider-flash-v1.2` (9,10 Go, révision `9ff7cf98`) | 723 tenseurs chargés en float32 |
+| goldens | `python tools/decider_goldens.py --checkpoint <dir> --device cpu --max-length 32768 --out serve/decider-goldens.json` | **10 cas, 11 séquences, 1 min 01 s** |
+| GGUF officiel | `decider-flash-v1.2-q8_0.gguf`, 5 157 837 472 octets | taille et SHA conformes à §1.1 |
+| tokenizer | `python tools/strata_tokenizer.py --gguf <gguf> --out <pack> --check` | 248 320 tokens, 247 587 merges, `pre qwen35`, aller-retour 16/16 |
+| `decider.json` | `python tools/decider_config.py --gguf <gguf> --out <pack>/tokenizer` | 255 codes, température 1,553909, `max_length` 262144 |
+
+**Parité vérifiée** (aucune mesure de vitesse, aucune inférence GPU) :
+
+- **Token ids** : le tokenizer Strata, extrait du GGUF, rend **exactement** les ids du `tokenizer.json` du
+  checkpoint sur les 11 séquences — y compris le cas à 255 options (3 426 tokens), l'état JSON, l'unicode et
+  l'injection de marqueur. Les positions de marqueurs sont identiques aussi.
+- **Métadonnées** : `codes`, `token_ids` et température du GGUF sont identiques à `decision_config.json` ; le
+  `chat_template.jinja` extrait du GGUF est **octet pour octet** celui du checkpoint.
+- **Formules** : `serve/systemone.py` (température appliquée une fois, softmax sur les options valides,
+  `noul`/`choice`/`score`) reproduit les réponses du paquet de référence calculées sur **ses propres logits**,
+  13 questions, écart absolu maximal **1,7 × 10⁻⁷** (arrondi float32).
+
+Deux écarts avec l'étude, à noter :
+
+- `requirements.txt` du checkpoint épingle `torch==2.14.0`, qui **n'existe pas** sur PyPI (la dernière version
+  publiée est 2.9.1). Le test a tourné avec **torch 2.9.1+cpu** et **transformers 5.17.0** (celui-ci existe bien) ;
+  la référence tombe sur ses implémentations PyTorch de `causal_conv1d` et `chunk_gated_delta_rule`, plus lentes
+  mais correctes, et le résultat est identique.
+- Le CPU suffit à M0 (1 min pour 10 cas), mais ce n'est pas une mesure du moteur : les projections de §4.2 restent
+  des projections, et le préfill réel sur la 9070 reste à mesurer.
+
+Fichiers ajoutés : `serve/decider-goldens.json` (91 Ko, le contrat de M1–M4) et
+`serve/test_systemone_goldens.py` (3 tests, sans torch, qui rejouent les formules sur les logits de référence).
+`tools/decider_goldens.py --verify` reste inutilisable tant que le moteur n'a pas `decide` : la route répond
+toujours 501.
 
 ### 10.5 Ce que cette étude ne prétend pas
 
