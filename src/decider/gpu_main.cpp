@@ -30,6 +30,7 @@ int usage(const char* argv0) {
                  "  --xn-out / --conv-out / --core-out / --attn-out  also write an intermediate stage\n"
                  "\n"
                  "       %s --gguf <file.gguf> --stage full --tokens <ids> --markers <positions>\n"
+                 "       %s --native <file.gguf> --serve       (DEC requests on stdin, the model loaded once)\n"
                  "\n"
                  "  --stage full runs the whole model (embeddings, 32 blocks, final norm, readout) and prints the\n"
                  "  readout's raw logits as JSON, the same shape `strata-decider --ref` prints.\n",
@@ -64,8 +65,12 @@ int main(int argc, char** argv) {
             trace = true;
             continue;
         }
+        if (flag == "--serve") {   // the engine's own flag name: `strata-decider-gpu --native <gguf> --serve`
+            stage = "serve";
+            continue;
+        }
         if (i + 1 >= argc) break;
-        if (flag == "--gguf") gguf = argv[++i];
+        if (flag == "--gguf" || flag == "--native") gguf = argv[++i];   // --native is the engine's spelling
         else if (flag == "--in") in_path = argv[++i];
         else if (flag == "--out") out_path = argv[++i];
         else if (flag == "--block") block = std::atoll(argv[++i]);
@@ -76,6 +81,10 @@ int main(int argc, char** argv) {
         else if (flag == "--stage") stage = argv[++i];
         else if (flag == "--tokens") tokens = ids_of(argv[++i]);
         else if (flag == "--markers") markers = ids_of(argv[++i]);
+    }
+    if (stage == "serve") {
+        if (gguf.empty()) return usage(argv[0]);
+        return strata::decider::gpu::serve(gguf, trace);
     }
     if (stage == "full") {
         if (gguf.empty() || tokens.empty() || markers.empty()) return usage(argv[0]);

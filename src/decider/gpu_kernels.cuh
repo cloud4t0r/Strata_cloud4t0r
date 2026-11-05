@@ -43,6 +43,9 @@ __global__ void gated_norm(const float* x, const float* z, const float* w, float
 __global__ void norm_rope(float* buffer, const float* w, int per_token, int row_stride, int head_dim, int n_rot,
                           float theta, float eps);
 
+/// The readout: `logits[c] = dot(code_rows[c], hidden)`, one block per code (255 blocks of `n` threads).
+__global__ void readout(const float* hidden, const float* code_rows, float* logits, int codes, int n);
+
 /// Non-causal grouped-query attention with the per-head gate; one block per query head.
 __global__ void attention(const float* qg, const float* k, const float* v, float* attn, int tokens, int heads,
                           int kv_heads, int head_dim, float scale);

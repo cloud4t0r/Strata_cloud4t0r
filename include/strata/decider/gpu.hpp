@@ -45,4 +45,11 @@ bool attention(const std::string& gguf, int64_t block, const std::string& in_pat
 bool logits(const std::string& gguf, const std::vector<int32_t>& tokens, const std::vector<int32_t>& markers,
             std::vector<std::vector<float>>& out, std::string& err, bool trace = false);
 
+/// Serves decision requests on stdin/stdout with the model loaded once.  One line per request:
+///     DEC <n_tokens> <id>... <n_markers> <position>...
+/// answered by
+///     DEC <n_markers> <count> <value>... <count> <value>...      then  DONE
+/// or by `ERR <message>`.  `QUIT` or end of input ends it.  Returns the process exit code.
+int serve(const std::string& gguf, bool trace = false);
+
 }  // namespace strata::decider::gpu

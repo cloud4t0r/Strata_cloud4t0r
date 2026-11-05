@@ -35,6 +35,23 @@ __global__ void rmsnorm(const float* x, const float* w, float* y, int n, float e
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * scale * w[i];
 }
 
+/// The readout: one block per code, the row dotted with the hidden state at a marker.
+__global__ void readout(const float* hidden, const float* code_rows, float* logits, int codes, int n) {
+    const int c = blockIdx.x;
+    if (c >= codes) return;
+    const float* row = code_rows + (size_t) c * n;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += row[i] * hidden[i];
+    __shared__ float shared[256];
+    shared[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) logits[c] = shared[0];
+}
+
 /// x += y, the residual stream.
 __global__ void add_in_place(float* x, const float* y, size_t n) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -56,6 +73,7 @@ using namespace detail;
 using kernels::rmsnorm;
 using kernels::swiglu;
 using kernels::add_in_place;
+using kernels::readout;
 }  // namespace
 
 bool mlp(const std::string& gguf, int64_t block, const std::string& in_path, const std::string& out_path,

@@ -1703,6 +1703,49 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def decide(self, ids: list[int], markers: list[int]) -> list[list[float]]:
+        """DEC: one decision request (serve/systemone.py).  Returns one row of 255 raw logits per marker.
+
+        The line is `DEC <n_tokens> <id>... <n_markers> <position>...`; the answer is
+        `DEC <n_markers> <count> <value>... ...` followed by DONE, or `ERR <message>`.  The model is already loaded
+        in the engine process, so a request is one forward pass.
+        """
+        if self.proc is None or not self.alive():
+            raise EngineDied(f"the engine is not running (exit code {self.exit_code()})")
+        line = (f"DEC {len(ids)} " + " ".join(str(int(t)) for t in ids) + f" {len(markers)} " +
+                " ".join(str(int(m)) for m in markers))
+        self._send(line)
+        answer = self._decide_line()
+        parts = answer.split()
+        if parts and parts[0] == "ERR":
+            raise RuntimeError("the engine refused the decision: " + " ".join(parts[1:]))
+        if len(parts) < 2 or parts[0] != "DEC":
+            raise RuntimeError(f"the engine answered {answer[:120]!r} to a DEC line")
+        rows: list[list[float]] = []
+        at = 2
+        for _ in range(int(parts[1])):
+            count = int(parts[at])
+            at += 1
+            rows.append([float(value) for value in parts[at:at + count]])
+            at += count
+        done = self._decide_line()
+        if done.strip() != "DONE":
+            raise RuntimeError(f"the engine said {done.strip()[:80]!r} after a decision")
+        return rows
+
+    def _decide_line(self) -> str:
+        """One line of a DEC answer, with a deadline: a decision that never ends must not hold the request turn.
+
+        The lines come from the pump, like a generation's: it is the one reader of the engine's stdout.
+        """
+        try:
+            line = self.lines.get(timeout=float(self.silence_s or 600))
+        except queue.Empty:
+            raise EngineDied("the engine did not answer a decision request") from None
+        if line is None:
+            raise EngineDied(f"the engine stopped during a decision (exit code {self.exit_code()})")
+        return line
+
     def _send(self, text: str):
         btrace("send>", text[:60])
         try:

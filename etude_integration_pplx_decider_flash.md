@@ -918,8 +918,44 @@ Un défaut trouvé en route, qui ne plantait qu'au deuxième cas : le scratch q8
 largeur du GDN (8 192), alors que la projection `ffn_down` prend `n_ff` = **9 216**. Débordement de 9 Ko, faute de
 mémoire GPU au cas suivant. Corrigé : le scratch prend la plus large des entrées de projection.
 
-Reste M4 : la tête de lecture sur GPU (aujourd'hui 255 lignes lues à l'hôte, 0,05 % du calcul), l'opération `DEC`
-du protocole serveur, et le branchement dans `strata`/`--serve`.
+### 10.13 M4 — la tête de lecture et le service (5 novembre 2026)
+
+**La tête sur GPU.** Les 255 lignes de `output.weight` sont déquantifiées une fois au chargement et gardées sur la
+carte ; un bloc par code, chacune pointée avec le hidden au marqueur. Le résultat diffère de la version hôte de
+**2,2 × 10⁻⁵** (ordre de sommation), et la tête ne pèse plus rien dans le calcul.
+
+**Le service.** `strata-decider-gpu --native <gguf> --serve` garde le modèle chargé et parle le protocole de
+décision sur stdin/stdout :
+
+```text
+DEC <n_tokens> <id>... <n_markers> <position>...
+  → DEC <n_markers> <count> <value>... <count> <value>...
+    DONE
+```
+
+Il annonce `READY 32768 stop` au démarrage, comme les autres moteurs, donc `serve/server.py` peut le lancer tel
+quel. `StrataEngine.decide(ids, markers)` (serve/server.py) écrit la ligne `DEC` et lit la réponse à travers la
+pompe du serveur (c'est elle, et elle seule, qui lit stdout).
+
+**Mesuré, sur la RX 6800 :**
+
+| | |
+|---|---|
+| Premier `DEC` (poids déjà chargés) | 0,41 s |
+| Deuxième `DEC` | 0,37 s, logits identiques |
+| `POST /v1/systemone` de bout en bout | **HTTP 200 en 0,41 s** |
+| Réponse | `{"defect": {"type": "noul", "noul": 0,656}}` — l'oracle donne 0,614 |
+
+La différence de 0,042 est la dérive de quantification déjà mesurée en §10.12, pas une erreur de service.
+
+**Ce qu'il a fallu brancher** : `--native` accepté comme alias de `--gguf` (le nom que `StrataEngine` passe),
+`--serve` comme drapeau, la ligne `READY`, et `StrataEngine.decide` + `_decide_line` (qui lit la file du pompe).
+Le serveur n'active la route que si `arch` vaut `qwen35` **et** qu'un `decider.json` est dans le dossier
+tokenizer — c'est déjà le cas depuis M1, donc rien à changer côté protocole.
+
+**Reste M5** : `setup.py` (`OWN_PATH_FAMILIES["decider"]`, écriture de `decider.json`, `strata launch --family
+decider`), `strata --families` avec `STRATA_HAVE_DECIDER`, la ligne du catalogue et de l'app, et les tests
+Terminal. Le modèle n'est pas encore installable par un utilisateur.
 
 ### 10.5 Ce que cette étude ne prétend pas
 
