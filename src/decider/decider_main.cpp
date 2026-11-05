@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <exception>
 #include <string>
 #include <vector>
@@ -31,6 +32,7 @@ int usage(const char* argv0) {
                  "             --tokens   the sequence's token ids, comma separated\n"
                  "             --markers  the readout positions, comma separated\n"
                  "             --trace    print the hidden state's sum and norm after each block (to stderr)\n"
+                 "             --dump-dir DIR --dump-block N  write that block's stages as raw f32 (a kernel's target)\n"
                  "\n"
                  "The engine (blocks on GPU, readout, /v1/systemone) is not built yet: see the integration study.\n",
                  argv0, argv0);
@@ -63,8 +65,21 @@ int inspect_file(const char* path) {
     return 0;
 }
 
+/// Writes one stage of one block as raw little-endian f32, row-major [tokens][n_embd]: the layout the GPU
+/// kernels read and write, so a comparison needs no format.
+void write_stage(const std::string& dir, int64_t block, const char* name, const std::vector<float>& values) {
+    const std::string path = dir + "/" + name + "_" + std::to_string(block) + ".f32";
+    std::FILE* file = std::fopen(path.c_str(), "wb");
+    if (!file) throw std::runtime_error("cannot write " + path);
+    if (std::fwrite(values.data(), sizeof(float), values.size(), file) != values.size()) {
+        std::fclose(file);
+        throw std::runtime_error("short write on " + path);
+    }
+    std::fclose(file);
+}
+
 int run_reference(const char* path, const std::vector<int32_t>& tokens, const std::vector<int32_t>& markers,
-                  bool tracing) {
+                  bool tracing, const std::string& dump_dir, int64_t dump_block) {
     strata::decider::ref::Model model;
     std::string err;
     std::fprintf(stderr, "strata-decider: reading %s ...\n", path);
@@ -80,7 +95,12 @@ int run_reference(const char* path, const std::vector<int32_t>& tokens, const st
         trace = [](const char* stage, double sum, double norm) {
             std::fprintf(stderr, "trace %-10s sum %12.4f norm %12.4f\n", stage, sum, norm);
         };
-    if (!strata::decider::ref::logits(model, tokens, markers, logits, err, trace)) {
+    strata::decider::ref::StageFn stage;
+    if (!dump_dir.empty())
+        stage = [&](int64_t block, const char* name, const std::vector<float>& values) {
+            if (block == dump_block) write_stage(dump_dir, block, name, values);
+        };
+    if (!strata::decider::ref::logits(model, tokens, markers, logits, err, trace, stage)) {
         std::fprintf(stderr, "%s: %s\n", path, err.c_str());
         return 1;
     }
@@ -102,6 +122,8 @@ int main(int argc, char** argv) {
         if (argc >= 3 && std::strcmp(argv[1], "--ref") == 0) {
             std::vector<int32_t> tokens, markers;
             bool tracing = false;
+            std::string dump_dir;
+            int64_t dump_block = 0;
             for (int i = 3; i < argc; ++i) {
                 if (std::strcmp(argv[i], "--trace") == 0) {
                     tracing = true;
@@ -110,6 +132,8 @@ int main(int argc, char** argv) {
                 if (i + 1 >= argc) break;
                 if (std::strcmp(argv[i], "--tokens") == 0) tokens = ids_of(argv[i + 1]);
                 else if (std::strcmp(argv[i], "--markers") == 0) markers = ids_of(argv[i + 1]);
+                else if (std::strcmp(argv[i], "--dump-dir") == 0) dump_dir = argv[i + 1];
+                else if (std::strcmp(argv[i], "--dump-block") == 0) dump_block = std::atoll(argv[i + 1]);
                 else continue;
                 ++i;
             }
@@ -117,7 +141,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata-decider: --ref needs --tokens and --markers\n");
                 return 2;
             }
-            return run_reference(argv[2], tokens, markers, tracing);
+            return run_reference(argv[2], tokens, markers, tracing, dump_dir, dump_block);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-decider: %s\n", e.what());

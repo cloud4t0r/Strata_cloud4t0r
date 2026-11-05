@@ -810,6 +810,35 @@ au bloc près. C'est ce qui a permis de trouver les trois pièges sans dump de t
 et la vision n'est pas touchée. Les noyaux de M2 seront comparés à cette référence, bloc par bloc, avant d'être
 comparés à l'oracle.
 
+### 10.9 M2 — les premiers noyaux GPU : le MLP dense d'un bloc (5 novembre 2026)
+
+Premier noyau porté, et le premier maillon de la chaîne de comparaison bloc par bloc :
+
+| Fichier | Rôle |
+|---|---|
+| `include/strata/decider/gpu.hpp`, `src/decider/gpu_mlp.cu` | le MLP d'un bloc sur GPU : RMSNorm post-attention, deux projections Q8_0 (gate, up), SwiGLU, projection down |
+| `src/decider/gpu_main.cpp` | `strata-decider-gpu --gguf … --block N --in x_post_N.f32 --out mlp_gpu_N.f32 [--xn-out …]` |
+| `strata-decider --ref --dump-dir DIR --dump-block N` | écrit les étapes du bloc en f32 brut : `x_post` (entrée du MLP, avant sa norme), `xn_post` (après), `mixer`, `mlp` |
+| `tools/decider_block_parity.py` | exécute les deux côtés et compare, étape par étape |
+
+Résultat sur le bloc 0 du cas `noul` (98 tokens), carte RX 6800 (gfx1030) :
+
+| Étape | Cosinus | Écart relatif | Attendu |
+|---|---:|---:|---|
+| `xn_post` (RMSNorm) | **1,00000000** | **0,000000** (max 4,8 × 10⁻⁷) | arrondi flottant seulement |
+| `mlp` (3 projections + SwiGLU) | **0,99995750** | **0,0092** (max 5,1 × 10⁻³) | ~1 % : `iq_mmvq` quantifie les **activations** en q8_1, comme le moteur |
+
+La norme est donc exacte au bit près à l'ordre de sommation près, et les projections sont à 0,9 % — la
+quantification d'activation, pas une erreur. C'est le premier noyau de M2 et la première mesure de bout en bout
+de la chaîne GPU.
+
+Un piège de harnais, à noter : la première version passait `xn_post` (déjà normé) au noyau, qui le normalisait une
+seconde fois — facteur 3,16 exactement (`sqrt(2560/256)`), cosinus 0,976, et rien qui plante. Un test de noyau doit
+recevoir l'entrée **avant** la norme (`x_post`), sinon il ne teste pas la norme et mesure deux fois.
+
+Reste pour M2 : la convolution et la règle delta du GDN (le scan séquentiel), puis l'attention non-causale ; ensuite
+M3 (assemblage des 32 blocs) et M4 (tête de lecture et `DEC`).
+
 ### 10.5 Ce que cette étude ne prétend pas
 
 - Aucune mesure de vitesse ou de VRAM n'a été faite sur la 9070 : les chiffres de §4.2 sont des

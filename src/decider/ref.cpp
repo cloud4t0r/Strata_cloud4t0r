@@ -393,7 +393,7 @@ bool load(const std::string& path, Model& m, std::string& err) {
 }
 
 bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vector<int32_t>& markers,
-            std::vector<std::vector<float>>& out, std::string& err, const TraceFn& trace) {
+            std::vector<std::vector<float>>& out, std::string& err, const TraceFn& trace, const StageFn& stage) {
     try {
         const strata::GgufFile& g = *m.file;
         const int64_t T = (int64_t) tokens.size(), E = m.n_embd, FF = m.n_ff;
@@ -438,6 +438,7 @@ bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vecto
                 rmsnorm(x.data() + t * E, attn_norm.data(), E, m.eps, normed.data() + t * E);
 
             trace_vec(" xn", normed.data(), normed.size());
+            if (stage) stage(l, "xn_attn", normed);
             if (m.recurrent[(size_t) l]) {
                 L.wqkv = &tensor(g, p + "attn_qkv.weight");
                 L.wgate = &tensor(g, p + "attn_gate.weight");
@@ -461,11 +462,14 @@ bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vecto
                 const std::vector<float> kn = small(g, *L.k_norm);
                 attention(m, L, qn, kn, normed, T, mixed_out);
             }
+            if (stage) stage(l, "mixer", mixed_out);
             for (int64_t i = 0; i < T * E; ++i) x[(size_t) i] += mixed_out[(size_t) i];
+            if (stage) stage(l, "x_post", x);   // the MLP's input before its norm: a kernel test needs the raw one
 
             // the dense SwiGLU, on the post-attention norm
             for (int64_t t = 0; t < T; ++t)
                 rmsnorm(x.data() + t * E, post_norm.data(), E, m.eps, normed.data() + t * E);
+            if (stage) stage(l, "xn_post", normed);
             std::vector<float> gate((size_t) FF), up((size_t) FF);
             for (int64_t t = 0; t < T; ++t) {
                 gemv(g, *L.ffn_gate, normed.data() + t * E, gate.data());
@@ -474,6 +478,7 @@ bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vecto
                 gemv(g, *L.ffn_down, gate.data(), tmp.data() + t * E);
             }
             trace_vec(" mlp", tmp.data(), tmp.size());
+            if (stage) stage(l, "mlp", tmp);
             for (int64_t i = 0; i < T * E; ++i) x[(size_t) i] += tmp[(size_t) i];
             const std::string stage = "block " + std::to_string(l);
             report(stage.c_str(), x);

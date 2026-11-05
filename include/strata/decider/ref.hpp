@@ -44,8 +44,15 @@ bool load(const std::string& path, Model& m, std::string& err);
 /// the final norm.  One run against the reference package localises a wrong block without a hidden-state dump.
 using TraceFn = std::function<void(const char* stage, double sum, double norm)>;
 
+/// A block's intermediate tensor, as it is computed: `stage` is "xn_attn" (the mixer's normalised input),
+/// "mixer" (the mixer's output), "x_post" (the residual after it, the MLP's un-normalised input), "xn_post" (the
+/// MLP's normalised input) or "mlp" (the MLP's output), and the
+/// values are row-major [tokens][n_embd].  This is what a kernel is compared against, block by block.
+using StageFn = std::function<void(int64_t block, const char* stage, const std::vector<float>& values)>;
+
 /// The readout's raw logits (255 per marker, before temperature) for `tokens`, read at `markers`.
 bool logits(const Model& m, const std::vector<int32_t>& tokens, const std::vector<int32_t>& markers,
-            std::vector<std::vector<float>>& out, std::string& err, const TraceFn& trace = {});
+            std::vector<std::vector<float>>& out, std::string& err, const TraceFn& trace = {},
+            const StageFn& stage = {});
 
 }  // namespace strata::decider::ref
