@@ -1,6 +1,6 @@
 # Strata guides
 
-**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.5.
+**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.13.
 
 ## Use Strata
 
@@ -10,6 +10,7 @@
 | Choose a model and check memory | [Models and quantizations](MODELS.md) |
 | Run DeepSeek V4.1-Flash (app and Terminal) | [DeepSeek V4.1-Flash](MODELS.md#deepseek-v41-flash) |
 | Run this fork's Step-3.7-Flash or MiniMax-M2 (source checkout, Linux) | [Step-3.7-Flash](STEP37.md), [MiniMax-M2](MINIMAX_M2.md) |
+| See which model runs on which hardware | [Model and hardware table](CAPABILITIES.md) |
 | Start from the command line | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |

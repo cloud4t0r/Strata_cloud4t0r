@@ -1,6 +1,6 @@
 # Strata media and video guide
 
-For people and AI tools creating an article, overview or video. Last reviewed: 25 October 2026, for Strata 0.2.5.
+For people and AI tools creating an article, overview or video. Last reviewed: 7 November 2026, for Strata 0.2.13.
 Use [AI_REFERENCE.md](AI_REFERENCE.md) for product facts and [README.md](../README.md) for the public introduction.
 
 ## Short description
@@ -15,7 +15,7 @@ Suggested opening: **“Run powerful AI on your own computer. Chat, code and wor
 1. **Show the desktop app.** A chat and a visible result explain the product quickly.
 2. **Show the choice of interfaces.** The desktop app for a visual workspace; the terminal app for keyboard-driven use.
 3. **Show the three released model families.** DeepSeekV4.1-Flash-1017, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B.
-   Explain the [availability limits](AI_REFERENCE.md#model-families): DeepSeek V4.1-Flash is in the app and the Terminal since 0.2.5, on NVIDIA RTX 30, 40 and 50 and the Radeon AI PRO R9700 (Linux). This fork also carries
+   Explain the [availability limits](AI_REFERENCE.md#model-families): <!-- cap:summary:deepseek41 -->DeepSeekV4.1-Flash-1017 runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows (RTX 30, 40 and 50); NVIDIA on Linux (RTX 30, 40 and 50); NVIDIA DGX Spark (GB10); AMD on Windows (Ryzen AI Max / Strix Halo, gfx1151); AMD on Linux (Radeon AI PRO R9700); Apple silicon (64 GB or more, macOS 15 or newer). Does not run on: Intel Arc on Linux. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#deepseek41).<!-- /cap --> This fork also carries
    MiniMax-M2 and Step-3.7-Flash; present them as this fork's source-built engine paths, not as released families.
 4. **Choose a model for the machine.** Prefer ISTA-DASLab, then Unsloth, Gyro and other providers where compatible.
    Gyro is a memory-saving option, currently slower. State the model, quantization and hardware used in any live demo.
@@ -46,7 +46,7 @@ establish a current default model or universal performance.
 - Use actual footage or label illustrations. Do not invent a successful install, generated answer or speed reading.
 - Keep the provider preference distinct from measured performance. The maintainer's collaboration with ISTA-DASLab
   explains the recommendation order; it does not prove a benchmark result.
-- DeepSeek V4.1-Flash runs in the desktop app and in the Terminal (0.2.5), on NVIDIA RTX 30, 40 and 50 and the Radeon AI PRO R9700 on Linux. Take its sets (1.75, 2.00 and 2.25 bpw), sizes and speeds from
+- <!-- cap:summary:deepseek41 -->DeepSeekV4.1-Flash-1017 runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows (RTX 30, 40 and 50); NVIDIA on Linux (RTX 30, 40 and 50); NVIDIA DGX Spark (GB10); AMD on Windows (Ryzen AI Max / Strix Halo, gfx1151); AMD on Linux (Radeon AI PRO R9700); Apple silicon (64 GB or more, macOS 15 or newer). Does not run on: Intel Arc on Linux. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#deepseek41).<!-- /cap --> Take its sets (1.75, 2.00 and 2.25 bpw), sizes and speeds from
   [MODELS.md](MODELS.md#deepseek-v41-flash) and name the hardware. Do not invent quants or memory figures.
 - This fork's Step-3.7-Flash runs only from a source checkout on Linux AMD cards, on its own engine path, from
   StepFun's IQ3_XXS release (75.8 GB). Its measured speeds are in [STEP37.md](STEP37.md); do not present it as a
